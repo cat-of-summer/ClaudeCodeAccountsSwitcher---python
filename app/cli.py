@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -387,6 +388,66 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _interactive() -> bool:
+    return bool(
+        sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty()
+    )
+
+
+def _dispatch(parser: argparse.ArgumentParser, tokens: list[str]) -> None:
+    try:
+        args = parser.parse_args(tokens)
+    except SystemExit:
+        # argparse calls sys.exit() on bad input or on --help/--version;
+        # keep the shell alive instead of letting it terminate the process.
+        return
+
+    func = getattr(args, "func", None)
+    if func is None:
+        parser.print_help()
+        return
+
+    try:
+        func(args)
+    except SystemExit as exc:
+        # Commands raise SystemExit(message) to report errors; surface the text.
+        if isinstance(exc.code, str):
+            print(exc.code)
+    except KeyboardInterrupt:
+        print()
+
+
+def run_shell(parser: argparse.ArgumentParser) -> int:
+    print(t("cli.shell.banner", version=__version__))
+    if is_installed():
+        cmd_list(argparse.Namespace(refresh=False))
+    else:
+        print(t("cli.not_installed_bare"))
+    print()
+    print(t("cli.shell.hint"))
+
+    while True:
+        try:
+            line = input("ccas> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if not line:
+            continue
+        if line.lower() in {"exit", "quit", "q"}:
+            return 0
+
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            print(t("cli.shell.unknown"))
+            continue
+
+        _dispatch(parser, tokens)
+        print()
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     installer.apply_pending_upgrade()
@@ -395,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv[1:])
 
     if not getattr(args, "func", None):
+        if _interactive():
+            return run_shell(parser)
         if not is_installed():
             print(t("cli.not_installed_bare") + "\n")
             parser.print_help()

@@ -58,6 +58,9 @@
   "cli.slot_removed": "Slot {slot} deleted.",
   "cli.slot_renamed": "Slot {slot} is now '{alias}'. Launch with: claude @{alias}",
   "cli.not_installed_bare": "ccas is not installed yet.",
+  "cli.shell.banner": "ccas {version} - interactive mode",
+  "cli.shell.hint": "Type a command and press Enter: install, list, switch <n>, add, doctor, --help. Type 'exit' (or Ctrl+C) to close.",
+  "cli.shell.unknown": "Unknown command. Type --help for the list, or 'exit' to close.",
 
   "cli.description": "Claude Code account switcher. Swaps only the credentials - history, projects, settings and plugins stay shared.",
   "cli.help.install": "install, or roll out a new version",

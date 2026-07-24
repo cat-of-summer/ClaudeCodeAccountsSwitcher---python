@@ -58,6 +58,9 @@
   "cli.slot_removed": "Слот {slot} удалён.",
   "cli.slot_renamed": "Слот {slot} теперь '{alias}'. Запуск: claude @{alias}",
   "cli.not_installed_bare": "ccas ещё не установлен.",
+  "cli.shell.banner": "ccas {version} — интерактивный режим",
+  "cli.shell.hint": "Введи команду и нажми Enter: install, list, switch <n>, add, doctor, --help. Для выхода — 'exit' (или Ctrl+C).",
+  "cli.shell.unknown": "Неизвестная команда. Набери --help для списка или 'exit' для выхода.",
 
   "cli.description": "Переключатель аккаунтов Claude Code. Меняет только креды — история, проекты, настройки и плагины остаются общими.",
   "cli.help.install": "установить или накатить новую версию",
