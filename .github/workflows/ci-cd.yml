@@ -354,9 +354,8 @@ jobs:
           while IFS= read -r item; do
             item="$(printf '%s' "$item" | tr -d '[:space:]')"
             if [ -z "$item" ]; then continue; fi
-            name="${item%%:*}"
-            ver="${item#*:}"
-            if [ "$ver" = "$name" ]; then ver="latest"; fi
+            name="${item%%[:@]*}"
+            if [ "$name" = "$item" ]; then ver="latest"; else ver="${item#*[:@]}"; fi
             tools="$tools $name@$ver"
           done <<< "$(printf '%s' "${TOOLCHAIN:-}" | tr ',' '\n')"
           tools="${tools# }"
@@ -466,7 +465,7 @@ jobs:
           fi
           echo "mise $("$mise" --version)"
 
-          export MISE_YES=1
+          export MISE_YES=1 MISE_PYTHON_COMPILE=false
           "$mise" use --global $TOOLS
           "$mise" ls --installed
 
@@ -621,9 +620,8 @@ jobs:
           while IFS= read -r it; do
             it="$(printf '%s' "$it" | tr -d '[:space:]')"
             if [ -z "$it" ]; then continue; fi
-            name="${it%%:*}"
-            ver="${it#*:}"
-            if [ "$ver" = "$name" ]; then ver=""; fi
+            name="${it%%[:@]*}"
+            if [ "$name" = "$it" ]; then ver=""; else ver="${it#*[:@]}"; fi
             if [ "$name" = "node" ]; then
               if [ -n "$ver" ]; then node="$ver"; else node="lts/*"; fi
             fi
@@ -980,9 +978,8 @@ jobs:
           while IFS= read -r item; do
             item="$(printf '%s' "$item" | tr -d '[:space:]')"
             if [ -z "$item" ]; then continue; fi
-            name="${item%%:*}"
-            ver="${item#*:}"
-            if [ "$ver" = "$name" ]; then ver="latest"; fi
+            name="${item%%[:@]*}"
+            if [ "$name" = "$item" ]; then ver="latest"; else ver="${item#*[:@]}"; fi
             tools="$tools $name@$ver"
           done <<< "$(printf '%s' "${TOOLCHAIN:-}" | tr ',' '\n')"
           tools="${tools# }"
@@ -1032,7 +1029,7 @@ jobs:
             exit 1
           fi
 
-          export MISE_YES=1
+          export MISE_YES=1 MISE_PYTHON_COMPILE=false
           "$mise" use --global $TOOLS
           "$mise" ls --installed
           {

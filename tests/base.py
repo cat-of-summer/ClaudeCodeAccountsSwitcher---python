@@ -22,6 +22,9 @@ class TempHome(unittest.TestCase):
         os.environ["CCAS_HOME"] = str(self.home / ".claude-switcher")
         os.environ["CCAS_LANG"] = "en"
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        os.environ.pop("SHELL", None)
 
         i18n.set_language("en")
         store.ensure_layout()
