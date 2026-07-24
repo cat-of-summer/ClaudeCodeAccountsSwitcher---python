@@ -1,5 +1,5 @@
 <!-- DOCGEN:START -->
-# ClaudeCodeAccountsSwitcher
+# ClaudeCodeAccountsSwitcher---python
 
 ## Папки
 
