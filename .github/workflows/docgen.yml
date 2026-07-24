@@ -1,0 +1,491 @@
+name: Generate docs structure
+
+on:
+  push: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  docgen:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git user for commits
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Generate docs structure
+        run: |
+          set -euo pipefail
+
+          DOCS_DIR="docs"
+          DOCIGNORE="$DOCS_DIR/.docignore"
+
+          mkdir -p "$DOCS_DIR"
+
+          if [ ! -f "$DOCIGNORE" ]; then
+            cat > "$DOCIGNORE" << 'IGNORE_EOF'
+          # ╔═══════════════════════════════════════════════════════════════╗
+          # ║              СИСТЕМА АВТОДОКУМЕНТАЦИИ — КАК ЭТО РАБОТАЕТ     ║
+          # ╚═══════════════════════════════════════════════════════════════╝
+          #
+          # При каждом push в репозиторий GitHub Action (docgen.yml) автоматически
+          # обходит все файлы проекта и воссоздаёт зеркальную структуру внутри docs/:
+          #
+          #   src/app.php       →  docs/src/app.php.md
+          #   src/utils/math.js →  docs/src/utils/math.js.md
+          #   style.css         →  docs/style.css.md
+          #
+          # В каждой папке внутри docs/ создаётся README.md — индекс с оглавлением,
+          # содержащий ссылки на все вложенные файлы и подпапки этого уровня.
+          #
+          # ─── КАК ДОБАВИТЬ ДОКУМЕНТАЦИЮ ──────────────────────────────────────────────
+          #
+          # Открой нужный .md файл в docs/ и пиши ниже строки <!-- DOCGEN:END -->.
+          # Содержимое после этого маркера никогда не перезаписывается автоматикой.
+          #
+          # Пример (docs/src/app.php.md):
+          #
+          #   <!-- DOCGEN:START -->
+          #   # app.php
+          #   <!-- DOCGEN:END -->
+          #                             ← всё написанное здесь сохраняется навсегда
+          #   ## Описание
+          #   Точка входа приложения. Инициализирует конфиг и роутер.
+          #
+          # ─── КАК РАБОТАЕТ ОБНОВЛЕНИЕ ────────────────────────────────────────────────
+          #
+          # • Новый файл в репо      → создаётся соответствующий .md (только заголовок)
+          # • Файл удалён из репо    → соответствующий .md тоже удаляется
+          # • Существующий .md       → блок <!-- DOCGEN:START/END --> обновляется,
+          #                             всё остальное содержимое остаётся нетронутым
+          # • README.md в папках     → перезаписываются полностью (только оглавление)
+          #
+          # ─── КАК НАСТРОИТЬ ФИЛЬТРАЦИЮ (.docignore) ──────────────────────────────────
+          #
+          # Этот файл (.docignore) работает как чёрный список — перечисли что исключить.
+          # Доступные форматы (синтаксис .gitignore):
+          #
+          #   *.ext            — все файлы с расширением      (пример: *.png)
+          #   dirname/         — папка целиком                (пример: node_modules/)
+          #   filename         — конкретный файл по имени     (пример: package-lock.json)
+          #   path/to/file     — путь от корня репозитория    (пример: src/app.js)
+          #   dir/*.js         — файлы в папке (без вложенных) (пример: dist/*.js)
+          #   dir/**           — всё внутри папки рекурсивно   (пример: dist/**)
+          #   dir/**/*.js      — по маске на любой глубине     (пример: dist/**/*.min.js)
+          #   *                — любые символы кроме /         (пример: build-*.log)
+          #   **               — любые символы включая /       (пример: **/tmp)
+          #   ?                — один любой символ кроме /     (пример: file?.txt)
+          #   !pattern         — отмена предыдущего правила    (пример: !examples/)
+          #   # комментарий    — строки начинающиеся с # игнорируются
+          #
+          # Паттерн со слешем привязан к корню репозитория; без слеша — совпадает
+          # на любом уровне вложенности (как в .gitignore).
+          #
+          # Файл создаётся автоматически при первом запуске и больше не перезаписывается.
+          # Редактируй его свободно — изменения вступят в силу при следующем push.
+          #
+          # ════════════════════════════════════════════════════════════════════════════
+          #
+          # ═══════════════════════════════════════════════
+          # Blacklist for docs generation
+          # Syntax: *.ext, dirname/, filename, !negation. Comments: #
+          # ═══════════════════════════════════════════════
+
+          # Images
+          *.png
+          *.jpg
+          *.jpeg
+          *.gif
+          *.bmp
+          *.ico
+          *.webp
+          *.tiff
+          *.tif
+          *.svg
+          *.avif
+          *.heic
+          *.heif
+          *.raw
+          *.cr2
+          *.nef
+
+          # Documents
+          *.doc
+          *.md
+          *.docx
+          *.pdf
+          *.xls
+          *.xlsx
+          *.ppt
+          *.pptx
+          *.odt
+          *.ods
+          *.odp
+          *.rtf
+          *.epub
+
+          # Audio
+          *.mp3
+          *.wav
+          *.ogg
+          *.flac
+          *.aac
+          *.wma
+          *.m4a
+
+          # Video
+          *.mp4
+          *.avi
+          *.mov
+          *.wmv
+          *.flv
+          *.mkv
+          *.webm
+          *.m4v
+          *.mpeg
+          *.mpg
+
+          # Fonts
+          *.ttf
+          *.otf
+          *.woff
+          *.woff2
+          *.eot
+
+          # Archives
+          *.zip
+          *.rar
+          *.7z
+          *.tar
+          *.gz
+          *.bz2
+          *.xz
+          *.tgz
+
+          # Binaries & executables
+          *.exe
+          *.dll
+          *.so
+          *.dylib
+          *.bin
+          *.msi
+          *.dmg
+          *.deb
+          *.rpm
+          *.app
+
+          # Compiled / object files
+          *.o
+          *.obj
+          *.pyc
+          *.pyo
+          *.class
+          *.jar
+          *.war
+
+          # Design files
+          *.psd
+          *.ai
+          *.sketch
+          *.fig
+          *.xd
+
+          # Database
+          *.sqlite
+          *.db
+          *.mdb
+
+          # Source maps & minified
+          *.map
+          *.min.js
+          *.min.css
+
+          # Lock files
+          .dockerignore
+          .gitignore
+          package-lock.json
+          yarn.lock
+          composer.lock
+          Gemfile.lock
+          poetry.lock
+          pnpm-lock.yaml
+
+          # Directories
+          node_modules/
+          vendor/
+          venv/
+          dist/
+          build/
+          .git/
+          .github/
+          docs/
+          __pycache__/
+          .cache/
+          .tmp/
+          .vscode/
+          .idea/
+          bower_components/
+          IGNORE_EOF
+            sed -i 's/^          //' "$DOCIGNORE"
+            echo "Created default $DOCIGNORE"
+          fi
+
+          RULES_PATTERN=()
+          RULES_NEGATE=()
+
+          # Translate a glob body (no leading !, no leading/trailing /) into ERE.
+          # Supports: ** (any chars incl. /), * (any chars except /), ? (one char
+          # except /). Every other character is escaped to match literally.
+          glob_to_regex() {
+            local glob="$1"
+            local re="" i=0 n=${#glob} c nxt
+            while (( i < n )); do
+              c="${glob:i:1}"
+              case "$c" in
+                '*')
+                  nxt="${glob:i+1:1}"
+                  if [[ "$nxt" == "*" ]]; then
+                    i=$((i+1))
+                    nxt="${glob:i+1:1}"
+                    if [[ "$nxt" == "/" ]]; then
+                      i=$((i+1))
+                      re+="(.*/)?"   # **/  → zero or more directories
+                    else
+                      re+=".*"        # **   → anything including /
+                    fi
+                  else
+                    re+="[^/]*"       # *    → anything except /
+                  fi
+                  ;;
+                '?')
+                  re+="[^/]"          # ?    → one char except /
+                  ;;
+                [a-zA-Z0-9_/-])
+                  re+="$c"
+                  ;;
+                *)
+                  re+="\\"            # escape regex-special / literal char
+                  re+="$c"
+                  ;;
+              esac
+              i=$((i+1))
+            done
+            printf '%s' "$re"
+          }
+
+          parse_rules() {
+            RULES_PATTERN=()
+            RULES_NEGATE=()
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              [[ -z "$line" || "$line" == \#* ]] && continue
+
+              local negate=false
+              if [[ "$line" == \!* ]]; then
+                negate=true
+                line="${line#!}"
+              fi
+
+              local anchored=false dir_only=false
+              if [[ "$line" == /* ]]; then
+                anchored=true
+                line="${line#/}"
+              fi
+              if [[ "$line" == */ ]]; then
+                dir_only=true
+                line="${line%/}"
+              fi
+              # A pattern containing a slash is anchored to the repo root,
+              # otherwise it matches at any depth (gitignore semantics).
+              [[ "$line" == */* ]] && anchored=true
+              [[ -z "$line" ]] && continue
+
+              local body prefix suffix
+              body="$(glob_to_regex "$line")"
+              if [[ "$anchored" == "true" ]]; then prefix="^"; else prefix="(^|/)"; fi
+              if [[ "$dir_only" == "true" ]]; then suffix="/"; else suffix="(\$|/)"; fi
+
+              RULES_PATTERN+=("${prefix}${body}${suffix}")
+              RULES_NEGATE+=("$negate")
+            done < "$1"
+          }
+
+          is_excluded() {
+            local filepath="$1"
+            local state=1
+            local i
+            for (( i=0; i<${#RULES_PATTERN[@]}; i++ )); do
+              if echo "$filepath" | grep -qiE "${RULES_PATTERN[$i]}"; then
+                if [[ "${RULES_NEGATE[$i]}" == "true" ]]; then
+                  state=1
+                else
+                  state=0
+                fi
+              fi
+            done
+            return $state
+          }
+
+          parse_rules "$DOCIGNORE"
+
+          mapfile -t ALL_FILES < <(
+            while IFS= read -r file; do
+              is_excluded "$file" || echo "$file"
+            done < <(
+              find . -not -path './docs/*' -not -path './.git/*' -type f \
+                | sed 's|^\./||' \
+                | sort
+            )
+          )
+
+          TMPDIR_WORK="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR_WORK"' EXIT
+
+          printf '%s\n' "${ALL_FILES[@]}" | sort > "$TMPDIR_WORK/source.txt"
+
+          find "$DOCS_DIR" -type f -name '*.md' ! -name 'README.md' -printf '%P\n' \
+            | sed 's/\.md$//' | sort > "$TMPDIR_WORK/existing.txt"
+
+          comm -23 "$TMPDIR_WORK/existing.txt" "$TMPDIR_WORK/source.txt" > "$TMPDIR_WORK/orphans.txt"
+          comm -23 "$TMPDIR_WORK/source.txt" "$TMPDIR_WORK/existing.txt" > "$TMPDIR_WORK/new.txt"
+
+          orphan_count=0
+          while IFS= read -r orphan; do
+            [[ -z "$orphan" ]] && continue
+            md_path="$DOCS_DIR/${orphan}.md"
+            if [ -f "$md_path" ]; then
+              rm -f "$md_path"
+              echo "  DELETE: $md_path"
+              ((orphan_count++)) || true
+            fi
+          done < "$TMPDIR_WORK/orphans.txt"
+
+          find "$DOCS_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+          new_count=0
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            md_path="$DOCS_DIR/${file}.md"
+
+            [ -f "$md_path" ] && continue
+            mkdir -p "$(dirname "$md_path")"
+            filename="$(basename "$file")"
+            echo "# ${filename}" > "$md_path"
+            echo "  CREATE: $md_path"
+            ((new_count++)) || true
+          done < "$TMPDIR_WORK/new.txt"
+
+          generate_index() {
+            local dir="$1"
+            local readme="$dir/README.md"
+
+            if [[ "$dir" == "$DOCS_DIR" ]]; then
+              local title="${GITHUB_REPOSITORY##*/}"
+            else
+              local title
+              title="$(basename "$dir")"
+            fi
+
+            local subdirs=()
+            while IFS= read -r subdir; do
+              [[ -z "$subdir" ]] && continue
+              subdirs+=("$(basename "$subdir")")
+            done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d | sort)
+
+            local files=()
+            while IFS= read -r entry; do
+              [[ -z "$entry" ]] && continue
+              local name
+              name="$(basename "$entry")"
+              [[ "$name" == "README.md" ]] && continue
+              files+=("$name")
+            done < <(find "$dir" -maxdepth 1 -mindepth 1 -type f -name '*.md' | sort)
+
+            local auto_tmp
+            auto_tmp="$(mktemp)"
+
+            {
+              echo "<!-- DOCGEN:START -->"
+              echo "# ${title}"
+              echo ""
+
+              if [[ ${#subdirs[@]} -gt 0 ]]; then
+                echo "## Папки"
+                echo ""
+                for d in "${subdirs[@]}"; do
+                  echo "- [${d}](${d}/)"
+                done
+                echo ""
+              fi
+
+              if [[ ${#files[@]} -gt 0 ]]; then
+                echo "## Файлы"
+                echo ""
+                for f in "${files[@]}"; do
+                  local original_name="${f%.md}"
+                  echo "- [${original_name}](${f})"
+                done
+                echo ""
+              fi
+
+              echo "<!-- DOCGEN:END -->"
+            } > "$auto_tmp"
+
+            if [ ! -f "$readme" ]; then
+              mv "$auto_tmp" "$readme"
+            else
+              if grep -q "<!-- DOCGEN:START -->" "$readme"; then
+                awk -v auto_file="$auto_tmp" '
+                  /<!-- DOCGEN:START -->/ {
+                    while ((getline line < auto_file) > 0) print line
+                    skip=1; next
+                  }
+                  /<!-- DOCGEN:END -->/ { skip=0; next }
+                  !skip { print }
+                ' "$readme" > "${readme}.tmp" && mv "${readme}.tmp" "$readme"
+                rm -f "$auto_tmp"
+              else
+                { cat "$auto_tmp"; echo ""; cat "$readme"; } > "${readme}.tmp" \
+                  && mv "${readme}.tmp" "$readme"
+                rm -f "$auto_tmp"
+              fi
+            fi
+          }
+
+          while IFS= read -r dir; do
+            generate_index "$dir"
+          done < <(find "$DOCS_DIR" -type d | sort -r)
+
+          index_count="$(find "$DOCS_DIR" -type f -name 'README.md' | wc -l)"
+          echo "Pass 2 done: ${index_count} index files generated"
+
+      - name: Stage docs changes
+        run: |
+          set -euo pipefail
+          git add docs/
+          git rm -r --cached node_modules 2>/dev/null || true
+
+      - name: Commit & push if there are changes
+        run: |
+          set -uo pipefail
+          if git diff --cached --quiet; then
+            echo "No docs changes to commit"
+            exit 0
+          fi
+
+          git commit -m "auto:generated_doc [skip ci]"
+          git push origin "HEAD:${GITHUB_REF#refs/heads/}"

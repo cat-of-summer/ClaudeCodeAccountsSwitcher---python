@@ -1,0 +1,219 @@
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║              СИСТЕМА АВТОДОКУМЕНТАЦИИ — КАК ЭТО РАБОТАЕТ     ║
+# ╚═══════════════════════════════════════════════════════════════╝
+#
+# При каждом push в репозиторий GitHub Action (docgen.yml) автоматически
+# обходит все файлы проекта и воссоздаёт зеркальную структуру внутри docs/:
+#
+#   src/app.php       →  docs/src/app.php.md
+#   src/utils/math.js →  docs/src/utils/math.js.md
+#   style.css         →  docs/style.css.md
+#
+# В каждой папке внутри docs/ создаётся README.md — индекс с оглавлением,
+# содержащий ссылки на все вложенные файлы и подпапки этого уровня.
+#
+# ─── КАК ДОБАВИТЬ ДОКУМЕНТАЦИЮ ──────────────────────────────────────────────
+#
+# Открой нужный .md файл в docs/ и пиши ниже строки <!-- DOCGEN:END -->.
+# Содержимое после этого маркера никогда не перезаписывается автоматикой.
+#
+# Пример (docs/src/app.php.md):
+#
+#   <!-- DOCGEN:START -->
+#   # app.php
+#   <!-- DOCGEN:END -->
+#                             ← всё написанное здесь сохраняется навсегда
+#   ## Описание
+#   Точка входа приложения. Инициализирует конфиг и роутер.
+#
+# ─── КАК РАБОТАЕТ ОБНОВЛЕНИЕ ────────────────────────────────────────────────
+#
+# • Новый файл в репо      → создаётся соответствующий .md (только заголовок)
+# • Файл удалён из репо    → соответствующий .md тоже удаляется
+# • Существующий .md       → блок <!-- DOCGEN:START/END --> обновляется,
+#                             всё остальное содержимое остаётся нетронутым
+# • README.md в папках     → перезаписываются полностью (только оглавление)
+#
+# ─── КАК НАСТРОИТЬ ФИЛЬТРАЦИЮ (.docignore) ──────────────────────────────────
+#
+# Этот файл (.docignore) работает как чёрный список — перечисли что исключить.
+# Доступные форматы:
+#
+#   *.ext         — все файлы с расширением    (пример: *.png)
+#   dirname/      — папка целиком              (пример: node_modules/)
+#   filename      — конкретный файл по имени   (пример: package-lock.json)
+#   !pattern      — отмена предыдущего правила (пример: !examples/)
+#   # комментарий — строки начинающиеся с # игнорируются
+#
+# Файл создаётся автоматически при первом запуске и больше не перезаписывается.
+# Редактируй его свободно — изменения вступят в силу при следующем push.
+#
+# ════════════════════════════════════════════════════════════════════════════
+#
+# ═══════════════════════════════════════════════
+# Blacklist for docs generation
+# Syntax: *.ext, dirname/, filename, !negation. Comments: #
+# ═══════════════════════════════════════════════
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.ico
+*.webp
+*.tiff
+*.tif
+*.svg
+*.avif
+*.heic
+*.heif
+*.raw
+*.cr2
+*.nef
+
+# Documents
+*.doc
+*.md
+*.docx
+*.pdf
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.odt
+*.ods
+*.odp
+*.rtf
+*.epub
+
+# Audio
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.aac
+*.wma
+*.m4a
+
+# Video
+*.mp4
+*.avi
+*.mov
+*.wmv
+*.flv
+*.mkv
+*.webm
+*.m4v
+*.mpeg
+*.mpg
+
+# Fonts
+*.ttf
+*.otf
+*.woff
+*.woff2
+*.eot
+
+# Archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.bz2
+*.xz
+*.tgz
+
+# Binaries & executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.bin
+*.msi
+*.dmg
+*.deb
+*.rpm
+*.app
+
+# Compiled / object files
+*.o
+*.obj
+*.pyc
+*.pyo
+*.class
+*.jar
+*.war
+
+# Design files
+*.psd
+*.ai
+*.sketch
+*.fig
+*.xd
+
+# Database
+*.sqlite
+*.db
+*.mdb
+
+# Source maps & minified
+*.map
+*.min.js
+*.min.css
+
+# Lock files & metadata
+.dockerignore
+.gitignore
+.gitattributes
+package.json
+package-lock.json
+yarn.lock
+composer.lock
+Gemfile.lock
+poetry.lock
+pnpm-lock.yaml
+
+# Directories
+node_modules/
+vendor/
+venv/
+dist/
+build/
+scripts/
+.git/
+.github/
+docs/
+examples/
+__pycache__/
+.cache/
+.tmp/
+.vscode/
+.idea/
+bower_components/
+.npmrc
+LICENSE
+
+# ═══════════════════════════════════════════════
+# ccas
+# ═══════════════════════════════════════════════
+
+# Empty package markers — nothing to document
+__init__.py
+
+# Language catalogues: the contract is described in docs/ui/i18n.py.md,
+# the files themselves are data and need no per-file page.
+lang/
+
+# Build scratch output
+*.spec
+build/__pycache__/
+.release-staging/
+.release-artifacts/
+
+# Runtime leftovers
+*.log
+.claude/
+.venv/
