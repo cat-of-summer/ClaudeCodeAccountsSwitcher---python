@@ -59,7 +59,7 @@ permissions:
 
 jobs:
   ci-cd:
-    uses: cat-of-summer/Git_toolkit/.github/workflows/ci-cd.yml@main
+    uses: cat-of-summer/git_toolkit/.github/workflows/ci-cd.yml@main
     secrets: inherit
     with:
       run_ci: ${{ inputs.run_ci == null && true || inputs.run_ci }}
