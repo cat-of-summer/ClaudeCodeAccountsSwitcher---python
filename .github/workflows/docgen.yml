@@ -9,5 +9,5 @@ permissions:
 
 jobs:
   docgen:
-    uses: cat-of-summer/Git_toolkit/.github/workflows/docgen.yml@main
+    uses: cat-of-summer/git_toolkit/.github/workflows/docgen.yml@main
     secrets: inherit
