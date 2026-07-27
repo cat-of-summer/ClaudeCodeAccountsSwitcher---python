@@ -1,7 +1,8 @@
 name: Generate docs structure
 
 on:
-  push: {}
+  push:
+    branches: ['**']
   workflow_dispatch: {}
 
 permissions:
