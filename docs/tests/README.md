@@ -6,6 +6,7 @@
 - [base.py](base.py.md)
 - [test_arguments.py](test_arguments.py.md)
 - [test_claude_config.py](test_claude_config.py.md)
+- [test_concurrency.py](test_concurrency.py.md)
 - [test_credentials.py](test_credentials.py.md)
 - [test_i18n.py](test_i18n.py.md)
 - [test_migration.py](test_migration.py.md)
