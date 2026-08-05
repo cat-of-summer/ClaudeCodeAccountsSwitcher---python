@@ -18,6 +18,7 @@ USER_AGENT = "ccas"
 DEFAULT_TIMEOUT = 5.0
 MAX_PARALLEL = 8
 USAGE_TTL_SECONDS = 600.0
+DEFAULT_RESET_FORMAT = "%d.%m %H:%M"
 
 TOKEN_LABEL_KEYS = {
     "ok": "usage.token_ok",
@@ -122,6 +123,19 @@ def _parse_reset(value: Any) -> datetime | None:
     return parsed.astimezone()
 
 
+def format_reset(value: Any) -> str:
+    """Момент сброса окна в локальной зоне пользователя: «05.08 18:50»."""
+    moment = _parse_reset(value)
+    if moment is None:
+        return ""
+    pattern = t("usage.reset_format")
+    if "%" not in pattern:
+        # Ключа нет в каталоге — t() вернул само имя ключа, и оно уехало бы
+        # в вывод литералом.
+        pattern = DEFAULT_RESET_FORMAT
+    return t("usage.reset_at", time=moment.strftime(pattern))
+
+
 def age_text(fetched_at_ms: Any) -> str:
     if not isinstance(fetched_at_ms, (int, float)) or fetched_at_ms <= 0:
         return ""
@@ -141,6 +155,11 @@ def age_text(fetched_at_ms: Any) -> str:
     return t("usage.age_days", value=int(hours / 24))
 
 
+def _window(label: str, block: dict[str, Any]) -> str:
+    reset = format_reset(block.get("resets_at"))
+    return f"{label} {reset}" if reset else label
+
+
 def format_usage(usage: dict[str, Any] | None) -> str:
     if not usage:
         return t("usage.unknown")
@@ -152,7 +171,9 @@ def format_usage(usage: dict[str, Any] | None) -> str:
     percent = five_hour.get("utilization")
     parts: list[str] = []
     if isinstance(percent, (int, float)):
-        parts.append(t("usage.five_hour", percent=int(percent)))
+        # Сброс идёт при своём окне: у недельного он через несколько суток,
+        # и общая метка в хвосте не сказала бы, к какому окну относится.
+        parts.append(_window(t("usage.five_hour", percent=int(percent)), five_hour))
     else:
         parts.append(t("usage.five_hour_unknown"))
 
@@ -160,11 +181,7 @@ def format_usage(usage: dict[str, Any] | None) -> str:
     if isinstance(seven_day, dict):
         weekly = seven_day.get("utilization")
         if isinstance(weekly, (int, float)):
-            parts.append(t("usage.seven_day", percent=int(weekly)))
-
-    reset = _parse_reset(five_hour.get("resets_at"))
-    if reset is not None:
-        parts.append(t("usage.reset_at", time=reset.strftime("%H:%M")))
+            parts.append(_window(t("usage.seven_day", percent=int(weekly)), seven_day))
 
     age = age_text(usage.get("fetchedAtMs"))
     if age and age != t("usage.age_now"):

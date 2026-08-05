@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from unittest import mock
+
 from tests.base import TempHome
 from ui import i18n, usage
+
+FIVE_HOUR_RESET = "2026-07-24T13:50:00.360619+00:00"
+SEVEN_DAY_RESET = "2026-07-31T09:00:00+00:00"
+
+
+def reset_mark() -> str:
+    return i18n.t("usage.reset_at", time="").strip()
 
 
 class TestUsageFormatting(TempHome):
@@ -9,14 +18,53 @@ class TestUsageFormatting(TempHome):
         text = usage.format_usage(
             {
                 "fetchedAtMs": None,
-                "five_hour": {
-                    "utilization": 46,
-                    "resets_at": "2026-07-24T13:50:00.360619+00:00",
-                },
+                "five_hour": {"utilization": 46, "resets_at": FIVE_HOUR_RESET},
             }
         )
         self.assertIn("46%", text)
-        self.assertIn(i18n.t("usage.reset_at", time="").strip(), text)
+        self.assertIn(reset_mark(), text)
+
+    def test_reset_shows_date_and_time(self) -> None:
+        # The expected value cannot be a literal: it depends on the zone of the
+        # machine running the tests, which is exactly what the render converts to.
+        moment = usage._parse_reset(FIVE_HOUR_RESET)
+        assert moment is not None
+        expected = moment.strftime(i18n.t("usage.reset_format"))
+
+        self.assertIn(expected, usage.format_reset(FIVE_HOUR_RESET))
+        self.assertNotEqual(expected, moment.strftime("%H:%M"))
+
+    def test_both_windows_carry_their_own_reset(self) -> None:
+        text = usage.format_usage(
+            {
+                "five_hour": {"utilization": 46, "resets_at": FIVE_HOUR_RESET},
+                "seven_day": {"utilization": 96, "resets_at": SEVEN_DAY_RESET},
+            }
+        )
+        self.assertEqual(text.count(reset_mark()), 2)
+
+    def test_window_without_reset_is_clean(self) -> None:
+        text = usage.format_usage(
+            {"five_hour": {"utilization": 46}, "seven_day": {"utilization": 96}}
+        )
+        self.assertIn("46%", text)
+        self.assertNotIn(reset_mark(), text)
+        self.assertNotIn("  ", text)
+
+    def test_reset_format_falls_back(self) -> None:
+        catalog = i18n._catalogs[i18n.current_language()]
+        with mock.patch.dict(catalog):
+            catalog.pop("usage.reset_format", None)
+            text = usage.format_reset(FIVE_HOUR_RESET)
+
+        self.assertNotIn("usage.reset_format", text)
+        moment = usage._parse_reset(FIVE_HOUR_RESET)
+        assert moment is not None
+        self.assertIn(moment.strftime(usage.DEFAULT_RESET_FORMAT), text)
+
+    def test_unparsable_reset_renders_nothing(self) -> None:
+        self.assertEqual(usage.format_reset(None), "")
+        self.assertEqual(usage.format_reset("not a timestamp"), "")
 
     def test_missing_data(self) -> None:
         self.assertEqual(usage.format_usage(None), i18n.t("usage.unknown"))
