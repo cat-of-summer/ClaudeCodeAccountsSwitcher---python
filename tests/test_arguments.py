@@ -78,9 +78,7 @@ class TestDefaultArgs(TempHome):
         self.assertEqual(merged, ["mcp", "list"])
 
 
-class TestMenuGating(TempHome):
-    def test_no_menu_when_arguments_present(self) -> None:
-        self.assertFalse(wrapper.wants_menu(["-p", "hi"], False))
-
-    def test_no_menu_when_slot_explicit(self) -> None:
-        self.assertFalse(wrapper.wants_menu([], True))
+class TestBareInvocation(TempHome):
+    def test_bare_claude_never_prompts(self) -> None:
+        """A bare `claude` resumes the last account instead of opening a picker."""
+        self.assertFalse(hasattr(wrapper, "wants_menu"))

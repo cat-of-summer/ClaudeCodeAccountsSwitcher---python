@@ -21,6 +21,7 @@ from core.store import (
     is_installed,
     log_file,
     read_json,
+    update_accounts,
 )
 from core.version import __version__
 from system import secure
@@ -86,15 +87,48 @@ def _resolve_target(accounts: Accounts, token: str) -> Slot:
     raise SystemExit(t("error.no_such_account", target=probe))
 
 
-def _refresh_usage(accounts: Accounts, slots: list[Slot]) -> int:
+def _refresh_usage(accounts: Accounts, slots: list[Slot]) -> tuple[int, int]:
+    """Fetch limits for `slots`; returns (refreshed, failed)."""
+    attempted = len(usage.refreshable(slots))
+    if not attempted:
+        return 0, 0
+
     fresh = usage.refresh_slots(slots)
     for number, payload in fresh.items():
         target = accounts.get(number)
         if target is not None:
             target.usage = payload
+
     if fresh:
-        accounts.save()
-    return len(fresh)
+
+        def _store(current: Accounts) -> None:
+            for number, payload in fresh.items():
+                current.ensure(number).usage = payload
+
+        update_accounts(_store)
+
+    return len(fresh), attempted - len(fresh)
+
+
+def _autorefresh(accounts: Accounts, slots: list[Slot], args: argparse.Namespace) -> int:
+    """Keep `ccas list` honest without making every call wait on the network.
+
+    Limits used to move only when someone remembered `--refresh`, so the list
+    showed either "unknown" or a frozen snapshot from hours ago.
+    """
+    if getattr(args, "cached", False):
+        return 0
+
+    if getattr(args, "refresh", False):
+        stale = slots
+    else:
+        stale = [slot for slot in slots if usage.is_stale(slot.usage)]
+
+    if not stale:
+        return 0
+
+    _, failed = _refresh_usage(accounts, stale)
+    return failed
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -140,8 +174,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(t("cli.no_slots_hint"))
         return 0
 
-    if getattr(args, "refresh", False):
-        _refresh_usage(accounts, slots)
+    failed = _autorefresh(accounts, slots, args)
 
     for slot in slots:
         marker = "*" if slot.number == accounts.active else " "
@@ -150,14 +183,48 @@ def cmd_list(args: argparse.Namespace) -> int:
         detail = usage.format_token_state(state) or usage.format_usage(slot.usage)
         email = f"  {slot.email}" if slot.alias and slot.email else ""
         print(f"{marker} [{slot.number}] {label}{email}   {detail}")
+
+    if failed:
+        print(t("usage.refresh_partial", count=failed))
+    return 0
+
+
+def cmd_menu(args: argparse.Namespace) -> int:
+    del args
+    config, accounts = _require_installed()
+    if not accounts.slots:
+        print(t("cli.no_slots_hint"))
+        return 0
+
+    from ui import menu
+
+    chosen = menu.choose(config, accounts)
+    if chosen is None:
+        return 0
+
+    target = accounts.get(chosen)
+    if target is None or not target.has_credentials():
+        # "+ add an account" picks a free number; making it active would leave a
+        # bare `claude` pointing at a slot nobody has signed into.
+        print(t("cli.free_slot", slot=chosen))
+        print(t("cli.free_slot_hint", slot=chosen))
+        return 0
+
+    update_accounts(lambda current: setattr(current, "active", chosen))
+    print(t("cli.active_slot", slot=chosen, label=target.label))
+    print(t("cli.run_claude_hint"))
     return 0
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
     _, accounts = _require_installed()
     slot = _resolve_target(accounts, args.target)
-    accounts.active = slot.number
-    accounts.save()
+
+    def _activate(current: Accounts) -> None:
+        current.ensure(slot.number)
+        current.active = slot.number
+
+    update_accounts(_activate)
     print(t("cli.active_slot", slot=slot.number, label=slot.label))
     print(t("cli.run_claude_hint"))
     return 0
@@ -188,8 +255,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
     with contextlib.suppress(OSError):
         identity_file(slot.number).unlink()
 
-    accounts.remove(slot.number)
-    accounts.save()
+    update_accounts(lambda current: current.remove(slot.number))
     print(t("cli.slot_removed", slot=slot.number))
     return 0
 
@@ -204,8 +270,10 @@ def cmd_rename(args: argparse.Namespace) -> int:
     if accounts.alias_taken(alias, excluding=slot.number):
         raise SystemExit(t("error.alias_taken", alias=alias))
 
-    slot.alias = alias
-    accounts.save()
+    def _rename(current: Accounts) -> None:
+        current.ensure(slot.number).alias = alias
+
+    update_accounts(_rename)
     print(t("cli.slot_renamed", slot=slot.number, alias=alias))
     return 0
 
@@ -217,12 +285,16 @@ def cmd_usage(args: argparse.Namespace) -> int:
         print(t("cli.no_slots"))
         return 0
 
+    failed = 0
     if not args.cached:
-        _refresh_usage(accounts, slots)
+        _, failed = _refresh_usage(accounts, slots)
 
     for slot in slots:
         marker = "*" if slot.number == accounts.active else " "
         print(f"{marker} [{slot.number}] {slot.label:<34} {usage.format_usage(slot.usage)}")
+
+    if failed:
+        print(t("usage.refresh_partial", count=failed))
     return 0
 
 
@@ -359,7 +431,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help=t("cli.help.list"))
     list_parser.add_argument("--refresh", action="store_true", help=t("cli.help.refresh"))
+    list_parser.add_argument(
+        "--cached", action="store_true", help=t("cli.help.cached_list")
+    )
     list_parser.set_defaults(func=cmd_list)
+
+    menu_parser = subparsers.add_parser("menu", help=t("cli.help.menu"))
+    menu_parser.set_defaults(func=cmd_menu)
 
     switch_parser = subparsers.add_parser("switch", help=t("cli.help.switch"))
     switch_parser.add_argument("target", help=t("cli.help.target"))
@@ -420,7 +498,7 @@ def _dispatch(parser: argparse.ArgumentParser, tokens: list[str]) -> None:
 def run_shell(parser: argparse.ArgumentParser) -> int:
     print(t("cli.shell.banner", version=__version__))
     if is_installed():
-        cmd_list(argparse.Namespace(refresh=False))
+        cmd_list(argparse.Namespace(refresh=False, cached=False))
     else:
         print(t("cli.not_installed_bare"))
     print()
@@ -462,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             print(t("cli.not_installed_bare") + "\n")
             parser.print_help()
             return 1
-        return cmd_list(argparse.Namespace(refresh=False))
+        return cmd_list(argparse.Namespace(refresh=False, cached=False))
 
     try:
         return int(args.func(args) or 0)

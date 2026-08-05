@@ -46,7 +46,7 @@
   "uninstall.confirm_purge": "Удалить всё, включая сохранённые токены всех аккаунтов?",
 
   "wrapper.login_needed": "Аккаунт {slot} ещё не сохранён — выполни вход.",
-  "wrapper.concurrent": "Слот {held} уже запущен. В режиме копирования одновременная работа со слотом {wanted} может затереть токены.",
+  "wrapper.concurrent": "Слот {held} уже запущен. В режиме копирования у слотов один общий файл кредов, поэтому слот {wanted} не стартует, пока тот сеанс не закрыт.",
 
   "cli.no_slots_hint": "Слотов пока нет. Запусти `claude` и войди — слот создастся сам.",
   "cli.no_slots": "Слотов пока нет.",
@@ -80,6 +80,8 @@
   "cli.help.purge": "удалить и сохранённые токены",
   "cli.help.refresh": "опросить лимиты по сети",
   "cli.help.cached": "без сетевых запросов",
+  "cli.help.cached_list": "показать сохранённые лимиты без обращения к сети",
+  "cli.help.menu": "выбрать активный аккаунт интерактивно",
   "cli.help.target": "номер, @алиас или email",
   "cli.help.lang": "язык интерфейса: {languages}",
 
@@ -123,6 +125,8 @@
   "usage.unknown": "лимиты неизвестны",
   "usage.five_hour": "5ч {percent}%",
   "usage.five_hour_unknown": "5ч ?",
+  "usage.seven_day": "7д {percent}%",
+  "usage.refresh_partial": "не удалось обновить аккаунтов: {count} — см. ccas doctor и журнал",
   "usage.reset_at": "сброс {time}",
   "usage.age_now": "сейчас",
   "usage.age_minutes": "{value} мин назад",

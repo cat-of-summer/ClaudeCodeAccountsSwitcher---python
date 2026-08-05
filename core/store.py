@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,9 @@ APP_DIR_NAME = ".claude-switcher"
 LEGACY_STORE_NAME = ".claude-accounts"
 CREDENTIALS_FILENAME = ".credentials.json"
 BACKUP_KEEP = 10
+
+LOCK_TIMEOUT = 10.0
+LOCK_POLL = 0.05
 
 DEFAULT_ARGS = ["--dangerously-skip-permissions"]
 
@@ -67,6 +71,10 @@ def accounts_path() -> Path:
     return app_dir() / "accounts.json"
 
 
+def accounts_lock_path() -> Path:
+    return app_dir() / "accounts.lock"
+
+
 def shim_name() -> str:
     return "claude.exe" if os.name == "nt" else "claude"
 
@@ -107,6 +115,71 @@ def write_json_atomic(
     if harden:
         with contextlib.suppress(secure.PermissionWarning, OSError):
             secure.harden_file(target)
+
+
+def _lock_exclusive(handle: int) -> None:
+    """Take an exclusive lock on the first byte, or raise OSError if held."""
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(handle: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def file_lock(
+    path: str | os.PathLike[str], *, timeout: float = LOCK_TIMEOUT
+) -> Iterator[bool]:
+    """Serialise writers across processes.
+
+    Yields True when the lock was taken. On timeout it yields False and lets the
+    caller proceed anyway: a contended store is worth a rare lost update, but a
+    claude session that refuses to start is not.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = os.open(str(target), os.O_RDWR | os.O_CREAT, 0o600)
+
+    acquired = False
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                _lock_exclusive(handle)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    from core import log
+
+                    log.write(f"lock timeout on {target.name}, proceeding unlocked")
+                    break
+                time.sleep(LOCK_POLL)
+        yield acquired
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                _unlock(handle)
+        with contextlib.suppress(OSError):
+            os.close(handle)
 
 
 def backup_file(path: str | os.PathLike[str], *, keep: int = BACKUP_KEEP) -> Path | None:
@@ -302,6 +375,21 @@ class Accounts:
         self.slots.pop(number, None)
         if self.active == number:
             self.active = 0
+
+
+def update_accounts(mutate: Callable[[Accounts], None]) -> Accounts:
+    """Apply a change to the account store without clobbering concurrent writers.
+
+    A wrapper process outlives the store it loaded at startup: a claude session
+    runs for hours while other terminals switch, rename and refresh slots. Saving
+    the stale in-memory snapshot would roll all of that back, so every mutation
+    re-reads the file under a lock and writes only its own edit.
+    """
+    with file_lock(accounts_lock_path()):
+        fresh = Accounts.load()
+        mutate(fresh)
+        fresh.save()
+    return fresh
 
 
 def ensure_layout() -> None:

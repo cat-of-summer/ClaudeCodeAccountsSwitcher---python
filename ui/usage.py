@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
-from core import claudecfg
+from core import claudecfg, log
 from core.store import Slot, creds_file
 from ui.i18n import t
 
@@ -17,6 +17,7 @@ BETA_HEADER = "oauth-2025-04-20"
 USER_AGENT = "ccas"
 DEFAULT_TIMEOUT = 5.0
 MAX_PARALLEL = 8
+USAGE_TTL_SECONDS = 600.0
 
 TOKEN_LABEL_KEYS = {
     "ok": "usage.token_ok",
@@ -42,12 +43,20 @@ def fetch_live(token: str, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any
             if response.status != 200:
                 return None
             payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+    except urllib.error.HTTPError as exc:
+        # A dead access token answers 401 here. Without this branch it is
+        # indistinguishable from "no network" and the limits stay silently blank.
+        log.write(f"usage request rejected: HTTP {exc.code} {exc.reason}")
+        return None
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        log.write(f"usage request failed: {exc!r}")
         return None
     return payload if isinstance(payload, dict) else None
 
 
 def _normalise(payload: dict[str, Any]) -> dict[str, Any]:
+    # The endpoint returns the windows at the top level; older payloads nested
+    # them under "utilization". Accept both.
     utilization = payload.get("utilization")
     source = utilization if isinstance(utilization, dict) else payload
     return {
@@ -55,6 +64,20 @@ def _normalise(payload: dict[str, Any]) -> dict[str, Any]:
         "five_hour": source.get("five_hour"),
         "seven_day": source.get("seven_day"),
     }
+
+
+def is_stale(usage: dict[str, Any] | None, *, ttl: float = USAGE_TTL_SECONDS) -> bool:
+    if not usage:
+        return True
+    fetched_at_ms = usage.get("fetchedAtMs")
+    if not isinstance(fetched_at_ms, (int, float)) or fetched_at_ms <= 0:
+        return True
+    return datetime.now(timezone.utc).timestamp() - fetched_at_ms / 1000 >= ttl
+
+
+def refreshable(slots: list[Slot]) -> list[Slot]:
+    """Slots holding a token we can actually ask the API with."""
+    return [slot for slot in slots if claudecfg.access_token(creds_file(slot.number))]
 
 
 def refresh_slots(
@@ -132,6 +155,12 @@ def format_usage(usage: dict[str, Any] | None) -> str:
         parts.append(t("usage.five_hour", percent=int(percent)))
     else:
         parts.append(t("usage.five_hour_unknown"))
+
+    seven_day = usage.get("seven_day")
+    if isinstance(seven_day, dict):
+        weekly = seven_day.get("utilization")
+        if isinstance(weekly, (int, float)):
+            parts.append(t("usage.seven_day", percent=int(weekly)))
 
     reset = _parse_reset(five_hour.get("resets_at"))
     if reset is not None:

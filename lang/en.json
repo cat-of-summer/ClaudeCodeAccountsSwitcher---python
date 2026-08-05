@@ -46,7 +46,7 @@
   "uninstall.confirm_purge": "Delete everything, including the stored tokens of every account?",
 
   "wrapper.login_needed": "Slot {slot} has no saved login yet - sign in.",
-  "wrapper.concurrent": "Slot {held} is already running. In copy mode, working on slot {wanted} at the same time may overwrite tokens.",
+  "wrapper.concurrent": "Slot {held} is already running. In copy mode both slots share one credentials file, so slot {wanted} cannot start until that session is closed.",
 
   "cli.no_slots_hint": "No slots yet. Run `claude` and sign in - a slot is created automatically.",
   "cli.no_slots": "No slots yet.",
@@ -80,6 +80,8 @@
   "cli.help.purge": "also delete the stored tokens",
   "cli.help.refresh": "query the limits over the network",
   "cli.help.cached": "no network requests",
+  "cli.help.cached_list": "show stored limits without querying the network",
+  "cli.help.menu": "pick the active account interactively",
   "cli.help.target": "number, @alias or email",
   "cli.help.lang": "interface language: {languages}",
 
@@ -123,6 +125,8 @@
   "usage.unknown": "limits unknown",
   "usage.five_hour": "5h {percent}%",
   "usage.five_hour_unknown": "5h ?",
+  "usage.seven_day": "7d {percent}%",
+  "usage.refresh_partial": "could not refresh {count} account(s) - see ccas doctor and the log",
   "usage.reset_at": "resets {time}",
   "usage.age_now": "just now",
   "usage.age_minutes": "{value} min ago",

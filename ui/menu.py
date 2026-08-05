@@ -5,7 +5,7 @@ import os
 import sys
 
 from core import claudecfg
-from core.store import Accounts, Config, Slot, creds_file
+from core.store import Accounts, Config, Slot, creds_file, update_accounts
 from ui import usage
 from ui.i18n import t
 
@@ -173,7 +173,12 @@ def choose(config: Config, accounts: Accounts) -> int | None:
                     if target is not None:
                         target.usage = payload
                 if fresh:
-                    accounts.save()
+
+                    def _store(current: Accounts, fetched=fresh) -> None:
+                        for number, payload in fetched.items():
+                            current.ensure(number).usage = payload
+
+                    update_accounts(_store)
                 note = (
                     t("menu.refreshed", count=len(fresh))
                     if fresh

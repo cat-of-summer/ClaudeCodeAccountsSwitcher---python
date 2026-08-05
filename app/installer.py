@@ -25,6 +25,7 @@ from core.store import (
     manager_name,
     read_json,
     shim_name,
+    update_accounts,
     write_json_atomic,
 )
 from core.version import SCHEMA_VERSION, __version__
@@ -295,10 +296,15 @@ def install(
     install_shims()
     ensure_path_entry()
 
-    accounts = Accounts.load()
-    imported = migrate_legacy_store(accounts)
-    adopted = adopt_current_login(accounts)
-    accounts.save()
+    imported: list[int] = []
+    adopted: int | None = None
+
+    def _seed(accounts: Accounts) -> None:
+        nonlocal adopted
+        imported.extend(migrate_legacy_store(accounts))
+        adopted = adopt_current_login(accounts)
+
+    update_accounts(_seed)
 
     header = "install.header_upgraded" if upgrading else "install.header_installed"
     reporter(t(header, version=__version__))

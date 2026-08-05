@@ -22,6 +22,7 @@ from core.store import (
     identity_file,
     is_installed,
     read_json,
+    update_accounts,
     write_json_atomic,
 )
 from ui.i18n import t
@@ -92,38 +93,112 @@ def merge_default_args(default_args: list[str], user_args: list[str]) -> list[st
     return merged + list(user_args)
 
 
-def wants_menu(args: list[str], explicit_slot: bool) -> bool:
-    if args or explicit_slot:
-        return False
-    return bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
+def default_slot(accounts: Accounts) -> int:
+    """The slot a bare `claude` should resume, without asking."""
+    current = accounts.get(accounts.active)
+    if current is not None and current.has_credentials():
+        return current.number
+
+    usable = [slot for slot in accounts.ordered() if slot.has_credentials()]
+    if usable:
+        return max(usable, key=lambda slot: slot.last_used_at).number
+
+    return min(accounts.slots) if accounts.slots else accounts.next_free_number()
 
 
-def adopt_existing_login(accounts: Accounts, config: Config) -> bool:
+def adopt_existing_login(config: Config) -> bool:
     if config.cred_mode != CRED_MODE_COPY:
         return False
 
     from app.installer import adopt_current_login
 
-    adopted = adopt_current_login(accounts)
-    if adopted is None:
+    adopted: list[int] = []
+
+    def _adopt(fresh: Accounts) -> None:
+        number = adopt_current_login(fresh)
+        if number is not None:
+            adopted.append(number)
+
+    update_accounts(_adopt)
+    if not adopted:
         return False
 
-    accounts.save()
-    log.write(f"adopted existing login as slot {adopted}")
+    log.write(f"adopted existing login as slot {adopted[0]}")
     return True
 
 
-def capture_identity(slot: Slot) -> dict[str, Any] | None:
+def identity_uuid(identity: dict[str, Any] | None) -> str:
+    if not isinstance(identity, dict):
+        return ""
+    oauth = identity.get("oauthAccount")
+    if not isinstance(oauth, dict):
+        return ""
+    return oauth.get("accountUuid") or ""
+
+
+def _creds_touched_since(slot: int, moment: float) -> bool:
+    try:
+        return creds_file(slot).stat().st_mtime >= moment
+    except OSError:
+        return False
+
+
+def capture_identity(
+    slot: Slot, accounts: Accounts, launched_at: float
+) -> dict[str, Any] | None:
+    """Record who this slot belongs to, refusing to adopt a neighbour's account.
+
+    `~/.claude.json` is shared by every session, so by the time this session ends
+    the identity sitting there may well have been written by a claude running in
+    another terminal on another slot. Copying it in blindly is what made two slots
+    collapse into one account.
+    """
     identity = claudecfg.read_identity()
     if not identity or not identity.get("oauthAccount"):
         return None
+
+    uuid = identity_uuid(identity)
+    if not uuid:
+        return None
+
+    if uuid != slot.account_uuid:
+        claimed = next(
+            (
+                other
+                for other in accounts.ordered()
+                if other.number != slot.number and other.account_uuid == uuid
+            ),
+            None,
+        )
+        if claimed is not None:
+            log.write(
+                f"identity capture skipped for slot {slot.number}: {uuid} already "
+                f"belongs to slot {claimed.number}"
+            )
+            return None
+
+        concurrent = other_live_sessions()
+        if concurrent:
+            slots = ", ".join(str(entry.get("slot")) for entry in concurrent)
+            log.write(
+                f"identity capture skipped for slot {slot.number}: {uuid} is "
+                f"unfamiliar while slots {slots} are still running"
+            )
+            return None
+
+        if not _creds_touched_since(slot.number, launched_at):
+            log.write(
+                f"identity capture skipped for slot {slot.number}: own credentials "
+                "were never written during this session"
+            )
+            return None
 
     write_json_atomic(identity_file(slot.number), identity)
 
     oauth = identity.get("oauthAccount") or {}
     if isinstance(oauth, dict):
         slot.email = oauth.get("emailAddress") or slot.email
-        slot.account_uuid = oauth.get("accountUuid") or slot.account_uuid
+    slot.account_uuid = uuid
 
     user_id = identity.get("userID")
     if isinstance(user_id, str):
@@ -137,13 +212,22 @@ def stored_identity(slot: int) -> dict[str, Any] | None:
     return raw if isinstance(raw, dict) else None
 
 
-def capture_usage(slot: Slot) -> None:
+def capture_usage(slot: Slot, identity: dict[str, Any] | None = None) -> None:
+    """Opportunistically lift limits out of the shared config.
+
+    Current claude builds no longer write `cachedUsageUtilization`, so this is a
+    bonus rather than a source: `ccas list` refreshes over the network. Both uuids
+    must be known and equal -- an unattributable block is another slot's data as
+    often as it is ours.
+    """
     cached = claudecfg.read_usage_cache()
     if not cached:
         return
 
-    account_uuid = cached.get("accountUuid")
-    if slot.account_uuid and account_uuid and account_uuid != slot.account_uuid:
+    account_uuid = cached.get("accountUuid") or identity_uuid(identity)
+    if not slot.account_uuid or not account_uuid:
+        return
+    if account_uuid != slot.account_uuid:
         return
 
     utilization = cached.get("utilization")
@@ -155,6 +239,52 @@ def capture_usage(slot: Slot) -> None:
         "five_hour": utilization.get("five_hour"),
         "seven_day": utilization.get("seven_day"),
     }
+
+
+def sessions_dir() -> Path:
+    return app_dir() / "sessions"
+
+
+def register_session(slot: int) -> None:
+    write_json_atomic(
+        sessions_dir() / f"{os.getpid()}.json",
+        {"pid": os.getpid(), "slot": slot, "at": time.time()},
+        harden=False,
+    )
+
+
+def unregister_session() -> None:
+    with contextlib.suppress(OSError):
+        (sessions_dir() / f"{os.getpid()}.json").unlink()
+
+
+def other_live_sessions() -> list[dict[str, Any]]:
+    """Wrapper processes other than this one that are still running.
+
+    Tells apart the two reasons the shared config can name an unfamiliar
+    account: a deliberate re-login on this slot (nobody else is running) versus
+    a neighbouring terminal having just written its own (someone is).
+    """
+    directory = sessions_dir()
+    if not directory.is_dir():
+        return []
+
+    mine = os.getpid()
+    live: list[dict[str, Any]] = []
+    for entry in directory.glob("*.json"):
+        raw = read_json(entry)
+        if not isinstance(raw, dict):
+            continue
+        pid = int(raw.get("pid", 0) or 0)
+        if pid == mine:
+            continue
+        stale = time.time() - float(raw.get("at", 0) or 0) > LOCK_STALE_SECONDS
+        if stale or not _pid_alive(pid):
+            with contextlib.suppress(OSError):
+                entry.unlink()
+            continue
+        live.append(raw)
+    return live
 
 
 def _lock_path() -> Path:
@@ -279,53 +409,66 @@ def launch(config: Config, slot: int, args: list[str]) -> int:
     return completed.returncode
 
 
-def run_slot(config: Config, accounts: Accounts, slot_number: int, args: list[str]) -> int:
+def run_slot(config: Config, slot_number: int, args: list[str]) -> int:
     if slot_number <= 0:
         slot_number = 1
 
-    slot = accounts.ensure(slot_number)
     ensure_slot_dir(slot_number)
+    launched_at = time.time()
+    copy_mode = config.cred_mode == CRED_MODE_COPY
 
-    fresh_login = not slot.has_credentials()
-    previous_active = accounts.active
-
-    if config.cred_mode == CRED_MODE_COPY:
+    if copy_mode:
         held = read_lock()
-        if held and int(held.get("slot", 0)) != slot_number:
-            _warn_concurrent(int(held.get("slot", 0)), slot_number)
-        if previous_active and previous_active != slot_number:
-            previous = accounts.get(previous_active)
-            if previous is not None:
+        held_slot = int(held.get("slot", 0)) if held else 0
+        if held_slot and held_slot != slot_number:
+            raise WrapperError(t("wrapper.concurrent", held=held_slot, wanted=slot_number))
+
+    state = {"fresh_login": False}
+
+    def _prepare(fresh: Accounts) -> None:
+        slot = fresh.ensure(slot_number)
+        state["fresh_login"] = not slot.has_credentials()
+
+        if copy_mode:
+            previous = fresh.get(fresh.active)
+            if previous is not None and previous.number != slot_number:
                 copy_mode_save(previous)
-        if fresh_login:
+
+        if state["fresh_login"]:
             claudecfg.clear_identity()
         else:
-            copy_mode_restore(slot_number)
-            claudecfg.patch_identity(stored_identity(slot_number))
-        acquire_lock(slot_number)
-    else:
-        if fresh_login:
-            claudecfg.clear_identity()
-        else:
+            if copy_mode:
+                copy_mode_restore(slot_number)
             claudecfg.patch_identity(stored_identity(slot_number))
 
-    if fresh_login:
+        fresh.active = slot_number
+        slot.last_used_at = launched_at
+
+    update_accounts(_prepare)
+
+    if copy_mode:
+        acquire_lock(slot_number)
+
+    if state["fresh_login"]:
         _print_login_hint(slot_number)
 
-    accounts.active = slot_number
-    slot.last_used_at = time.time()
-    accounts.save()
-
+    register_session(slot_number)
     try:
         return launch(config, slot_number, args)
     finally:
         try:
-            if config.cred_mode == CRED_MODE_COPY:
-                copy_mode_save(slot)
+            unregister_session()
+
+            def _bookkeep(fresh: Accounts) -> None:
+                slot = fresh.ensure(slot_number)
+                if copy_mode:
+                    copy_mode_save(slot)
+                identity = capture_identity(slot, fresh, launched_at)
+                capture_usage(slot, identity)
+
+            update_accounts(_bookkeep)
+            if copy_mode:
                 release_lock()
-            capture_identity(slot)
-            capture_usage(slot)
-            accounts.save()
         except Exception as exc:
             log.write(f"post-run bookkeeping failed: {exc!r}")
 
@@ -336,11 +479,6 @@ def _print_login_hint(slot: int) -> None:
         sys.stderr.write(f"\033[33m{message}\033[0m\n")
     else:
         sys.stderr.write(f"{message}\n")
-
-
-def _warn_concurrent(held_slot: int, wanted_slot: int) -> None:
-    sys.stderr.write(t("wrapper.concurrent", held=held_slot, wanted=wanted_slot) + "\n")
-    log.write(f"concurrent launch: held={held_slot} wanted={wanted_slot}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -360,21 +498,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"{exc}\n")
         return 2
 
-    adopt_existing_login(accounts, config)
+    del explicit
 
-    if slot_number is None and wants_menu(rest, explicit):
-        from ui import menu
-
-        chosen = menu.choose(config, accounts)
-        if chosen is None:
-            return 0
-        slot_number = chosen
+    if adopt_existing_login(config):
+        accounts = Accounts.load()
 
     if slot_number is None:
-        slot_number = accounts.active or 1
+        slot_number = default_slot(accounts)
 
     try:
-        return run_slot(config, accounts, slot_number, rest)
+        return run_slot(config, slot_number, rest)
     except WrapperError as exc:
         sys.stderr.write(f"{exc}\n")
         return 2
