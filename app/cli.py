@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from app import installer
-from core import claudecfg, detect
+from core import claudecfg, detect, settings
 from core.store import (
     Accounts,
     Config,
@@ -20,6 +20,7 @@ from core.store import (
     identity_file,
     is_installed,
     log_file,
+    migrate_config,
     read_json,
     update_accounts,
 )
@@ -93,7 +94,9 @@ def _refresh_usage(accounts: Accounts, slots: list[Slot]) -> tuple[int, int]:
     if not attempted:
         return 0, 0
 
-    fresh = usage.refresh_slots(slots)
+    fresh = usage.refresh_slots(
+        slots, refresh_timeout=usage.INTERACTIVE_REFRESH_TIMEOUT
+    )
     for number, payload in fresh.items():
         target = accounts.get(number)
         if target is not None:
@@ -122,7 +125,11 @@ def _autorefresh(accounts: Accounts, slots: list[Slot], args: argparse.Namespace
     if getattr(args, "refresh", False):
         stale = slots
     else:
-        stale = [slot for slot in slots if usage.is_stale(slot.usage)]
+        stale = [
+            slot
+            for slot in slots
+            if usage.needs_network(slot, active=slot.number == accounts.active)
+        ]
 
     if not stale:
         return 0
@@ -147,6 +154,7 @@ def cmd_install(args: argparse.Namespace) -> int:
             skip_permissions=skip_permissions,
             language=getattr(args, "lang", None),
             ask=ask,
+            ask_defaults=getattr(args, "reinstall", False),
         )
     except (installer.InstallError, detect.DetectionError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -178,11 +186,9 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     for slot in slots:
         marker = "*" if slot.number == accounts.active else " "
-        state = claudecfg.token_state(creds_file(slot.number))
         label = slot.alias or slot.email or t("menu.slot_fallback_label", slot=slot.number)
-        detail = usage.format_token_state(state) or usage.format_usage(slot.usage)
         email = f"  {slot.email}" if slot.alias and slot.email else ""
-        print(f"{marker} [{slot.number}] {label}{email}   {detail}")
+        print(f"{marker} [{slot.number}] {label}{email}   {usage.describe(slot)}")
 
     if failed:
         print(t("usage.refresh_partial", count=failed))
@@ -291,11 +297,48 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
     for slot in slots:
         marker = "*" if slot.number == accounts.active else " "
-        print(f"{marker} [{slot.number}] {slot.label:<34} {usage.format_usage(slot.usage)}")
+        print(f"{marker} [{slot.number}] {slot.label:<34} {usage.describe(slot)}")
 
     if failed:
         print(t("usage.refresh_partial", count=failed))
     return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    _require_installed()
+
+    if args.key is None:
+        if args.list or not _interactive():
+            _print_settings()
+            return 0
+
+        from ui import settings_screen
+
+        settings_screen.edit()
+        _print_settings()
+        return 0
+
+    try:
+        setting = settings.find(args.key)
+        if args.value is None:
+            print(f"{setting.key} = {setting.display(Config.load())}")
+            return 0
+
+        config = settings.apply(setting, settings.parse(setting, args.value))
+    except settings.SettingError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    print(t("config.saved", key=setting.key, value=setting.display(config)))
+    return 0
+
+
+def _print_settings() -> None:
+    config = Config.load()
+    width = max(len(setting.key) for setting in settings.SETTINGS)
+    for setting in settings.SETTINGS:
+        print(f"{setting.key:<{width}}  {setting.display(config)}")
+    print()
+    print(t("config.hint"))
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -356,6 +399,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         report(WARN, t("doctor.cred_mode_copy"))
 
+    if config.auto_switch.get("enabled"):
+        report(
+            OK,
+            t(
+                "doctor.auto_switch_on",
+                strategy=config.auto_switch.get("strategy"),
+                threshold=config.auto_switch.get("threshold"),
+            ),
+        )
+    else:
+        report(OK, t("doctor.auto_switch_off"))
+
     if not accounts.slots:
         report(WARN, t("doctor.no_slots"))
 
@@ -395,7 +450,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
-def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_install_arguments(
+    parser: argparse.ArgumentParser, *, reinstall: bool = False
+) -> None:
     parser.add_argument("--claude-path", help=t("cli.help.claude_path"))
     parser.add_argument(
         "--skip-permissions", action="store_true", help=t("cli.help.skip_permissions")
@@ -411,7 +468,7 @@ def _add_install_arguments(parser: argparse.ArgumentParser) -> None:
         choices=i18n.available_languages(),
         help=t("cli.help.lang", languages="/".join(i18n.available_languages())),
     )
-    parser.set_defaults(func=cmd_install)
+    parser.set_defaults(func=cmd_install, reinstall=reinstall)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -421,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_install_arguments(subparsers.add_parser("install", help=t("cli.help.install")))
     _add_install_arguments(
-        subparsers.add_parser("reinstall", help=t("cli.help.reinstall"))
+        subparsers.add_parser("reinstall", help=t("cli.help.reinstall")), reinstall=True
     )
 
     uninstall_parser = subparsers.add_parser("uninstall", help=t("cli.help.uninstall"))
@@ -459,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
     usage_parser = subparsers.add_parser("usage", help=t("cli.help.usage"))
     usage_parser.add_argument("--cached", action="store_true", help=t("cli.help.cached"))
     usage_parser.set_defaults(func=cmd_usage)
+
+    config_parser = subparsers.add_parser("config", help=t("cli.help.config"))
+    config_parser.add_argument("key", nargs="?", help=t("cli.help.config_key"))
+    config_parser.add_argument("value", nargs="?", help=t("cli.help.config_value"))
+    config_parser.add_argument(
+        "--list", action="store_true", help=t("cli.help.config_list")
+    )
+    config_parser.set_defaults(func=cmd_config)
 
     doctor_parser = subparsers.add_parser("doctor", help=t("cli.help.doctor"))
     doctor_parser.set_defaults(func=cmd_doctor)
@@ -513,8 +578,24 @@ def run_shell(parser: argparse.ArgumentParser) -> int:
 
         if not line:
             continue
-        if line.lower() in {"exit", "quit", "q"}:
+
+        # One-letter aliases for the two things you come back to this prompt
+        # for. `l --refresh` works too, but nobody types it twice.
+        shortcut = line.lower()
+        if shortcut in {"exit", "quit", "q"}:
             return 0
+        if shortcut in {"r", "refresh"}:
+            _dispatch(parser, ["list", "--refresh"])
+            print()
+            continue
+        if shortcut in {"l", "ls"}:
+            _dispatch(parser, ["list"])
+            print()
+            continue
+        if shortcut in {"s", "settings"}:
+            _dispatch(parser, ["config"])
+            print()
+            continue
 
         try:
             tokens = shlex.split(line)
@@ -529,6 +610,7 @@ def run_shell(parser: argparse.ArgumentParser) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     installer.apply_pending_upgrade()
+    migrate_config()
 
     parser = build_parser()
     args = parser.parse_args(argv[1:])

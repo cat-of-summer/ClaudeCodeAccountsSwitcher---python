@@ -256,6 +256,7 @@ def install(
     skip_permissions: bool | None = None,
     language: str | None = None,
     ask: Callable[[str, bool], bool] | None = None,
+    ask_defaults: bool = False,
     reporter: Callable[[str], None] = print,
 ) -> Config:
     upgrading = is_installed()
@@ -269,16 +270,27 @@ def install(
     real_claude = resolve_claude(claude_path or (previous.real_claude_path or None))
     mode, probe = detect.probe_cred_mode(real_claude, previous.cred_mode_probe or None)
 
-    if skip_permissions is None:
-        if upgrading:
-            default_args = list(previous.default_args)
-        elif ask is not None:
-            wanted = ask(t("install.ask_skip_permissions"), True)
-            default_args = list(DEFAULT_ARGS) if wanted else []
-        else:
-            default_args = list(DEFAULT_ARGS)
-    else:
+    # An unattended upgrade must not stop on a prompt, so `install` over an
+    # existing setup keeps the old answer. `reinstall` is the deliberate act of
+    # coming back to change it, and asks -- with today's value as the default,
+    # so Enter still means "leave it alone".
+    previous_skip = DEFAULT_ARGS[0] in previous.default_args
+    auto_switch = dict(previous.auto_switch)
+
+    if skip_permissions is not None:
         default_args = list(DEFAULT_ARGS) if skip_permissions else []
+    elif ask is not None and (not upgrading or ask_defaults):
+        wanted = ask(t("install.ask_skip_permissions"), previous_skip if upgrading else True)
+        default_args = list(DEFAULT_ARGS) if wanted else []
+    elif upgrading:
+        default_args = list(previous.default_args)
+    else:
+        default_args = list(DEFAULT_ARGS)
+
+    if ask is not None and (not upgrading or ask_defaults):
+        auto_switch["enabled"] = ask(
+            t("install.ask_auto_switch"), bool(auto_switch.get("enabled"))
+        )
 
     config = Config(
         schema=SCHEMA_VERSION,
@@ -290,6 +302,7 @@ def install(
         default_args=default_args,
         shim_dir=str(bin_dir()),
         language=chosen_language,
+        auto_switch=auto_switch,
     )
     config.save()
 

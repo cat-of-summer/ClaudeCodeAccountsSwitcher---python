@@ -1,106 +1,18 @@
 from __future__ import annotations
 
-import contextlib
-import os
 import sys
 
-from core import claudecfg
-from core.store import Accounts, Config, Slot, creds_file, update_accounts
+from core.store import Accounts, Config, Slot, update_accounts
 from ui import usage
 from ui.i18n import t
-
-IS_WINDOWS = os.name == "nt"
-
-ESC = "\033["
-RESET = f"{ESC}0m"
-DIM = f"{ESC}2m"
-BOLD = f"{ESC}1m"
-GREEN = f"{ESC}32m"
-YELLOW = f"{ESC}33m"
-CYAN = f"{ESC}36m"
-
-ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-STD_OUTPUT_HANDLE = -11
-
-
-def enable_ansi() -> None:
-    if not IS_WINDOWS:
-        return
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        mode = ctypes.c_ulong()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(
-                handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            )
-    except (AttributeError, OSError):
-        pass
-
-
-def _read_key_windows() -> str:
-    import msvcrt
-
-    char = msvcrt.getwch()
-    if char in ("\x00", "\xe0"):
-        second = msvcrt.getwch()
-        return {"H": "up", "P": "down"}.get(second, "")
-    if char == "\r":
-        return "enter"
-    if char == "\x1b":
-        return "esc"
-    if char == "\x03":
-        raise KeyboardInterrupt
-    return char.lower()
-
-
-def _read_key_posix() -> str:
-    import select
-    import termios
-    import tty
-
-    descriptor = sys.stdin.fileno()
-    previous = termios.tcgetattr(descriptor)
-    try:
-        tty.setraw(descriptor)
-        char = sys.stdin.read(1)
-        if char == "\x1b":
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not ready:
-                return "esc"
-            if sys.stdin.read(1) != "[":
-                return "esc"
-            return {"A": "up", "B": "down"}.get(sys.stdin.read(1), "")
-        if char in ("\r", "\n"):
-            return "enter"
-        if char == "\x03":
-            raise KeyboardInterrupt
-        return char.lower()
-    finally:
-        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
-
-
-def read_key() -> str:
-    return _read_key_windows() if IS_WINDOWS else _read_key_posix()
+from ui.screen import BOLD, CYAN, DIM, GREEN, RESET, Surface, enable_ansi, read_key
 
 
 def _row(slot: Slot, *, active: bool, selected: bool) -> str:
     marker = "*" if active else " "
     pointer = ">" if selected else " "
     label = slot.alias or slot.email or t("menu.slot_fallback_label", slot=slot.number)
-
-    state = claudecfg.token_state(creds_file(slot.number))
-    if state == "missing":
-        detail = f"{DIM}{t('menu.slot_no_login')}{RESET}"
-    elif state == "stale":
-        detail = f"{YELLOW}{t('menu.slot_relogin')}{RESET}"
-    else:
-        summary = usage.format_usage(slot.usage)
-        detail = f"{DIM}{summary}{RESET}" if usage.is_unknown(summary) else summary
-        if state == "expired":
-            detail = f"{detail}  {DIM}{t('menu.token_self_refresh')}{RESET}"
+    detail = usage.describe(slot, colour=True)
 
     body = f"{pointer} {marker} {slot.number}  {label:<28} {detail}"
     return f"{BOLD}{body}{RESET}" if selected else body
@@ -126,18 +38,26 @@ def _lines(accounts: Accounts, cursor: int, note: str) -> list[str]:
     return lines
 
 
-def _draw(lines: list[str], previous_height: int) -> int:
-    if previous_height:
-        sys.stdout.write(f"{ESC}{previous_height}A")
-    for line in lines:
-        sys.stdout.write(f"\r{ESC}K{line}\n")
-    sys.stdout.flush()
-    return len(lines)
+def refresh_into(accounts: Accounts, slots: list[Slot]) -> int:
+    """Ask the API about `slots` and keep the answer, in memory and on disk."""
+    fresh = usage.refresh_slots(slots, refresh_timeout=usage.INTERACTIVE_REFRESH_TIMEOUT)
+    for number, payload in fresh.items():
+        target = accounts.get(number)
+        if target is not None:
+            target.usage = payload
+
+    if fresh:
+
+        def _store(current: Accounts, fetched: dict = fresh) -> None:
+            for number, payload in fetched.items():
+                current.ensure(number).usage = payload
+
+        update_accounts(_store)
+
+    return len(fresh)
 
 
 def choose(config: Config, accounts: Accounts) -> int | None:
-    del config
-
     slots = accounts.ordered()
     if not slots:
         return accounts.next_free_number()
@@ -150,11 +70,11 @@ def choose(config: Config, accounts: Accounts) -> int | None:
             cursor = index
             break
 
+    surface = Surface()
     note = ""
-    height = 0
     try:
         while True:
-            height = _draw(_lines(accounts, cursor, note), height)
+            surface.paint(_lines(accounts, cursor, note))
             note = ""
             key = read_key()
 
@@ -165,38 +85,34 @@ def choose(config: Config, accounts: Accounts) -> int | None:
                 cursor = (cursor - 1) % (len(slots) + 1)
             elif key == "down":
                 cursor = (cursor + 1) % (len(slots) + 1)
-            elif key == "r":
-                height = _draw(_lines(accounts, cursor, t("menu.refreshing")), height)
-                fresh = usage.refresh_slots(slots)
-                for number, payload in fresh.items():
-                    target = accounts.get(number)
-                    if target is not None:
-                        target.usage = payload
-                if fresh:
-
-                    def _store(current: Accounts, fetched=fresh) -> None:
-                        for number, payload in fetched.items():
-                            current.ensure(number).usage = payload
-
-                    update_accounts(_store)
-                note = (
-                    t("menu.refreshed", count=len(fresh))
-                    if fresh
-                    else t("menu.refresh_failed")
+            elif key in ("r", "u"):
+                # `u` is one request, `r` is one per slot. Shift-R could not be
+                # the pair to `r`: read_key() lowercases everything.
+                wanted = (
+                    [slots[cursor]] if key == "u" and cursor < len(slots) else slots
                 )
+                surface.paint(_lines(accounts, cursor, t("menu.refreshing")))
+                count = refresh_into(accounts, wanted)
+                note = (
+                    t("menu.refreshed", count=count) if count else t("menu.refresh_failed")
+                )
+            elif key == "s":
+                from ui import settings_screen
+
+                settings_screen.edit(config)
+                surface.reset()
             elif key in ("enter", "a"):
                 if key == "a" or cursor == len(slots):
                     return accounts.next_free_number()
                 return slots[cursor].number
             elif key.isdigit():
-                wanted = int(key)
+                wanted_number = int(key)
                 for index, slot in enumerate(slots):
-                    if slot.number == wanted:
+                    if slot.number == wanted_number:
                         cursor = index
                         break
     except KeyboardInterrupt:
         sys.stdout.write("\n")
         return None
     finally:
-        with contextlib.suppress(OSError):
-            sys.stdout.flush()
+        sys.stdout.flush()

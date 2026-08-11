@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest import mock
 
+from core.store import Slot, creds_file
 from tests.base import TempHome
 from ui import i18n, usage
 
@@ -27,7 +29,7 @@ class TestUsageFormatting(TempHome):
     def test_reset_shows_date_and_time(self) -> None:
         # The expected value cannot be a literal: it depends on the zone of the
         # machine running the tests, which is exactly what the render converts to.
-        moment = usage._parse_reset(FIVE_HOUR_RESET)
+        moment = usage.parse_iso(FIVE_HOUR_RESET)
         assert moment is not None
         expected = moment.strftime(i18n.t("usage.reset_format"))
 
@@ -58,7 +60,7 @@ class TestUsageFormatting(TempHome):
             text = usage.format_reset(FIVE_HOUR_RESET)
 
         self.assertNotIn("usage.reset_format", text)
-        moment = usage._parse_reset(FIVE_HOUR_RESET)
+        moment = usage.parse_iso(FIVE_HOUR_RESET)
         assert moment is not None
         self.assertIn(moment.strftime(usage.DEFAULT_RESET_FORMAT), text)
 
@@ -76,11 +78,6 @@ class TestUsageFormatting(TempHome):
     def test_percent_may_be_absent(self) -> None:
         text = usage.format_usage({"five_hour": {"resets_at": None}})
         self.assertEqual(text, i18n.t("usage.five_hour_unknown"))
-
-    def test_token_state_labels_exist(self) -> None:
-        for state in ("expired", "stale", "missing"):
-            self.assertTrue(usage.format_token_state(state))
-        self.assertEqual(usage.format_token_state("ok"), "")
 
     def test_age_buckets(self) -> None:
         self.assertEqual(usage.age_text(None), "")
@@ -120,6 +117,112 @@ class TestUsageFreshness(TempHome):
     def test_usage_past_the_ttl_is_stale(self) -> None:
         old = self._now_ms() - (usage.USAGE_TTL_SECONDS + 60) * 1000
         self.assertTrue(usage.is_stale({"fetchedAtMs": old}))
+
+
+class TestDescribe(TempHome):
+    """The listing column. An expired token used to wipe out the numbers."""
+
+    def _slot(self, number: int = 1) -> Slot:
+        return Slot(
+            number=number,
+            usage={
+                "fetchedAtMs": datetime.now(timezone.utc).timestamp() * 1000,
+                "five_hour": {"utilization": 46},
+                "seven_day": {"utilization": 96},
+            },
+        )
+
+    def test_expired_token_keeps_the_numbers(self) -> None:
+        text = usage.describe(self._slot(), state="expired")
+        self.assertIn("46%", text)
+        self.assertIn("96%", text)
+        self.assertIn(i18n.t("menu.token_self_refresh"), text)
+
+    def test_healthy_token_is_just_the_numbers(self) -> None:
+        text = usage.describe(self._slot(), state="ok")
+        self.assertIn("96%", text)
+        self.assertNotIn(i18n.t("menu.token_self_refresh"), text)
+
+    def test_a_slot_needing_a_relogin_says_so(self) -> None:
+        text = usage.describe(self._slot(), state="stale")
+        self.assertEqual(text, i18n.t("menu.slot_relogin"))
+
+    def test_a_slot_without_a_login_says_so(self) -> None:
+        text = usage.describe(self._slot(), state="missing")
+        self.assertEqual(text, i18n.t("menu.slot_no_login"))
+
+    def test_colour_is_opt_in(self) -> None:
+        plain = usage.describe(self._slot(), state="expired")
+        painted = usage.describe(self._slot(), state="expired", colour=True)
+        self.assertNotIn("\033", plain)
+        self.assertIn("\033", painted)
+
+    def test_state_is_read_from_disk_when_not_given(self) -> None:
+        self.write_credentials(creds_file(1))
+        self.assertIn("46%", usage.describe(self._slot()))
+
+
+class TestRefreshOne(TempHome):
+    def test_an_expired_token_is_exchanged_before_asking(self) -> None:
+        self.write_credentials(creds_file(1), expiresAt=1)
+        with mock.patch.object(usage.oauth, "refresh_slot") as refresh, mock.patch.object(
+            usage, "fetch_live_ex", return_value=({"five_hour": {"utilization": 1}}, 200)
+        ):
+            usage._refresh_one(1, busy=set(), timeout=1, refresh_timeout=1)
+        refresh.assert_called_once()
+
+    def test_a_401_costs_exactly_one_forced_exchange(self) -> None:
+        self.write_credentials(creds_file(1))
+        answers = [(None, 401), ({"five_hour": {"utilization": 5}}, 200)]
+
+        with mock.patch.object(
+            usage.oauth, "refresh_slot", return_value=usage.oauth.REFRESHED
+        ) as refresh, mock.patch.object(
+            usage, "fetch_live_ex", side_effect=answers
+        ) as fetch:
+            result = usage._refresh_one(1, busy=set(), timeout=1, refresh_timeout=1)
+
+        refresh.assert_called_once()
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(result["five_hour"], {"utilization": 5})
+
+    def test_a_slot_needing_a_relogin_is_not_asked_at_all(self) -> None:
+        self.write_credentials(creds_file(1), expiresAt=1, refreshTokenExpiresAt=1)
+        with mock.patch.object(usage, "fetch_live_ex") as fetch:
+            self.assertIsNone(
+                usage._refresh_one(1, busy=set(), timeout=1, refresh_timeout=1)
+            )
+        fetch.assert_not_called()
+
+    def test_refreshable_now_includes_expired_tokens(self) -> None:
+        self.write_credentials(creds_file(1), expiresAt=1)  # expired, refreshable
+        self.write_credentials(creds_file(2), expiresAt=1, refreshTokenExpiresAt=1)
+        slots = [Slot(number=1), Slot(number=2), Slot(number=3)]
+        self.assertEqual([s.number for s in usage.refreshable(slots)], [1])
+
+
+class TestFreshnessTiers(TempHome):
+    def _aged(self, seconds: float) -> dict:
+        now = datetime.now(timezone.utc).timestamp() * 1000
+        return {"fetchedAtMs": now - seconds * 1000}
+
+    def test_the_active_slot_goes_stale_sooner(self) -> None:
+        recent = Slot(number=1, usage=self._aged(usage.USAGE_TTL_SECONDS + 60))
+        self.assertTrue(usage.needs_network(recent, active=True))
+        self.assertFalse(usage.needs_network(recent, active=False))
+
+    def test_idle_slots_still_expire(self) -> None:
+        old = Slot(number=1, usage=self._aged(usage.USAGE_TTL_IDLE_SECONDS + 60))
+        self.assertTrue(usage.needs_network(old, active=False))
+
+    def test_ranking_tolerates_a_much_older_snapshot(self) -> None:
+        """The weekly window cannot move fast enough to invalidate it."""
+        aged = self._aged(usage.USAGE_TTL_IDLE_SECONDS + 60)
+        self.assertTrue(usage.is_stale(aged))
+        self.assertTrue(usage.is_usable_for_ranking(aged))
+
+        ancient = self._aged(usage.USAGE_TTL_RANKING_SECONDS + 60)
+        self.assertFalse(usage.is_usable_for_ranking(ancient))
 
 
 class TestPayloadShapes(TempHome):

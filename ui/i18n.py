@@ -92,7 +92,10 @@ def current_language() -> str:
     return _language
 
 
-def t(key: str, **params: object) -> str:
+def t(key: str, /, **params: object) -> str:
+    # `key` is positional-only so that a catalog string may itself contain a
+    # {key} placeholder -- several of the config messages do, and without this
+    # they collide with the lookup argument and raise at call time.
     template = _catalog(_language).get(key)
     if template is None and _language != DEFAULT_LANGUAGE:
         template = _catalog(DEFAULT_LANGUAGE).get(key)

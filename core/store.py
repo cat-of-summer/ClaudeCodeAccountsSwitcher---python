@@ -23,6 +23,21 @@ LOCK_POLL = 0.05
 
 DEFAULT_ARGS = ["--dangerously-skip-permissions"]
 
+# Off by default on purpose: this changes how `claude` is launched -- it can
+# stop and restart a live session -- and that deserves an explicit yes.
+DEFAULT_AUTO_SWITCH: dict[str, Any] = {
+    "enabled": False,
+    "strategy": "limits",
+    "threshold": 95,
+    "maxSwitches": 3,
+    "minIntervalSeconds": 60,
+    "confirmWithApi": True,
+    "restoreMode": True,
+    "resumePrompt": "",
+}
+
+AUTO_SWITCH_STRATEGIES = ("limits", "order", "notify")
+
 
 def home() -> Path:
     return Path.home()
@@ -211,12 +226,20 @@ class Config:
     default_args: list[str] = field(default_factory=lambda: list(DEFAULT_ARGS))
     shim_dir: str = ""
     language: str = ""
+    auto_switch: dict[str, Any] = field(
+        default_factory=lambda: dict(DEFAULT_AUTO_SWITCH)
+    )
 
     @classmethod
     def load(cls) -> "Config":
         raw = read_json(config_path())
         if not isinstance(raw, dict):
             return cls()
+        stored = raw.get("autoSwitch")
+        # An explicitly empty list means "add nothing", and must not be
+        # confused with an absent key: `[] or DEFAULT_ARGS` used to hand the
+        # bypass flag back to a user who had just turned it off.
+        stored_args = raw.get("defaultArgs")
         return cls(
             schema=raw.get("schema", SCHEMA_VERSION),
             version=raw.get("version", __version__),
@@ -224,9 +247,20 @@ class Config:
             real_claude_path=raw.get("realClaudePath", ""),
             cred_mode=raw.get("credMode", "env"),
             cred_mode_probe=raw.get("credModeProbe") or {},
-            default_args=raw.get("defaultArgs") or list(DEFAULT_ARGS),
+            default_args=(
+                list(stored_args)
+                if isinstance(stored_args, list)
+                else list(DEFAULT_ARGS)
+            ),
             shim_dir=raw.get("shimDir", ""),
             language=raw.get("language", ""),
+            # Merged rather than taken as-is: a config written by an older
+            # build is missing whatever key the newer one added, and reading
+            # that key would be a KeyError at the worst possible moment.
+            auto_switch={
+                **DEFAULT_AUTO_SWITCH,
+                **(stored if isinstance(stored, dict) else {}),
+            },
         )
 
     def save(self) -> None:
@@ -242,12 +276,36 @@ class Config:
                 "defaultArgs": self.default_args,
                 "shimDir": self.shim_dir,
                 "language": self.language,
+                "autoSwitch": self.auto_switch,
             },
         )
 
 
 def is_installed() -> bool:
     return config_path().exists()
+
+
+def migrate_config() -> bool:
+    """Bring an older config.json up to the current schema.
+
+    Nothing needs converting today -- every key is read through a default -- but
+    stamping the version is what lets a future breaking change know which
+    layout it is looking at, and the backup is what makes that change safe.
+    """
+    if not is_installed():
+        return False
+
+    config = Config.load()
+    if config.schema >= SCHEMA_VERSION:
+        return False
+
+    backup_file(config_path())
+    config.schema = SCHEMA_VERSION
+    config.save()
+    from core import log
+
+    log.write(f"config migrated to schema {SCHEMA_VERSION}")
+    return True
 
 
 @dataclass
@@ -258,6 +316,7 @@ class Slot:
     account_uuid: str = ""
     user_id: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    token: dict[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
     last_used_at: float = 0.0
 
@@ -279,6 +338,7 @@ class Slot:
             "accountUuid": self.account_uuid,
             "userID": self.user_id,
             "usage": self.usage,
+            "token": self.token,
             "createdAt": self.created_at,
             "lastUsedAt": self.last_used_at,
         }
@@ -292,6 +352,7 @@ class Slot:
             account_uuid=raw.get("accountUuid", "") or "",
             user_id=raw.get("userID", "") or "",
             usage=raw.get("usage") or {},
+            token=raw.get("token") or {},
             created_at=raw.get("createdAt", 0.0) or 0.0,
             last_used_at=raw.get("lastUsedAt", 0.0) or 0.0,
         )

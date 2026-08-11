@@ -6,17 +6,29 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from app import autoswitch
 from core import claudecfg, log
 from core.detect import CRED_MODE_COPY, CRED_MODE_ENV
+from core.sessions import (  # noqa: F401  -- re-exported, see note below
+    LOCK_STALE_SECONDS,
+    acquire_lock,
+    other_live_sessions,
+    read_lock,
+    register_session,
+    release_lock,
+    sessions_dir,
+    unregister_session,
+)
 from core.store import (
     Accounts,
     Config,
     Slot,
-    app_dir,
     creds_file,
     ensure_slot_dir,
     identity_file,
@@ -26,6 +38,10 @@ from core.store import (
     write_json_atomic,
 )
 from ui.i18n import t
+
+# Session and lock bookkeeping moved to core/sessions.py so that core modules
+# can consult it without importing app/. Re-exported here because it reads as
+# wrapper vocabulary at every call site in this file.
 
 _SLOT_RE = re.compile(r"^\d+$")
 _ALIAS_RE = re.compile(r"^@(.+)$")
@@ -48,8 +64,6 @@ CLAUDE_SUBCOMMANDS = frozenset(
         "upgrade",
     }
 )
-
-LOCK_STALE_SECONDS = 12 * 60 * 60
 
 
 class WrapperError(Exception):
@@ -241,103 +255,6 @@ def capture_usage(slot: Slot, identity: dict[str, Any] | None = None) -> None:
     }
 
 
-def sessions_dir() -> Path:
-    return app_dir() / "sessions"
-
-
-def register_session(slot: int) -> None:
-    write_json_atomic(
-        sessions_dir() / f"{os.getpid()}.json",
-        {"pid": os.getpid(), "slot": slot, "at": time.time()},
-        harden=False,
-    )
-
-
-def unregister_session() -> None:
-    with contextlib.suppress(OSError):
-        (sessions_dir() / f"{os.getpid()}.json").unlink()
-
-
-def other_live_sessions() -> list[dict[str, Any]]:
-    """Wrapper processes other than this one that are still running.
-
-    Tells apart the two reasons the shared config can name an unfamiliar
-    account: a deliberate re-login on this slot (nobody else is running) versus
-    a neighbouring terminal having just written its own (someone is).
-    """
-    directory = sessions_dir()
-    if not directory.is_dir():
-        return []
-
-    mine = os.getpid()
-    live: list[dict[str, Any]] = []
-    for entry in directory.glob("*.json"):
-        raw = read_json(entry)
-        if not isinstance(raw, dict):
-            continue
-        pid = int(raw.get("pid", 0) or 0)
-        if pid == mine:
-            continue
-        stale = time.time() - float(raw.get("at", 0) or 0) > LOCK_STALE_SECONDS
-        if stale or not _pid_alive(pid):
-            with contextlib.suppress(OSError):
-                entry.unlink()
-            continue
-        live.append(raw)
-    return live
-
-
-def _lock_path() -> Path:
-    return app_dir() / ".lock"
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            completed = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return str(pid) in completed.stdout
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def read_lock() -> dict[str, Any] | None:
-    raw = read_json(_lock_path())
-    if not isinstance(raw, dict):
-        return None
-    if time.time() - float(raw.get("at", 0)) > LOCK_STALE_SECONDS:
-        return None
-    if not _pid_alive(int(raw.get("pid", 0) or 0)):
-        return None
-    return raw
-
-
-def acquire_lock(slot: int) -> None:
-    write_json_atomic(_lock_path(), {"pid": os.getpid(), "slot": slot, "at": time.time()})
-
-
-def release_lock() -> None:
-    raw = read_json(_lock_path())
-    if isinstance(raw, dict) and int(raw.get("pid", 0) or 0) != os.getpid():
-        return
-    with contextlib.suppress(OSError):
-        _lock_path().unlink()
-
-
 def _shared_account_uuid() -> str:
     oauth = claudecfg.read_credentials(claudecfg.shared_credentials_path())
     if not oauth:
@@ -390,7 +307,61 @@ def build_environment(config: Config, slot: int) -> dict[str, str]:
     return env
 
 
-def launch(config: Config, slot: int, args: list[str]) -> int:
+TERMINATE_GRACE_SECONDS = 5.0
+
+
+def terminate(process: subprocess.Popen[bytes]) -> None:
+    """Stop claude and everything it spawned, politely first.
+
+    claude leaves node and ripgrep children holding the console, so on Windows
+    the whole tree has to go: killing the parent alone leaves the terminal
+    unusable for the session we are about to start in its place.
+    """
+    if process.poll() is not None:
+        return
+
+    try:
+        if os.name == "nt":
+            _taskkill(process.pid, force=False)
+        else:
+            process.terminate()
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        if os.name == "nt":
+            _taskkill(process.pid, force=True)
+        else:
+            process.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+
+
+def _taskkill(pid: int, *, force: bool) -> None:
+    command = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        command.append("/F")
+    subprocess.run(
+        command,
+        capture_output=True,
+        timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def launch(
+    config: Config,
+    slot: int,
+    args: list[str],
+    *,
+    on_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> int:
     executable = config.real_claude_path
     if not executable or not Path(executable).exists():
         raise WrapperError(t("error.real_claude_missing"))
@@ -400,19 +371,31 @@ def launch(config: Config, slot: int, args: list[str]) -> int:
     log.write(f"launch slot={slot} mode={config.cred_mode} args={args}")
 
     try:
-        completed = subprocess.run(command, env=env)
-    except KeyboardInterrupt:
-        return 130
+        process = subprocess.Popen(command, env=env)
     except OSError as exc:
         raise WrapperError(t("error.launch_failed", error=exc)) from exc
 
-    return completed.returncode
+    if on_started is not None:
+        on_started(process)
+
+    while True:
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            # Ctrl-C reached claude too and it handles its own shutdown. Waiting
+            # again is what keeps us from returning while the child still owns
+            # the terminal.
+            continue
 
 
-def run_slot(config: Config, slot_number: int, args: list[str]) -> int:
-    if slot_number <= 0:
-        slot_number = 1
-
+def run_once(
+    config: Config,
+    slot_number: int,
+    args: list[str],
+    *,
+    on_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> int:
+    """One claude, start to finish, with the per-slot bookkeeping around it."""
     ensure_slot_dir(slot_number)
     launched_at = time.time()
     copy_mode = config.cred_mode == CRED_MODE_COPY
@@ -454,7 +437,7 @@ def run_slot(config: Config, slot_number: int, args: list[str]) -> int:
 
     register_session(slot_number)
     try:
-        return launch(config, slot_number, args)
+        return launch(config, slot_number, args, on_started=on_started)
     finally:
         try:
             unregister_session()
@@ -473,12 +456,251 @@ def run_slot(config: Config, slot_number: int, args: list[str]) -> int:
             log.write(f"post-run bookkeeping failed: {exc!r}")
 
 
+def run_slot(config: Config, slot_number: int, args: list[str]) -> int:
+    if slot_number <= 0:
+        slot_number = 1
+
+    plan = autoswitch.plan_session(config, args, interactive=_interactive())
+    if not plan.supervise:
+        return run_once(config, slot_number, args)
+
+    return _supervise(config, slot_number, plan)
+
+
 def _print_login_hint(slot: int) -> None:
     message = t("wrapper.login_needed", slot=slot)
     if sys.stderr and sys.stderr.isatty():
         sys.stderr.write(f"\033[33m{message}\033[0m\n")
     else:
         sys.stderr.write(f"{message}\n")
+
+
+def _interactive() -> bool:
+    return bool(
+        sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty()
+    )
+
+
+def _number(source: dict[str, Any], key: str, default: float) -> float:
+    """Read a numeric setting without letting a legitimate 0 fall back.
+
+    `value or default` reads naturally and is wrong here: "never switch"
+    (maxSwitches 0) and "no cooldown" (minIntervalSeconds 0) are settings a
+    user can pick, and they are exactly the values `or` throws away.
+    """
+    value = source.get(key, default)
+    return float(value) if isinstance(value, (int, float)) else default
+
+
+def _notice(message: str) -> None:
+    if sys.stderr and sys.stderr.isatty():
+        sys.stderr.write(f"\033[33mccas: {message}\033[0m\n")
+    else:
+        sys.stderr.write(f"ccas: {message}\n")
+    sys.stderr.flush()
+
+
+def _supervise(config: Config, slot_number: int, plan: autoswitch.SessionPlan) -> int:
+    """Run claude, and when it runs out of quota, run it again elsewhere.
+
+    The switch is driven by a reaper thread rather than by the exit code
+    because claude does not exit when it hits the wall -- it sits at the prompt
+    refusing to work. Waiting for the user to quit would defeat the point;
+    killing it before the wall would interrupt work that was still going.
+    """
+    auto = config.auto_switch
+    threshold = _number(auto, "threshold", 95.0)
+    max_switches = int(_number(auto, "maxSwitches", 3))
+    min_interval = _number(auto, "minIntervalSeconds", 60.0)
+
+    args = list(plan.args)
+    session_id = plan.session_id
+    tried: set[int] = set()
+    switches = 0
+    last_switch = 0.0
+
+    while True:
+        tried.add(slot_number)
+        signal = autoswitch.LimitSignal()
+        decision: dict[str, Any] = {}
+        allowed = switches < max_switches
+        # Evaluated when the wall is hit, not now: this session may run for
+        # hours, and a cooldown measured from its launch would have expired
+        # long before it ever mattered.
+        not_before = last_switch + min_interval if last_switch else 0.0
+
+        watcher = autoswitch.TranscriptWatcher(
+            session_id, since=time.time(), signal=signal
+        )
+        watcher.start()
+
+        def _on_started(
+            process: subprocess.Popen[bytes],
+            _signal: autoswitch.LimitSignal = signal,
+            _decision: dict[str, Any] = decision,
+            _slot: int = slot_number,
+            _tried: set[int] = set(tried),
+            _allowed: bool = allowed,
+            _not_before: float = not_before,
+        ) -> None:
+            reaper = threading.Thread(
+                target=_reap,
+                args=(process, _signal, _decision, config, _slot, _tried, threshold),
+                kwargs={
+                    "may_kill": _allowed,
+                    "not_before": _not_before,
+                    "session_id": session_id,
+                },
+                daemon=True,
+            )
+            reaper.start()
+
+        try:
+            code = run_once(config, slot_number, args, on_started=_on_started)
+        finally:
+            watcher.stop()
+
+        # _reap only leaves a target behind when it actually killed the child.
+        target = decision.get("target")
+        if not target:
+            if signal.fired and not allowed and switches:
+                _notice(t("autoswitch.gave_up", count=switches))
+            return code
+
+        mode = str(decision.get("mode") or "")
+        args = autoswitch.relaunch_args(
+            args, session_id=session_id, mode=mode, config=config
+        )
+        slot_number = int(target)
+        switches += 1
+        last_switch = time.time()
+        _notice(t("autoswitch.resumed", slot=slot_number))
+
+
+def _reap(
+    process: subprocess.Popen[bytes],
+    signal: autoswitch.LimitSignal,
+    decision: dict[str, Any],
+    config: Config,
+    slot_number: int,
+    tried: set[int],
+    threshold: float,
+    *,
+    may_kill: bool,
+    not_before: float = 0.0,
+    session_id: str | None = None,
+) -> None:
+    while not signal.wait(0.5):
+        if process.poll() is not None:
+            return
+
+    window = signal.window
+    _notice(
+        t(
+            "autoswitch.limit_hit",
+            slot=slot_number,
+            window=t(f"usage.window_{window}") if window else t("usage.window_unknown"),
+        )
+    )
+
+    if config.cred_mode == CRED_MODE_COPY and other_live_sessions():
+        # In copy mode the credentials live in one shared file; moving this
+        # session would silently move the neighbour's too.
+        _notice(t("autoswitch.copy_mode_busy"))
+        return
+
+    accounts = Accounts.load()
+    slot = accounts.ensure(slot_number)
+
+    if config.auto_switch.get("confirmWithApi", True):
+        _notice(t("autoswitch.confirming"))
+        confirmed = autoswitch.confirm_exhausted(slot, threshold=threshold)
+        if confirmed is None:
+            _notice(t("autoswitch.unconfirmed"))
+            return
+        if not confirmed:
+            _notice(t("autoswitch.not_exhausted"))
+            return
+        _store_usage({slot_number: slot.usage})
+
+    _refresh_candidates(accounts, current=slot_number, tried=tried)
+
+    election = autoswitch.elect_target(
+        accounts,
+        current=slot_number,
+        tried=tried,
+        threshold=threshold,
+        strategy=str(config.auto_switch.get("strategy") or "limits"),
+    )
+    if election.target is None:
+        _notice(t("autoswitch.no_target", slot=slot_number))
+        return
+
+    if process.poll() is not None:
+        # The user quit while we were checking. Relaunching now would reopen a
+        # session they just closed on purpose.
+        log.write("autoswitch: session ended before the switch, standing down")
+        return
+
+    decision["target"] = election.target
+    decision["mode"] = signal.permission_mode
+
+    too_soon = not_before and time.time() < not_before
+    if config.auto_switch.get("strategy") == "notify" or not may_kill or too_soon:
+        hint = autoswitch.relaunch_args(
+            [], session_id=session_id, mode=signal.permission_mode, config=config
+        )
+        _notice(
+            t(
+                "autoswitch.notify_command",
+                command=f"claude {election.target} {' '.join(hint)}".strip(),
+            )
+        )
+        decision.pop("target", None)
+        return
+
+    target_label = accounts.ensure(election.target).label
+    _notice(
+        t(
+            "autoswitch.switching",
+            from_slot=slot_number,
+            to_slot=election.target,
+            label=target_label,
+            mode=signal.permission_mode or t("common.none"),
+        )
+    )
+    terminate(process)
+
+
+def _store_usage(payloads: dict[int, dict[str, Any]]) -> None:
+    if not payloads:
+        return
+
+    def _write(current: Accounts) -> None:
+        for number, payload in payloads.items():
+            if payload:
+                current.ensure(number).usage = payload
+
+    update_accounts(_write)
+
+
+def _refresh_candidates(accounts: Accounts, *, current: int, tried: set[int]) -> None:
+    """Make sure the ranking is done on numbers worth ranking by."""
+    from ui import usage as usage_module
+
+    pool = autoswitch.candidates(accounts, current=current, tried=tried)
+    stale = [
+        slot for slot in pool if not usage_module.is_usable_for_ranking(slot.usage)
+    ]
+    if not stale:
+        return
+
+    fresh = usage_module.refresh_slots(
+        stale, refresh_timeout=usage_module.INTERACTIVE_REFRESH_TIMEOUT
+    )
+    for number, payload in fresh.items():
+        accounts.ensure(number).usage = payload
+    _store_usage(fresh)
 
 
 def main(argv: list[str] | None = None) -> int:

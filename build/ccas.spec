@@ -49,17 +49,23 @@ ARTIFACT_NAME = (
 LANG_DATA = [(str(path), "lang") for path in sorted((ROOT / "lang").glob("*.json"))]
 
 HIDDEN = [
+    "app.autoswitch",
     "app.cli",
     "app.installer",
     "app.wrapper",
     "core.claudecfg",
     "core.detect",
     "core.log",
+    "core.oauth",
+    "core.sessions",
+    "core.settings",
     "core.store",
     "core.version",
     "system.secure",
     "ui.i18n",
     "ui.menu",
+    "ui.screen",
+    "ui.settings_screen",
     "ui.usage",
 ]
 
