@@ -5,13 +5,17 @@
 
 - [base.py](base.py.md)
 - [test_arguments.py](test_arguments.py.md)
+- [test_autoswitch.py](test_autoswitch.py.md)
 - [test_claude_config.py](test_claude_config.py.md)
 - [test_concurrency.py](test_concurrency.py.md)
 - [test_credentials.py](test_credentials.py.md)
 - [test_i18n.py](test_i18n.py.md)
 - [test_migration.py](test_migration.py.md)
+- [test_oauth.py](test_oauth.py.md)
 - [test_pathenv.py](test_pathenv.py.md)
+- [test_settings.py](test_settings.py.md)
 - [test_store.py](test_store.py.md)
+- [test_supervise.py](test_supervise.py.md)
 - [test_usage.py](test_usage.py.md)
 
 <!-- DOCGEN:END -->
