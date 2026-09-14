@@ -17,6 +17,25 @@ fi
 
 echo "Python: $("$python" --version)"
 
+# The version baked into the binary. CCAS_VERSION wins; otherwise a tag build
+# in CI takes the tag the toolkit already normalised for us (REF_NAME_NORM,
+# e.g. "v1.2.0"), so the release and `ccas --version` cannot disagree.
+version="${CCAS_VERSION:-}"
+if [ -z "$version" ] && [ "${REF_TYPE:-}" = tag ] && [ -n "${REF_NAME_NORM:-}" ]; then
+    version="$REF_NAME_NORM"
+fi
+version="${version##*/}"   # "pkg/v1.2.0" -> "v1.2.0"
+version="${version#[vV]}"  # "v1.2.0"     -> "1.2.0"
+
+version_file="$root/core/version.py"
+if [ -n "$version" ]; then
+    cp "$version_file" "$version_file.orig"
+    trap 'mv -f "$version_file.orig" "$version_file"' EXIT
+    sed -i.bak "s/^__version__ = \".*\"$/__version__ = \"$version\"/" "$version_file"
+    rm -f "$version_file.bak"
+    echo "Version: $version (stamped into core/version.py for this build)"
+fi
+
 scratch="$root/build/__pycache__"
 export PYTHONPYCACHEPREFIX="$scratch"
 

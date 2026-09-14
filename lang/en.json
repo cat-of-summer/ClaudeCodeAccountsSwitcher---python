@@ -59,6 +59,12 @@
   "autoswitch.gave_up": "already switched {count} times this session - take it from here",
   "autoswitch.copy_mode_busy": "auto-switching is unsafe in copy mode while a neighbouring session is live",
   "autoswitch.notify_command": "continue manually: {command}",
+  "autoswitch.switching_later": "moving from slot {from_slot} to {to_slot} ({label}) once it opens at {opens}; stopping this session now...",
+  "autoswitch.waiting": "every account is spent - waiting for slot {slot} ({label}) to open at {opens}, about {minutes} min; Ctrl+C to stop waiting",
+  "autoswitch.waiting_title": "waiting for slot {slot}, {minutes} min",
+  "autoswitch.wait_cancelled": "wait cancelled - continue by hand when a slot opens",
+  "autoswitch.wait_too_long": "the next to open is slot {slot} ({label}) at {opens}, in {minutes} min - longer than the {limit} min wait limit, staying put",
+  "autoswitch.default_resume_prompt": "Check the running processes, restart whatever stopped, and carry on.",
 
   "cli.no_slots_hint": "No slots yet. Run `claude` and sign in - a slot is created automatically.",
   "cli.no_slots": "No slots yet.",
@@ -71,7 +77,7 @@
   "cli.slot_renamed": "Slot {slot} is now '{alias}'. Launch with: claude @{alias}",
   "cli.not_installed_bare": "ccas is not installed yet.",
   "cli.shell.banner": "ccas {version} - interactive mode",
-  "cli.shell.hint": "Type a command and press Enter: install, list, switch <n>, add, doctor, --help. Type 'exit' (or Ctrl+C) to close.",
+  "cli.shell.hint": "Type a command and press Enter: list, run <n>, switch <n>, add, doctor, --help. A bare slot number starts claude on it. Type 'exit' (or Ctrl+C) to close.",
   "cli.shell.unknown": "Unknown command. Type --help for the list, or 'exit' to close.",
 
   "cli.description": "Claude Code account switcher. Swaps only the credentials - history, projects, settings and plugins stay shared.",
@@ -98,6 +104,7 @@
   "cli.help.cached": "no network requests",
   "cli.help.cached_list": "show stored limits without querying the network",
   "cli.help.menu": "pick the active account interactively",
+  "cli.help.run": "start claude on a slot (number, @alias or email)",
   "cli.help.target": "number, @alias or email",
   "cli.help.lang": "interface language: {languages}",
 
@@ -181,6 +188,8 @@
   "config.help_auto-switch-threshold": "how full the 5-hour window must be before the account counts as spent (50-100)",
   "config.label_auto-switch-max": "switches per session",
   "config.help_auto-switch-max": "how many times in a row a session may move before it stops trying (1-10)",
+  "config.label_auto-switch-max-wait": "wait for a reset, minutes",
+  "config.help_auto-switch-max-wait": "when every account is spent, how long a session may wait for the nearest reset before giving up (0 - never wait)",
   "config.label_auto-switch-confirm": "confirm with the API",
   "config.help_auto-switch-confirm": "ask the API for limits before moving - filters out transient 429s, but needs a connection",
   "config.label_auto-switch-restore-mode": "restore the mode",

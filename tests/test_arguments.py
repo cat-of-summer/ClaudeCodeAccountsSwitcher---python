@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from unittest import mock
+
 from app import wrapper
+from core import store
 from core.store import Accounts, Slot
 from tests.base import TempHome
 
@@ -82,3 +85,49 @@ class TestBareInvocation(TempHome):
     def test_bare_claude_never_prompts(self) -> None:
         """A bare `claude` resumes the last account instead of opening a picker."""
         self.assertFalse(hasattr(wrapper, "wants_menu"))
+
+
+class TestStartFromCcas(TempHome):
+    """`ccas run 2`, a bare `2` at the prompt and Enter in the menu all land here."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from core.store import Config
+
+        Config(real_claude_path="/bin/claude").save()
+        self.write_credentials(store.creds_file(2))
+        accounts = Accounts()
+        accounts.slots[2] = Slot(number=2, alias="work", email="b@example.com")
+        accounts.save()
+
+    def test_run_hands_the_slot_to_the_wrapper(self) -> None:
+        import argparse
+
+        from app import cli
+
+        with mock.patch.object(wrapper, "run_slot", return_value=0) as run:
+            cli.cmd_run(argparse.Namespace(target="@work", claude_args=["--verbose"]))
+
+        run.assert_called_once()
+        _, slot_number, args = run.call_args.args
+        self.assertEqual(slot_number, 2)
+        self.assertEqual(args, ["--verbose"])
+        self.assertEqual(Accounts.load().active, 2)
+
+    def test_a_bare_number_at_the_prompt_is_a_run(self) -> None:
+        from app import cli
+
+        parser = cli.build_parser()
+        with mock.patch.object(wrapper, "run_slot", return_value=0) as run:
+            cli._dispatch(parser, ["run", "2"])
+        self.assertEqual(run.call_args.args[1], 2)
+
+    def test_a_slot_nobody_signed_into_is_not_started(self) -> None:
+        import argparse
+
+        from app import cli
+
+        Accounts.load()  # slot 3 exists in no store and has no credentials
+        with mock.patch.object(wrapper, "run_slot") as run, self.assertRaises(SystemExit):
+            cli.cmd_run(argparse.Namespace(target="3", claude_args=[]))
+        run.assert_not_called()

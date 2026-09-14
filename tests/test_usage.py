@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from unittest import mock
 
-from core.store import Slot, creds_file
+from core import store
+from core.store import Accounts, Slot, creds_file
 from tests.base import TempHome
 from ui import i18n, usage
 
-FIVE_HOUR_RESET = "2026-07-24T13:50:00.360619+00:00"
-SEVEN_DAY_RESET = "2026-07-31T09:00:00+00:00"
+FIVE_HOUR_RESET = "2036-07-24T13:50:00.360619+00:00"
+PAST_RESET = "2026-07-24T13:50:00.360619+00:00"
+SEVEN_DAY_RESET = "2036-07-31T09:00:00+00:00"
 
 
 def reset_mark() -> str:
@@ -44,6 +47,32 @@ class TestUsageFormatting(TempHome):
             }
         )
         self.assertEqual(text.count(reset_mark()), 2)
+
+
+    def test_a_window_past_its_reset_reads_as_empty(self) -> None:
+        """The recorded 100 % describes a window that has since rolled over."""
+        text = usage.format_usage(
+            {
+                "five_hour": {"utilization": 100, "resets_at": PAST_RESET},
+                "seven_day": {"utilization": 96, "resets_at": SEVEN_DAY_RESET},
+            }
+        )
+        self.assertIn("5h 0%", text)
+        self.assertIn("96%", text)
+        # The stale reset moment is not printed next to the zero it contradicts.
+        self.assertEqual(text.count(reset_mark()), 1)
+
+    def test_effective_utilisation_honours_the_reset_moment(self) -> None:
+        payload = {"five_hour": {"utilization": 100, "resets_at": PAST_RESET}}
+        self.assertEqual(usage.effective_utilisation(payload, usage.FIVE_HOUR), 0.0)
+
+        live = {"five_hour": {"utilization": 100, "resets_at": FIVE_HOUR_RESET}}
+        self.assertEqual(usage.effective_utilisation(live, usage.FIVE_HOUR), 100.0)
+
+        # No reset moment at all: nothing to reason from, the number stands.
+        bare = {"five_hour": {"utilization": 100, "resets_at": None}}
+        self.assertEqual(usage.effective_utilisation(bare, usage.FIVE_HOUR), 100.0)
+        self.assertIsNone(usage.effective_utilisation(bare, usage.SEVEN_DAY))
 
     def test_window_without_reset_is_clean(self) -> None:
         text = usage.format_usage(
@@ -239,3 +268,56 @@ class TestPayloadShapes(TempHome):
             {"utilization": {"five_hour": {"utilization": 7.0}, "seven_day": None}}
         )
         self.assertEqual(normalised["five_hour"], {"utilization": 7.0})
+
+
+class TestNamingSlots(TempHome):
+    def test_an_unnamed_slot_gets_its_email_from_the_profile(self) -> None:
+        self.write_credentials(creds_file(2))
+        accounts = Accounts()
+        accounts.slots[2] = Slot(number=2)
+        accounts.save()
+        slots = [Slot(number=2)]
+
+        profile = {"email": "two@example.com", "account_uuid": "uuid-2"}
+        with mock.patch.object(usage.oauth, "fetch_profile", return_value=profile) as fetch:
+            self.assertEqual(usage.name_slots(slots), 1)
+
+        fetch.assert_called_once()
+        self.assertEqual(slots[0].email, "two@example.com")
+        self.assertEqual(Accounts.load().slots[2].email, "two@example.com")
+        self.assertEqual(Accounts.load().slots[2].account_uuid, "uuid-2")
+        # And written where the offline backfill will find it next time.
+        saved = store.read_json(store.identity_file(2))
+        self.assertEqual(saved["oauthAccount"]["emailAddress"], "two@example.com")
+
+    def test_named_slots_cost_no_request(self) -> None:
+        self.write_credentials(creds_file(1))
+        with mock.patch.object(usage.oauth, "fetch_profile") as fetch:
+            self.assertEqual(usage.name_slots([Slot(number=1, email="a@b")]), 0)
+        fetch.assert_not_called()
+
+    def test_a_slot_without_a_token_is_skipped(self) -> None:
+        with mock.patch.object(usage.oauth, "fetch_profile") as fetch:
+            self.assertEqual(usage.name_slots([Slot(number=7)]), 0)
+        fetch.assert_not_called()
+
+
+class TestRefreshDeadline(TempHome):
+    def test_one_stuck_slot_does_not_hold_the_others_hostage(self) -> None:
+        """A name lookup that ignores its timeout must not become our hang."""
+        for number in (1, 2):
+            self.write_credentials(creds_file(number))
+
+        def _answer(number: int, **_kw: object) -> dict | None:
+            if number == 2:
+                time.sleep(60)  # never returns within the budget
+            return {"fetchedAtMs": 1, "five_hour": {"utilization": 3}, "seven_day": None}
+
+        with mock.patch.object(usage, "_refresh_one", side_effect=_answer), mock.patch.object(
+            usage, "_budget", return_value=0.5
+        ), mock.patch.object(usage, "name_slots", return_value=0):
+            started = time.monotonic()
+            result = usage.refresh_slots([Slot(number=1), Slot(number=2)])
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(set(result), {1})

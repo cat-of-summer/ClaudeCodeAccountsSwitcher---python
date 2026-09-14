@@ -294,7 +294,7 @@ class TestTranscriptWatcher(TempHome):
 
         signal = autoswitch.LimitSignal()
         with mock.patch.object(autoswitch.LimitSignal, "fire", autospec=True) as fire:
-            fire.side_effect = lambda self, window: self._event.set()
+            fire.side_effect = lambda self, window, **_kw: self._event.set()
             self._watcher(signal).tick()
         self.assertEqual(fire.call_count, 1)
 
@@ -330,7 +330,7 @@ class TestPickTarget(TempHome):
         accounts = self._accounts(
             self._slot(1, 100, 90), self._slot(2, 10, 40), self._slot(3, 5, 60)
         )
-        target, reason = autoswitch.pick_target(
+        target, reason, _ = autoswitch.pick_target(
             accounts, current=1, tried={1}, threshold=95
         )
         self.assertEqual(target, 2)  # weekly is the first key, not five_hour
@@ -338,12 +338,12 @@ class TestPickTarget(TempHome):
 
     def test_an_exhausted_weekly_window_is_excluded(self) -> None:
         accounts = self._accounts(self._slot(1, 100, 100), self._slot(2, 0, 100))
-        target, _ = autoswitch.pick_target(accounts, current=1, tried={1}, threshold=95)
+        target, _, _ = autoswitch.pick_target(accounts, current=1, tried={1}, threshold=95)
         self.assertIsNone(target)
 
     def test_the_threshold_excludes_a_nearly_spent_slot(self) -> None:
         accounts = self._accounts(self._slot(1, 100, 10), self._slot(2, 96, 10))
-        target, reason = autoswitch.pick_target(
+        target, reason, _ = autoswitch.pick_target(
             accounts, current=1, tried={1}, threshold=95
         )
         self.assertIsNone(target)
@@ -353,7 +353,7 @@ class TestPickTarget(TempHome):
         accounts = self._accounts(
             self._slot(1, 100, 90), self._slot(3, 10, 10), self._slot(2, 10, 10)
         )
-        target, _ = autoswitch.pick_target(accounts, current=1, tried={1}, threshold=95)
+        target, _, _ = autoswitch.pick_target(accounts, current=1, tried={1}, threshold=95)
         self.assertEqual(target, 2)
 
     def test_stale_data_falls_back_to_slot_order(self) -> None:
@@ -362,7 +362,7 @@ class TestPickTarget(TempHome):
             self._slot(2, 0, 0, fresh=False),
             self._slot(4, 0, 0, fresh=False),
         )
-        target, reason = autoswitch.pick_target(
+        target, reason, _ = autoswitch.pick_target(
             accounts, current=2, tried={2}, threshold=95
         )
         self.assertEqual(target, 4)
@@ -372,14 +372,14 @@ class TestPickTarget(TempHome):
         accounts = self._accounts(
             self._slot(1, 0, 0, fresh=False), self._slot(5, 0, 0, fresh=False)
         )
-        target, _ = autoswitch.pick_target(accounts, current=5, tried={5}, threshold=95)
+        target, _, _ = autoswitch.pick_target(accounts, current=5, tried={5}, threshold=95)
         self.assertEqual(target, 1)
 
     def test_already_tried_slots_are_skipped(self) -> None:
         accounts = self._accounts(
             self._slot(1, 100, 90), self._slot(2, 1, 1), self._slot(3, 2, 2)
         )
-        target, _ = autoswitch.pick_target(
+        target, _, _ = autoswitch.pick_target(
             accounts, current=1, tried={1, 2}, threshold=95
         )
         self.assertEqual(target, 3)
@@ -387,7 +387,7 @@ class TestPickTarget(TempHome):
     def test_a_slot_without_credentials_is_not_a_candidate(self) -> None:
         accounts = self._accounts(self._slot(1, 100, 90))
         accounts.slots[2] = Slot(number=2)  # never signed in
-        target, reason = autoswitch.pick_target(
+        target, reason, _ = autoswitch.pick_target(
             accounts, current=1, tried={1}, threshold=95
         )
         self.assertIsNone(target)
@@ -395,7 +395,7 @@ class TestPickTarget(TempHome):
 
     def test_order_strategy_ignores_limits(self) -> None:
         accounts = self._accounts(self._slot(1, 100, 90), self._slot(2, 99, 99))
-        target, reason = autoswitch.pick_target(
+        target, reason, _ = autoswitch.pick_target(
             accounts, current=1, tried={1}, threshold=95, strategy="order"
         )
         self.assertEqual(target, 2)
@@ -485,3 +485,144 @@ class TestExhaustion(TempHome):
 
         self.assertTrue(verdict)
         self.assertEqual(slot.usage, payload)
+
+
+class TestQuotaLimits(TempHome):
+    """Current claude builds say which window and when, in `quotaLimits`."""
+
+    def _record(self, **quota: object) -> dict:
+        return {
+            "message": {"content": [{"type": "text", "text": "something unfamiliar"}]},
+            "quotaLimits": {"status": "rejected", **quota},
+        }
+
+    def test_the_window_comes_from_the_field_not_the_wording(self) -> None:
+        record = self._record(rateLimitType="seven_day")
+        self.assertEqual(autoswitch._window_of(record), autoswitch.SEVEN_DAY)
+
+    def test_the_wording_is_only_a_fallback(self) -> None:
+        record = {"message": {"content": [{"type": "text", "text": "hit your weekly limit"}]}}
+        self.assertEqual(autoswitch._window_of(record), autoswitch.SEVEN_DAY)
+
+    def test_the_reset_moment_is_lifted(self) -> None:
+        self.assertEqual(autoswitch._reset_of(self._record(resetsAt=1789317000)), 1789317000.0)
+        self.assertEqual(autoswitch._reset_of(self._record()), 0.0)
+        self.assertEqual(autoswitch._reset_of({}), 0.0)
+
+    def test_the_signal_carries_the_reset(self) -> None:
+        signal = autoswitch.LimitSignal()
+        signal.fire(autoswitch.FIVE_HOUR, resets_at=123.0)
+        self.assertEqual(signal.resets_at, 123.0)
+
+        signal.rearm()
+        self.assertFalse(signal.fired)
+        self.assertEqual(signal.window, "")
+        self.assertEqual(signal.resets_at, 0.0)
+
+        signal.fire(autoswitch.SEVEN_DAY)
+        self.assertTrue(signal.fired)
+        self.assertEqual(signal.window, autoswitch.SEVEN_DAY)
+
+
+class TestWaiting(TempHome):
+    def _slot(self, number: int, five: float, seven: float, *, five_reset: float | None = None, seven_reset: float | None = None) -> Slot:
+        self.write_credentials(store.creds_file(number))
+
+        def stamp(offset: float | None) -> str | None:
+            if offset is None:
+                return None
+            return datetime.fromtimestamp(time.time() + offset, timezone.utc).isoformat()
+
+        return Slot(
+            number=number,
+            usage={
+                "fetchedAtMs": time.time() * 1000,
+                "five_hour": {"utilization": five, "resets_at": stamp(five_reset)},
+                "seven_day": {"utilization": seven, "resets_at": stamp(seven_reset)},
+            },
+        )
+
+    def _accounts(self, *slots: Slot) -> Accounts:
+        accounts = Accounts()
+        for slot in slots:
+            accounts.slots[slot.number] = slot
+        return accounts
+
+    def test_a_window_past_its_reset_is_free_despite_the_stored_percent(self) -> None:
+        """The very case that made ccas say every account was spent."""
+        accounts = self._accounts(
+            self._slot(1, 100, 90, five_reset=3600),
+            self._slot(3, 100, 31, five_reset=-3600),
+        )
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1}, threshold=100
+        )
+        self.assertEqual(target, 3)
+        self.assertEqual(reason, "limits")
+        self.assertEqual(opens, 0.0)
+
+    def test_when_nobody_is_free_the_earliest_reset_wins(self) -> None:
+        accounts = self._accounts(
+            self._slot(1, 100, 90, five_reset=1800),
+            self._slot(2, 100, 50, five_reset=3600),
+            self._slot(3, 100, 20, five_reset=900),
+        )
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1}, threshold=95
+        )
+        self.assertEqual(target, 3)
+        self.assertEqual(reason, "waiting")
+        self.assertAlmostEqual(opens, time.time() + 900, delta=5)
+
+    def test_the_current_slot_may_be_the_one_to_wait_for(self) -> None:
+        accounts = self._accounts(
+            self._slot(1, 100, 10, five_reset=300),
+            self._slot(2, 100, 10, five_reset=3600),
+        )
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1}, threshold=95
+        )
+        self.assertEqual(target, 1)
+        self.assertEqual(reason, "waiting")
+        self.assertAlmostEqual(opens, time.time() + 300, delta=5)
+
+    def test_the_transcript_reset_covers_a_silent_current_slot(self) -> None:
+        accounts = self._accounts(
+            self._slot(1, 100, 10),  # spent, but no reset moment recorded
+            self._slot(2, 100, 10, five_reset=3600),
+        )
+        soon = time.time() + 120
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1}, threshold=95, current_reset=soon
+        )
+        self.assertEqual(target, 1)
+        self.assertEqual(reason, "waiting")
+        self.assertEqual(opens, soon)
+
+    def test_both_windows_must_clear(self) -> None:
+        payload = self._slot(1, 100, 100, five_reset=600, seven_reset=86400).usage
+        opens = autoswitch.available_at(payload, threshold=95)
+        self.assertAlmostEqual(opens, time.time() + 86400, delta=5)
+
+    def test_a_spent_window_without_a_reset_cannot_be_waited_for(self) -> None:
+        accounts = self._accounts(self._slot(1, 100, 10), self._slot(2, 100, 10))
+        target, reason, _ = autoswitch.pick_target(
+            accounts, current=1, tried={1}, threshold=95
+        )
+        self.assertIsNone(target)
+        self.assertEqual(reason, "all_exhausted")
+
+    def test_the_plan_outlives_the_wait(self) -> None:
+        accounts = self._accounts(
+            self._slot(1, 100, 10, five_reset=1800),
+            self._slot(2, 100, 10, five_reset=900),
+        )
+        first = autoswitch.elect_target(accounts, current=1, tried={1}, threshold=95)
+        self.assertEqual(first.target, 2)
+        self.assertTrue(first.must_wait())
+
+        later = autoswitch.elect_target(
+            accounts, current=1, tried={1}, threshold=95, now=time.time() + 600
+        )
+        self.assertTrue(later.followed)
+        self.assertEqual(later.available_at, first.available_at)

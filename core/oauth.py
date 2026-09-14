@@ -47,6 +47,15 @@ BUSY = "busy"
 DEAD = "dead"
 FAILED = "failed"
 
+# The usage and profile endpoints live on a different host from the token
+# exchange above, and both need the same three headers. Kept here rather than in
+# ui/usage.py so that core does not have to reach up into ui for them.
+API_BASE = "https://api.anthropic.com"
+PROFILE_PATH = "/api/oauth/profile"
+BETA_HEADER = "oauth-2025-04-20"
+USER_AGENT = "ccas"
+PROFILE_TIMEOUT = 5.0
+
 
 class OAuthError(Exception):
     def __init__(self, kind: str, detail: str = "") -> None:
@@ -278,3 +287,48 @@ def refresh_slot(
     log.write(f"slot {number}: access token refreshed")
     _record(number, REFRESHED, now=time.time())
     return REFRESHED
+
+
+def fetch_profile(token: str, *, timeout: float = PROFILE_TIMEOUT) -> dict[str, str] | None:
+    """Who this token belongs to, asked of the account that minted it.
+
+    The email used to come only from the shared `~/.claude.json`, and only once
+    the session ended -- by which time a neighbouring terminal had usually
+    written its own account there, the capture was skipped, and the slot went on
+    showing as a bare number. A token knows its own owner and nobody else's, so
+    there is no race to lose here.
+    """
+    request = urllib.request.Request(
+        f"{API_BASE}{PROFILE_PATH}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": BETA_HEADER,
+            "User-Agent": USER_AGENT,
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ) as exc:
+        log.write(f"profile request failed: {exc!r}")
+        return None
+
+    account = payload.get("account") if isinstance(payload, dict) else None
+    if not isinstance(account, dict):
+        return None
+
+    email = account.get("email")
+    account_uuid = account.get("uuid")
+    identity = {
+        "email": email if isinstance(email, str) else "",
+        "account_uuid": account_uuid if isinstance(account_uuid, str) else "",
+    }
+    return identity if identity["email"] or identity["account_uuid"] else None

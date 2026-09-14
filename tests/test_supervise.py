@@ -9,6 +9,7 @@ from app import autoswitch, wrapper
 from core import store
 from core.store import Accounts, Config, Slot
 from tests.base import TempHome
+from ui import usage
 
 # A stand-in for claude: records how it was invoked, optionally writes the
 # rate-limit line into a transcript, then waits to be killed.
@@ -117,6 +118,12 @@ class TestSupervisedRun(TempHome):
         self._poll = mock.patch.object(autoswitch, "WATCH_POLL_SECONDS", 0.05)
         self._poll.start()
         self.addCleanup(self._poll.stop)
+
+        # Every candidate is now re-fetched before the ranking; the store is
+        # the only source of truth these tests want.
+        self._network = mock.patch.object(usage, "refresh_slots", return_value={})
+        self._network.start()
+        self.addCleanup(self._network.stop)
 
     def _invocations(self) -> list[list[str]]:
         if not self.log.exists():

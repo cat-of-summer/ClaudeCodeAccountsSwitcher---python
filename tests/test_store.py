@@ -76,3 +76,32 @@ class TestAtomicWrite(TempHome):
             store.backup_file(target, keep=3)
         backups = list(store.backups_dir().glob("big.json.*"))
         self.assertLessEqual(len(backups), 3)
+
+
+class TestBackfillIdentity(TempHome):
+    def test_an_anonymous_slot_is_named_from_its_identity_file(self) -> None:
+        store.write_json_atomic(store.identity_file(2), self.identity("two@example.com"))
+        accounts = Accounts()
+        accounts.slots[1] = Slot(number=1, email="one@example.com", account_uuid="u1")
+        accounts.slots[2] = Slot(number=2)
+        accounts.slots[3] = Slot(number=3)  # never logged in, no file
+
+        self.assertTrue(accounts.backfill_identity())
+        self.assertEqual(accounts.slots[2].email, "two@example.com")
+        self.assertEqual(accounts.slots[2].account_uuid, "uuid-two@example.com")
+        self.assertEqual(accounts.slots[3].email, "")
+        self.assertEqual(accounts.slots[1].email, "one@example.com")
+
+    def test_a_named_slot_is_left_alone(self) -> None:
+        store.write_json_atomic(store.identity_file(1), self.identity("other@example.com"))
+        accounts = Accounts()
+        accounts.slots[1] = Slot(number=1, email="mine@example.com", account_uuid="u1")
+        self.assertFalse(accounts.backfill_identity())
+        self.assertEqual(accounts.slots[1].email, "mine@example.com")
+
+    def test_a_broken_identity_file_is_not_fatal(self) -> None:
+        store.identity_file(1).parent.mkdir(parents=True, exist_ok=True)
+        store.identity_file(1).write_text("{not json", encoding="utf-8")
+        accounts = Accounts()
+        accounts.slots[1] = Slot(number=1)
+        self.assertFalse(accounts.backfill_identity())

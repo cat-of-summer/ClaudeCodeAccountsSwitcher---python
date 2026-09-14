@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
 from core import claudecfg, log, oauth, sessions
-from core.store import Slot, creds_file
+from core.oauth import API_BASE, BETA_HEADER, USER_AGENT
+from core.store import (
+    Accounts,
+    Slot,
+    creds_file,
+    identity_file,
+    update_accounts,
+    write_json_atomic,
+)
 from ui.i18n import t
 
-API_BASE = "https://api.anthropic.com"
 USAGE_PATH = "/api/oauth/usage"
-BETA_HEADER = "oauth-2025-04-20"
-USER_AGENT = "ccas"
 DEFAULT_TIMEOUT = 5.0
-MAX_PARALLEL = 8
 DEFAULT_RESET_FORMAT = "%d.%m %H:%M"
+
+FIVE_HOUR = "five_hour"
+SEVEN_DAY = "seven_day"
 
 # The 5h window runs 0 -> 100 % inside a single sitting, so a ten minute old
 # snapshot of the slot you are about to launch is already suspect. The weekly
@@ -95,8 +103,61 @@ def needs_network(slot: Slot, *, active: bool) -> bool:
 
 
 def is_usable_for_ranking(usage: dict[str, Any] | None) -> bool:
-    """Good enough to decide which account to move a session to."""
+    """Good enough to show in a listing without asking the network first."""
     return not is_stale(usage, ttl=USAGE_TTL_RANKING_SECONDS)
+
+
+# --------------------------------------------------------------------------
+# reading a window
+# --------------------------------------------------------------------------
+
+
+def window(usage: dict[str, Any] | None, name: str) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+    block = usage.get(name)
+    return block if isinstance(block, dict) else None
+
+
+def window_reset_at(usage: dict[str, Any] | None, name: str) -> datetime | None:
+    block = window(usage, name)
+    return parse_iso(block.get("resets_at")) if block else None
+
+
+def has_rolled_over(
+    usage: dict[str, Any] | None, name: str, *, now: float | None = None
+) -> bool:
+    """The window named its own expiry, and that moment has passed."""
+    moment = window_reset_at(usage, name)
+    if moment is None:
+        return False
+    return moment.timestamp() <= (time.time() if now is None else now)
+
+
+def effective_utilisation(
+    usage: dict[str, Any] | None, name: str, *, now: float | None = None
+) -> float | None:
+    """How full the window is *now*, not when the snapshot was taken.
+
+    A 5-hour window runs out and comes back inside the time a stored reading
+    stays nominally usable, so a slot could sit at a recorded 100 % for hours
+    after it had emptied -- which is how `ccas` came to report that every
+    account was spent while one of them was free. The payload carries the
+    moment the window rolls over, and once that moment is behind us the
+    recorded percentage describes a window that no longer exists.
+    """
+    block = window(usage, name)
+    if block is None:
+        return None
+    if has_rolled_over(usage, name, now=now):
+        return 0.0
+    value = block.get("utilization")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+# --------------------------------------------------------------------------
+# asking the network
+# --------------------------------------------------------------------------
 
 
 def refreshable(slots: list[Slot]) -> list[Slot]:
@@ -142,43 +203,152 @@ def _refresh_one(
     return _normalise(payload) if payload else None
 
 
+def _budget(timeout: float, refresh_timeout: float) -> float:
+    """A ceiling for the whole refresh, however badly one socket behaves.
+
+    Worst case for a single slot is an exchange, a request, a forced exchange
+    and a retry. Naming the sum is what keeps a name lookup that ignores its
+    own timeout -- getaddrinfo does, on every platform -- from becoming an
+    unbounded wait for the user.
+    """
+    return 2 * (timeout + refresh_timeout) + 5.0
+
+
+def _spawn(target: Any, *args: Any) -> threading.Thread:
+    """A daemon thread, deliberately not a ThreadPoolExecutor.
+
+    The executor registers an atexit hook that joins every worker it ever
+    created, so one socket wedged in a name lookup takes the whole process down
+    with it on the way out -- `ccas` freezing at startup with nothing to type
+    into was exactly that. A daemon thread the interpreter is willing to
+    abandon cannot do it.
+    """
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
+
+
+def _join_all(workers: list[threading.Thread], *, budget: float) -> None:
+    deadline = time.monotonic() + budget
+    for worker in workers:
+        worker.join(max(0.0, deadline - time.monotonic()))
+
+
 def refresh_slots(
     slots: list[Slot],
     *,
     timeout: float = DEFAULT_TIMEOUT,
     refresh_timeout: float = oauth.REFRESH_TIMEOUT,
 ) -> dict[int, dict[str, Any]]:
-    targets = [slot.number for slot in refreshable(slots)]
+    targets = refreshable(slots)
     if not targets:
         return {}
 
-    # Read the live-session list once: it costs a tasklist call per entry on
-    # Windows, and the answer cannot meaningfully change inside one refresh.
+    # Read the live-session list once: it is shared by every worker below and
+    # the answer cannot meaningfully change inside one refresh.
     busy = sessions.busy_slots()
 
     results: dict[int, dict[str, Any]] = {}
-    workers = min(MAX_PARALLEL, len(targets))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _refresh_one,
-                number,
-                busy=busy,
-                timeout=timeout,
-                refresh_timeout=refresh_timeout,
-            ): number
-            for number in targets
-        }
-        for future in futures:
-            number = futures[future]
-            try:
-                payload = future.result()
-            except Exception as exc:
-                log.write(f"slot {number}: usage refresh raised {exc!r}")
-                payload = None
-            if payload:
+    guard = threading.Lock()
+
+    def _work(number: int) -> None:
+        try:
+            payload = _refresh_one(
+                number, busy=busy, timeout=timeout, refresh_timeout=refresh_timeout
+            )
+        except Exception as exc:
+            log.write(f"slot {number}: usage refresh raised {exc!r}")
+            return
+        if payload:
+            with guard:
                 results[number] = payload
-    return results
+
+    _join_all(
+        [_spawn(_work, slot.number) for slot in targets],
+        budget=_budget(timeout, refresh_timeout),
+    )
+    with guard:
+        collected = dict(results)
+
+    name_slots(targets, timeout=timeout)
+    return collected
+
+
+def name_slots(slots: list[Slot], *, timeout: float = DEFAULT_TIMEOUT) -> int:
+    """Give an unnamed slot its email, from the account its own token belongs to.
+
+    Fires only for a slot that never had a session end cleanly enough for
+    `capture_identity` to find its own account in the shared config -- on a
+    machine with several terminals open that is common, and the slot would
+    otherwise be listed as a bare number forever. The token knows its owner and
+    nobody else's, so unlike the shared config there is no race to lose.
+
+    The passed-in `Slot` objects are updated in place, so the caller's next
+    print already shows the name.
+    """
+    unnamed = [slot for slot in slots if not slot.email]
+    if not unnamed:
+        return 0
+
+    found: dict[int, dict[str, str]] = {}
+    guard = threading.Lock()
+
+    def _work(slot: Slot) -> None:
+        token = claudecfg.access_token(creds_file(slot.number))
+        if not token:
+            return
+        identity = oauth.fetch_profile(token, timeout=timeout)
+        if not identity or not identity.get("email"):
+            return
+        with guard:
+            found[slot.number] = identity
+
+    _join_all([_spawn(_work, slot) for slot in unnamed], budget=timeout + 5.0)
+    with guard:
+        collected = dict(found)
+    if not collected:
+        return 0
+
+    by_number = {slot.number: slot for slot in unnamed}
+    for number, identity in collected.items():
+        slot = by_number[number]
+        slot.email = identity["email"]
+        slot.account_uuid = identity["account_uuid"] or slot.account_uuid
+        _remember_identity(number, identity)
+
+    def _store(current: Accounts) -> None:
+        for stored_number, stored in collected.items():
+            target = current.ensure(stored_number)
+            target.email = stored["email"]
+            target.account_uuid = stored["account_uuid"] or target.account_uuid
+
+    update_accounts(_store)
+    log.write(f"named slots from the profile endpoint: {sorted(collected)}")
+    return len(collected)
+
+
+def _remember_identity(number: int, identity: dict[str, str]) -> None:
+    """Keep the answer where `backfill_identity` finds it without a network."""
+    if not identity.get("account_uuid"):
+        return
+    path = identity_file(number)
+    if path.exists():
+        return
+    write_json_atomic(
+        path,
+        {
+            "oauthAccount": {
+                "emailAddress": identity.get("email", ""),
+                "accountUuid": identity["account_uuid"],
+            },
+            "userID": None,
+        },
+    )
+
+
+# --------------------------------------------------------------------------
+# saying it out loud
+# --------------------------------------------------------------------------
 
 
 def parse_iso(value: Any) -> datetime | None:
@@ -200,17 +370,21 @@ def parse_iso(value: Any) -> datetime | None:
     return parsed.astimezone()
 
 
-def format_reset(value: Any) -> str:
-    """Момент сброса окна в локальной зоне пользователя: «05.08 18:50»."""
-    moment = parse_iso(value)
-    if moment is None:
-        return ""
+def format_moment(moment: datetime) -> str:
+    """A moment in the user's zone, in the catalog's short form: «05.08 18:50»."""
     pattern = t("usage.reset_format")
     if "%" not in pattern:
         # Ключа нет в каталоге — t() вернул само имя ключа, и оно уехало бы
         # в вывод литералом.
         pattern = DEFAULT_RESET_FORMAT
-    return t("usage.reset_at", time=moment.strftime(pattern))
+    return moment.strftime(pattern)
+
+
+def format_reset(value: Any) -> str:
+    moment = parse_iso(value)
+    if moment is None:
+        return ""
+    return t("usage.reset_at", time=format_moment(moment))
 
 
 def age_text(fetched_at_ms: Any) -> str:
@@ -232,33 +406,37 @@ def age_text(fetched_at_ms: Any) -> str:
     return t("usage.age_days", value=int(hours / 24))
 
 
-def _window(label: str, block: dict[str, Any]) -> str:
+def _labelled(label: str, usage: dict[str, Any] | None, name: str) -> str:
+    # A reset moment already behind us belongs to the window that just ended,
+    # not to the one being described; printed next to a zero it would only
+    # contradict it.
+    if has_rolled_over(usage, name):
+        return label
+    block = window(usage, name) or {}
     reset = format_reset(block.get("resets_at"))
     return f"{label} {reset}" if reset else label
 
 
 def format_usage(usage: dict[str, Any] | None) -> str:
-    if not usage:
+    if not usage or window(usage, FIVE_HOUR) is None:
         return t("usage.unknown")
 
-    five_hour = usage.get("five_hour")
-    if not isinstance(five_hour, dict):
-        return t("usage.unknown")
-
-    percent = five_hour.get("utilization")
+    percent = effective_utilisation(usage, FIVE_HOUR)
     parts: list[str] = []
-    if isinstance(percent, (int, float)):
+    if percent is not None:
         # Сброс идёт при своём окне: у недельного он через несколько суток,
         # и общая метка в хвосте не сказала бы, к какому окну относится.
-        parts.append(_window(t("usage.five_hour", percent=int(percent)), five_hour))
+        parts.append(
+            _labelled(t("usage.five_hour", percent=int(percent)), usage, FIVE_HOUR)
+        )
     else:
         parts.append(t("usage.five_hour_unknown"))
 
-    seven_day = usage.get("seven_day")
-    if isinstance(seven_day, dict):
-        weekly = seven_day.get("utilization")
-        if isinstance(weekly, (int, float)):
-            parts.append(_window(t("usage.seven_day", percent=int(weekly)), seven_day))
+    weekly = effective_utilisation(usage, SEVEN_DAY)
+    if weekly is not None:
+        parts.append(
+            _labelled(t("usage.seven_day", percent=int(weekly)), usage, SEVEN_DAY)
+        )
 
     age = age_text(usage.get("fetchedAtMs"))
     if age and age != t("usage.age_now"):

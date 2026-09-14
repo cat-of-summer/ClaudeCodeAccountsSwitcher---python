@@ -62,6 +62,16 @@ def _set_auto(key: str) -> Callable[[Config, Any], None]:
     return _apply
 
 
+def _get_max_wait(config: Config) -> int:
+    """Shown in minutes: nobody thinks about a wall in seconds."""
+    value = config.auto_switch.get("maxWaitSeconds")
+    return int(value // 60) if isinstance(value, (int, float)) else 0
+
+
+def _set_max_wait(config: Config, value: Any) -> None:
+    _set_auto("maxWaitSeconds")(config, int(value) * 60)
+
+
 def _get_skip(config: Config) -> bool:
     return SKIP_PERMISSIONS_FLAG in config.default_args
 
@@ -116,6 +126,14 @@ SETTINGS: tuple[Setting, ...] = (
         _set_auto("maxSwitches"),
         minimum=1,
         maximum=10,
+    ),
+    Setting(
+        "auto-switch-max-wait",
+        "int",
+        _get_max_wait,
+        _set_max_wait,
+        minimum=0,
+        maximum=1440,
     ),
     Setting(
         "auto-switch-confirm",

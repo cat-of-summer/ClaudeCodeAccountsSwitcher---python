@@ -59,6 +59,12 @@
   "autoswitch.gave_up": "переключений за сеанс уже {count} — дальше вручную",
   "autoswitch.copy_mode_busy": "в режиме копирования и при живом соседнем сеансе автопереход небезопасен",
   "autoswitch.notify_command": "продолжить вручную: {command}",
+  "autoswitch.switching_later": "перехожу со слота {from_slot} на {to_slot} ({label}), когда он откроется в {opens}; останавливаю этот сеанс…",
+  "autoswitch.waiting": "все аккаунты исчерпаны — жду, пока слот {slot} ({label}) откроется в {opens}, около {minutes} мин; Ctrl+C — не ждать",
+  "autoswitch.waiting_title": "жду слот {slot}, {minutes} мин",
+  "autoswitch.wait_cancelled": "ожидание отменено — продолжить вручную, когда слот освободится",
+  "autoswitch.wait_too_long": "ближайший откроется слот {slot} ({label}) в {opens}, через {minutes} мин — дольше лимита ожидания {limit} мин, остаюсь",
+  "autoswitch.default_resume_prompt": "Проверь запущенные процессы, перезапусти что отключилось, продолжай.",
 
   "cli.no_slots_hint": "Слотов пока нет. Запусти `claude` и войди — слот создастся сам.",
   "cli.no_slots": "Слотов пока нет.",
@@ -71,7 +77,7 @@
   "cli.slot_renamed": "Слот {slot} теперь '{alias}'. Запуск: claude @{alias}",
   "cli.not_installed_bare": "ccas ещё не установлен.",
   "cli.shell.banner": "ccas {version} — интерактивный режим",
-  "cli.shell.hint": "Введи команду и нажми Enter: install, list, switch <n>, add, doctor, --help. Для выхода — 'exit' (или Ctrl+C).",
+  "cli.shell.hint": "Введи команду и нажми Enter: list, run <n>, switch <n>, add, doctor, --help. Просто номер слота — запустить на нём claude. Для выхода — 'exit' (или Ctrl+C).",
   "cli.shell.unknown": "Неизвестная команда. Набери --help для списка или 'exit' для выхода.",
 
   "cli.description": "Переключатель аккаунтов Claude Code. Меняет только креды — история, проекты, настройки и плагины остаются общими.",
@@ -98,6 +104,7 @@
   "cli.help.cached": "без сетевых запросов",
   "cli.help.cached_list": "показать сохранённые лимиты без обращения к сети",
   "cli.help.menu": "выбрать активный аккаунт интерактивно",
+  "cli.help.run": "запустить claude на слоте (номер, @алиас или email)",
   "cli.help.target": "номер, @алиас или email",
   "cli.help.lang": "язык интерфейса: {languages}",
 
@@ -181,6 +188,8 @@
   "config.help_auto-switch-threshold": "с какой загрузки пятичасового окна аккаунт считается исчерпанным (50–100)",
   "config.label_auto-switch-max": "переходов за сеанс",
   "config.help_auto-switch-max": "сколько раз подряд разрешено переключаться, прежде чем остановиться (1–10)",
+  "config.label_auto-switch-max-wait": "ждать сброса, минут",
+  "config.help_auto-switch-max-wait": "когда исчерпаны все аккаунты — сколько сеанс может ждать ближайшего сброса, прежде чем сдаться (0 — не ждать)",
   "config.label_auto-switch-confirm": "сверять с API",
   "config.help_auto-switch-confirm": "перед переходом спросить лимиты по сети — отсекает временные ошибки 429, но требует связи",
   "config.label_auto-switch-restore-mode": "восстанавливать режим",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -60,8 +61,9 @@ CONFIRM_DELAY_SECONDS = 5.0
 PLAN_TTL_SECONDS = 300.0
 PLAN_LOCK_TIMEOUT = 5.0
 
-FIVE_HOUR = "five_hour"
-SEVEN_DAY = "seven_day"
+FIVE_HOUR = usage.FIVE_HOUR
+SEVEN_DAY = usage.SEVEN_DAY
+WINDOWS = (FIVE_HOUR, SEVEN_DAY)
 
 
 # --------------------------------------------------------------------------
@@ -233,6 +235,7 @@ class LimitSignal:
         self._lock = threading.Lock()
         self._event = threading.Event()
         self._window = ""
+        self._resets_at = 0.0
         self._mode = ""
 
     @property
@@ -243,6 +246,12 @@ class LimitSignal:
     def window(self) -> str:
         with self._lock:
             return self._window
+
+    @property
+    def resets_at(self) -> float:
+        """When the window that ran out opens again, as epoch seconds; 0 if unknown."""
+        with self._lock:
+            return self._resets_at
 
     @property
     def permission_mode(self) -> str:
@@ -256,10 +265,24 @@ class LimitSignal:
         with self._lock:
             self._mode = mode
 
-    def fire(self, window: str) -> None:
+    def fire(self, window: str, *, resets_at: float = 0.0) -> None:
         with self._lock:
             self._window = window
+            self._resets_at = resets_at
         self._event.set()
+
+    def rearm(self) -> None:
+        """Forget this wall so the next one is reported too.
+
+        A switch that was declined -- the API could not be reached, the quota
+        turned out to be there after all, no slot was free -- used to leave the
+        signal set for the rest of the session, which is why the second wall of
+        an evening was never acted on.
+        """
+        with self._lock:
+            self._window = ""
+            self._resets_at = 0.0
+        self._event.clear()
 
 
 def project_slug(path: Path) -> str:
@@ -395,16 +418,32 @@ class TranscriptWatcher(threading.Thread):
             return
 
         window = _window_of(record)
-        log.write(f"transcript: rate limit observed ({window or 'unspecified'})")
-        self._signal.fire(window)
+        resets_at = _reset_of(record)
+        log.write(
+            f"transcript: rate limit observed ({window or 'unspecified'}"
+            + (f", resets {stamp(resets_at)}" if resets_at else "")
+            + ")"
+        )
+        self._signal.fire(window, resets_at=resets_at)
+
+
+def _quota(record: dict[str, Any]) -> dict[str, Any]:
+    block = record.get("quotaLimits")
+    return block if isinstance(block, dict) else {}
 
 
 def _window_of(record: dict[str, Any]) -> str:
-    """Best-effort guess at which window ran out, for the message only.
+    """Which window ran out.
 
-    The text is English and has had several wordings, so nothing may depend on
-    it -- the decision to switch is made from the API, not from here.
+    Current claude builds say so outright in `quotaLimits.rateLimitType`; the
+    English wording of the message is only consulted for transcripts that
+    predate the field, and nothing may depend on it -- the decision to switch is
+    made from the API, not from here.
     """
+    kind = _quota(record).get("rateLimitType")
+    if isinstance(kind, str) and kind in WINDOWS:
+        return kind
+
     message = record.get("message")
     if not isinstance(message, dict):
         return ""
@@ -424,19 +463,26 @@ def _window_of(record: dict[str, Any]) -> str:
     return ""
 
 
+def _reset_of(record: dict[str, Any]) -> float:
+    """When the wall comes down, as epoch seconds -- 0 when the record is silent."""
+    value = _quota(record).get("resetsAt")
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return 0.0
+
+
+def stamp(moment: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(moment))
+
+
 # --------------------------------------------------------------------------
 # deciding where to go
 # --------------------------------------------------------------------------
 
 
 def utilisation(payload: dict[str, Any] | None, window: str) -> float | None:
-    if not isinstance(payload, dict):
-        return None
-    block = payload.get(window)
-    if not isinstance(block, dict):
-        return None
-    value = block.get("utilization")
-    return float(value) if isinstance(value, (int, float)) else None
+    """The window as it stands now: a reading past its own reset counts as empty."""
+    return usage.effective_utilisation(payload, window)
 
 
 def is_exhausted(payload: dict[str, Any] | None, *, threshold: float) -> bool:
@@ -446,6 +492,35 @@ def is_exhausted(payload: dict[str, Any] | None, *, threshold: float) -> bool:
         (five is not None and five >= threshold)
         or (seven is not None and seven >= 100)
     )
+
+
+def available_at(
+    payload: dict[str, Any] | None, *, threshold: float, now: float | None = None
+) -> float:
+    """When this account can take work again, as epoch seconds.
+
+    0 means right now. A window that is spent contributes its reset moment; if
+    both are spent the later one wins, since both have to clear. A spent window
+    that never named its reset gives infinity: there is nothing to wait for
+    with any confidence.
+    """
+    moment = time.time() if now is None else now
+    blocked = 0.0
+
+    five = usage.effective_utilisation(payload, FIVE_HOUR, now=moment)
+    if five is not None and five >= threshold:
+        blocked = max(blocked, _reset_epoch(payload, FIVE_HOUR))
+
+    seven = usage.effective_utilisation(payload, SEVEN_DAY, now=moment)
+    if seven is not None and seven >= 100:
+        blocked = max(blocked, _reset_epoch(payload, SEVEN_DAY))
+
+    return blocked
+
+
+def _reset_epoch(payload: dict[str, Any] | None, window: str) -> float:
+    reset = usage.window_reset_at(payload, window)
+    return reset.timestamp() if reset is not None else math.inf
 
 
 def confirm_exhausted(
@@ -486,6 +561,21 @@ def candidates(
     return usable
 
 
+def waitable(accounts: Accounts) -> list[Slot]:
+    """Every account that could come back -- the current and the tried included.
+
+    Waiting is not the same as switching: the slot that hit the wall a minute
+    ago may well be the first one to open again, and a slot tried earlier
+    tonight has had hours to recover.
+    """
+    return [
+        slot
+        for slot in accounts.ordered()
+        if slot.has_credentials()
+        and claudecfg.token_state(creds_file(slot.number)) != "stale"
+    ]
+
+
 def pick_target(
     accounts: Accounts,
     *,
@@ -493,13 +583,22 @@ def pick_target(
     tried: set[int],
     threshold: float,
     strategy: str = "limits",
-) -> tuple[int | None, str]:
+    current_reset: float = 0.0,
+    now: float | None = None,
+) -> tuple[int | None, str, float]:
+    """Choose a slot, and say when it will be able to work.
+
+    Returns (slot, reason, available_at). `available_at` is 0 for a slot that is
+    free now and an epoch moment for one that has to be waited for. With no
+    candidate at all, or none whose reset is known, the slot is None.
+    """
+    moment = time.time() if now is None else now
     pool = candidates(accounts, current=current, tried=tried)
-    if not pool:
-        return None, "no_candidates"
 
     if strategy != "limits":
-        return _round_robin(pool, current=current), "order"
+        if not pool:
+            return None, "no_candidates", 0.0
+        return _round_robin(pool, current=current), "order", 0.0
 
     ranked: list[Slot] = []
     unknown: list[Slot] = []
@@ -519,12 +618,33 @@ def pick_target(
                 slot.number,
             )
         )
-        return ranked[0].number, "limits"
+        return ranked[0].number, "limits", 0.0
 
     if unknown:
-        return _round_robin(unknown, current=current), "order"
+        return _round_robin(unknown, current=current), "order", 0.0
 
-    return None, "all_exhausted"
+    # Nobody is free: find who opens first. The transcript's own reset moment
+    # covers the current slot when its stored usage does not name one.
+    soonest: tuple[float, int] | None = None
+    for slot in waitable(accounts):
+        opens = available_at(slot.usage, threshold=threshold, now=moment)
+        if slot.number == current and current_reset and (
+            math.isinf(opens) or opens <= moment
+        ):
+            opens = current_reset
+        if math.isinf(opens):
+            continue
+        # A slot the ranking above rejected as exhausted but whose data names no
+        # blocking window is not free either -- it is simply unreadable.
+        if opens <= moment and slot.number not in pool:
+            continue
+        key = (opens, slot.number)
+        if soonest is None or key < soonest:
+            soonest = key
+
+    if soonest is None:
+        return None, "all_exhausted" if pool else "no_candidates", 0.0
+    return soonest[1], "waiting", soonest[0]
 
 
 def _round_robin(pool: list[Slot], *, current: int) -> int:
@@ -563,7 +683,11 @@ class Election:
     target: int | None
     reason: str
     followed: bool = False
+    available_at: float = 0.0
     detail: dict[str, Any] = field(default_factory=dict)
+
+    def must_wait(self, now: float | None = None) -> bool:
+        return self.available_at > (time.time() if now is None else now)
 
 
 def elect_target(
@@ -573,6 +697,7 @@ def elect_target(
     tried: set[int],
     threshold: float,
     strategy: str = "limits",
+    current_reset: float = 0.0,
     now: float | None = None,
 ) -> Election:
     """Pick a slot, or adopt the pick another terminal already made.
@@ -593,15 +718,23 @@ def elect_target(
         plan = read_json(switch_plan_path())
         if _plan_valid(plan, current, moment):
             target = int(plan["to"])
+            opens = float(plan.get("availableAt", 0) or 0)
             log.write(f"autoswitch: following plan {current} -> {target}")
-            return Election(target, str(plan.get("reason") or "followed"), followed=True)
+            return Election(
+                target,
+                str(plan.get("reason") or "followed"),
+                followed=True,
+                available_at=opens,
+            )
 
-        target, reason = pick_target(
+        target, reason, opens = pick_target(
             accounts,
             current=current,
             tried=tried,
             threshold=threshold,
             strategy=strategy,
+            current_reset=current_reset,
+            now=moment,
         )
         if target is None:
             return Election(None, reason)
@@ -612,11 +745,18 @@ def elect_target(
                 "from": current,
                 "to": target,
                 "reason": reason,
+                "availableAt": opens,
                 "decidedAt": moment,
-                "expiresAt": moment + PLAN_TTL_SECONDS,
+                # A plan that waits for a reset must outlive that wait, or the
+                # neighbour arriving a minute later would decide afresh.
+                "expiresAt": max(moment, opens) + PLAN_TTL_SECONDS,
             },
             harden=False,
         )
 
-    log.write(f"autoswitch: elected {current} -> {target} ({reason})")
-    return Election(target, reason)
+    log.write(
+        f"autoswitch: elected {current} -> {target} ({reason}"
+        + (f", opens {stamp(opens)}" if opens > moment else "")
+        + ")"
+    )
+    return Election(target, reason, available_at=opens)

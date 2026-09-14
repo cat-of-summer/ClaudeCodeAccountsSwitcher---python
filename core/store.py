@@ -31,6 +31,7 @@ DEFAULT_AUTO_SWITCH: dict[str, Any] = {
     "threshold": 95,
     "maxSwitches": 3,
     "minIntervalSeconds": 60,
+    "maxWaitSeconds": 7200,
     "confirmWithApi": True,
     "restoreMode": True,
     "resumePrompt": "",
@@ -285,12 +286,25 @@ def is_installed() -> bool:
     return config_path().exists()
 
 
+def default_resume_prompt() -> str:
+    """What to say to the resumed session so the work actually continues.
+
+    Lives in the language catalog rather than in this dict: it is a sentence
+    addressed to claude, and the user reads it in `ccas config`.
+    """
+    from ui.i18n import t
+
+    return t("autoswitch.default_resume_prompt")
+
+
 def migrate_config() -> bool:
     """Bring an older config.json up to the current schema.
 
-    Nothing needs converting today -- every key is read through a default -- but
-    stamping the version is what lets a future breaking change know which
-    layout it is looking at, and the backup is what makes that change safe.
+    Schema 3 fills in `autoSwitch.resumePrompt`, which shipped empty and so let
+    every switch land in a resumed session that then sat there waiting to be
+    told to carry on. An empty value still means "say nothing" once it has been
+    set deliberately -- this only reaches configs written before the key had a
+    meaningful default.
     """
     if not is_installed():
         return False
@@ -300,6 +314,12 @@ def migrate_config() -> bool:
         return False
 
     backup_file(config_path())
+
+    if not str(config.auto_switch.get("resumePrompt") or "").strip():
+        merged = dict(config.auto_switch)
+        merged["resumePrompt"] = default_resume_prompt()
+        config.auto_switch = merged
+
     config.schema = SCHEMA_VERSION
     config.save()
     from core import log
@@ -436,6 +456,37 @@ class Accounts:
         self.slots.pop(number, None)
         if self.active == number:
             self.active = 0
+
+    def backfill_identity(self) -> bool:
+        """Name the slots we already know the names of.
+
+        `capture_identity` can only run when the session ends *and* the shared
+        `~/.claude.json` still names our own account -- on a machine with
+        several terminals open that is the exception, so a slot could stay
+        anonymous forever and show up as a bare number. The per-slot identity
+        file has no such race: if the slot ever completed a login, it is there.
+        """
+        changed = False
+        for slot in self.ordered():
+            if slot.email and slot.account_uuid:
+                continue
+
+            raw: Any = None
+            with contextlib.suppress(OSError, ValueError):
+                raw = read_json(identity_file(slot.number))
+            oauth = raw.get("oauthAccount") if isinstance(raw, dict) else None
+            if not isinstance(oauth, dict):
+                continue
+
+            email = oauth.get("emailAddress")
+            account_uuid = oauth.get("accountUuid")
+            if not slot.email and isinstance(email, str) and email:
+                slot.email = email
+                changed = True
+            if not slot.account_uuid and isinstance(account_uuid, str) and account_uuid:
+                slot.account_uuid = account_uuid
+                changed = True
+        return changed
 
 
 def update_accounts(mutate: Callable[[Accounts], None]) -> Accounts:

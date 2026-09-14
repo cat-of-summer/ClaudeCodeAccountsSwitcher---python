@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -77,21 +76,56 @@ def _lock_path() -> Path:
     return app_dir() / ".lock"
 
 
+# OpenProcess rights, and the two answers WaitForSingleObject gives for a
+# handle to a process.
+_SYNCHRONIZE = 0x00100000
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WAIT_TIMEOUT = 0x00000102
+_ERROR_INVALID_PARAMETER = 87
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Ask the kernel directly instead of spawning `tasklist`.
+
+    The old implementation cost a console process per call -- several hundred
+    milliseconds each, on every `ccas` start and every usage refresh -- and it
+    attached that process to the console claude was drawing in. Nothing here
+    touches the console, and the answer arrives in microseconds.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = kernel32.OpenProcess(
+        _SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not handle:
+        # "No such process" is the only error that means dead. Access denied is
+        # a process we may not touch, which is still very much running.
+        return ctypes.get_last_error() != _ERROR_INVALID_PARAMETER
+
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
         try:
-            completed = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return str(pid) in completed.stdout
+            return _pid_alive_windows(pid)
+        except (AttributeError, OSError, ValueError):
+            # Unreadable is not the same as gone: dropping the session record
+            # here would let a rotation run against a live claude.
+            return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

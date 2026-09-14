@@ -37,6 +37,7 @@ from core.store import (
     update_accounts,
     write_json_atomic,
 )
+from ui import notify
 from ui.i18n import t
 
 # Session and lock bookkeeping moved to core/sessions.py so that core modules
@@ -492,12 +493,15 @@ def _number(source: dict[str, Any], key: str, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
-def _notice(message: str) -> None:
-    if sys.stderr and sys.stderr.isatty():
-        sys.stderr.write(f"\033[33mccas: {message}\033[0m\n")
-    else:
-        sys.stderr.write(f"ccas: {message}\n")
-    sys.stderr.flush()
+# How long after the announced reset to actually try: the moment the API names
+# is when the window rolls over server-side, and a request that lands on the
+# exact second has been seen to draw one more 429.
+RESET_MARGIN_SECONDS = 30.0
+
+# A declined switch does not end the watch. This is the least we wait before
+# taking the next wall seriously, so that the burst of 429 retries claude makes
+# on its own is not re-examined line by line.
+RETRY_FLOOR_SECONDS = 30.0
 
 
 def _supervise(config: Config, slot_number: int, plan: autoswitch.SessionPlan) -> int:
@@ -519,62 +523,106 @@ def _supervise(config: Config, slot_number: int, plan: autoswitch.SessionPlan) -
     switches = 0
     last_switch = 0.0
 
-    while True:
-        tried.add(slot_number)
-        signal = autoswitch.LimitSignal()
-        decision: dict[str, Any] = {}
-        allowed = switches < max_switches
-        # Evaluated when the wall is hit, not now: this session may run for
-        # hours, and a cooldown measured from its launch would have expired
-        # long before it ever mattered.
-        not_before = last_switch + min_interval if last_switch else 0.0
+    try:
+        while True:
+            tried.add(slot_number)
+            signal = autoswitch.LimitSignal()
+            decision: dict[str, Any] = {}
+            allowed = switches < max_switches
+            # Evaluated when the wall is hit, not now: this session may run for
+            # hours, and a cooldown measured from its launch would have expired
+            # long before it ever mattered.
+            not_before = last_switch + min_interval if last_switch else 0.0
 
-        watcher = autoswitch.TranscriptWatcher(
-            session_id, since=time.time(), signal=signal
-        )
-        watcher.start()
-
-        def _on_started(
-            process: subprocess.Popen[bytes],
-            _signal: autoswitch.LimitSignal = signal,
-            _decision: dict[str, Any] = decision,
-            _slot: int = slot_number,
-            _tried: set[int] = set(tried),
-            _allowed: bool = allowed,
-            _not_before: float = not_before,
-        ) -> None:
-            reaper = threading.Thread(
-                target=_reap,
-                args=(process, _signal, _decision, config, _slot, _tried, threshold),
-                kwargs={
-                    "may_kill": _allowed,
-                    "not_before": _not_before,
-                    "session_id": session_id,
-                },
-                daemon=True,
+            watcher = autoswitch.TranscriptWatcher(
+                session_id, since=time.time(), signal=signal
             )
-            reaper.start()
+            watcher.start()
 
-        try:
-            code = run_once(config, slot_number, args, on_started=_on_started)
-        finally:
-            watcher.stop()
+            def _on_started(
+                process: subprocess.Popen[bytes],
+                _signal: autoswitch.LimitSignal = signal,
+                _decision: dict[str, Any] = decision,
+                _slot: int = slot_number,
+                _tried: set[int] = set(tried),
+                _allowed: bool = allowed,
+                _not_before: float = not_before,
+            ) -> None:
+                reaper = threading.Thread(
+                    target=_reap,
+                    args=(process, _signal, _decision, config, _slot, _tried, threshold),
+                    kwargs={
+                        "may_kill": _allowed,
+                        "not_before": _not_before,
+                        "session_id": session_id,
+                        "retry_after": max(min_interval, RETRY_FLOOR_SECONDS),
+                    },
+                    daemon=True,
+                )
+                reaper.start()
 
-        # _reap only leaves a target behind when it actually killed the child.
-        target = decision.get("target")
-        if not target:
-            if signal.fired and not allowed and switches:
-                _notice(t("autoswitch.gave_up", count=switches))
-            return code
+            try:
+                code = run_once(config, slot_number, args, on_started=_on_started)
+            finally:
+                watcher.stop()
 
-        mode = str(decision.get("mode") or "")
-        args = autoswitch.relaunch_args(
-            args, session_id=session_id, mode=mode, config=config
-        )
-        slot_number = int(target)
-        switches += 1
-        last_switch = time.time()
-        _notice(t("autoswitch.resumed", slot=slot_number))
+            # _reap only leaves a target behind when it actually killed the child.
+            target = decision.get("target")
+            if not target:
+                if signal.fired and not allowed and switches:
+                    notify.notice(t("autoswitch.gave_up", count=switches), live=False)
+                return code
+
+            wait_until = float(decision.get("wait_until") or 0.0)
+            if wait_until > time.time():
+                label = Accounts.load().ensure(int(target)).label
+                if not _wait_for_reset(wait_until, slot=int(target), label=label):
+                    return code
+
+            mode = str(decision.get("mode") or "")
+            args = autoswitch.relaunch_args(
+                args, session_id=session_id, mode=mode, config=config
+            )
+            slot_number = int(target)
+            switches += 1
+            last_switch = time.time()
+            notify.notice(t("autoswitch.resumed", slot=slot_number), live=False)
+    finally:
+        notify.clear_title()
+
+
+def _wait_for_reset(moment: float, *, slot: int, label: str) -> bool:
+    """Sit out the time until `slot` opens again; False if the user gave up.
+
+    claude has already been stopped by now, so the terminal is ours: one line
+    says what is happening and the title carries the countdown. Sleeping in
+    short slices is what keeps Ctrl-C answering.
+    """
+    resume_at = moment + RESET_MARGIN_SECONDS
+    minutes = max(1, int((resume_at - time.time()) / 60) + 1)
+    notify.notice(
+        t(
+            "autoswitch.waiting",
+            slot=slot,
+            label=label,
+            opens=autoswitch.stamp(moment),
+            minutes=minutes,
+        ),
+        live=False,
+    )
+
+    try:
+        while True:
+            remaining = resume_at - time.time()
+            if remaining <= 0:
+                return True
+            notify.title(
+                t("autoswitch.waiting_title", slot=slot, minutes=int(remaining / 60) + 1)
+            )
+            time.sleep(min(1.0, remaining))
+    except KeyboardInterrupt:
+        notify.notice(t("autoswitch.wait_cancelled"), live=False)
+        return False
 
 
 def _reap(
@@ -589,41 +637,98 @@ def _reap(
     may_kill: bool,
     not_before: float = 0.0,
     session_id: str | None = None,
+    retry_after: float = RETRY_FLOOR_SECONDS,
 ) -> None:
-    while not signal.wait(0.5):
-        if process.poll() is not None:
+    """Watch for the wall, decide, and if the decision is to stay, keep watching.
+
+    One wall used to be the end of it: a switch declined for any reason left
+    the signal set, and the second wall of the evening went unanswered. Now a
+    decline re-arms the signal after a pause, so the next 429 gets the same
+    consideration the first one did.
+    """
+    while True:
+        while not signal.wait(0.5):
+            if process.poll() is not None:
+                return
+
+        if _decide(
+            process,
+            signal,
+            decision,
+            config,
+            slot_number,
+            tried,
+            threshold,
+            may_kill=may_kill,
+            not_before=not_before,
+            session_id=session_id,
+        ):
             return
 
+        log.write(f"autoswitch: staying on slot {slot_number}, watching for the next wall")
+        deadline = time.time() + retry_after
+        while time.time() < deadline:
+            if process.poll() is not None:
+                return
+            time.sleep(0.5)
+        signal.rearm()
+
+
+def _decide(
+    process: subprocess.Popen[bytes],
+    signal: autoswitch.LimitSignal,
+    decision: dict[str, Any],
+    config: Config,
+    slot_number: int,
+    tried: set[int],
+    threshold: float,
+    *,
+    may_kill: bool,
+    not_before: float,
+    session_id: str | None,
+) -> bool:
+    """One wall, one verdict. True when claude was told to stop.
+
+    Every way of declining is written to the journal by name: while claude owns
+    the screen there is nowhere else for the reason to go, and a switch that
+    silently does not happen is indistinguishable from one that was never
+    attempted.
+    """
     window = signal.window
-    _notice(
+    notify.notice(
         t(
             "autoswitch.limit_hit",
             slot=slot_number,
             window=t(f"usage.window_{window}") if window else t("usage.window_unknown"),
-        )
+        ),
+        live=True,
     )
 
     if config.cred_mode == CRED_MODE_COPY and other_live_sessions():
         # In copy mode the credentials live in one shared file; moving this
         # session would silently move the neighbour's too.
-        _notice(t("autoswitch.copy_mode_busy"))
-        return
+        notify.notice(t("autoswitch.copy_mode_busy"), live=True)
+        return False
 
     accounts = Accounts.load()
     slot = accounts.ensure(slot_number)
 
+    confirmed_here = False
     if config.auto_switch.get("confirmWithApi", True):
-        _notice(t("autoswitch.confirming"))
+        notify.notice(t("autoswitch.confirming"), live=True)
         confirmed = autoswitch.confirm_exhausted(slot, threshold=threshold)
         if confirmed is None:
-            _notice(t("autoswitch.unconfirmed"))
-            return
+            notify.notice(t("autoswitch.unconfirmed"), live=True)
+            return False
         if not confirmed:
-            _notice(t("autoswitch.not_exhausted"))
-            return
+            notify.notice(t("autoswitch.not_exhausted"), live=True)
+            return False
         _store_usage({slot_number: slot.usage})
+        confirmed_here = True
 
-    _refresh_candidates(accounts, current=slot_number, tried=tried)
+    _refresh_candidates(
+        accounts, current=slot_number, tried=tried, include_current=not confirmed_here
+    )
 
     election = autoswitch.elect_target(
         accounts,
@@ -631,45 +736,86 @@ def _reap(
         tried=tried,
         threshold=threshold,
         strategy=str(config.auto_switch.get("strategy") or "limits"),
+        current_reset=signal.resets_at,
     )
     if election.target is None:
-        _notice(t("autoswitch.no_target", slot=slot_number))
-        return
+        notify.notice(t("autoswitch.no_target", slot=slot_number), live=True)
+        return False
+
+    target_label = accounts.ensure(election.target).label
+
+    if election.must_wait():
+        max_wait = _number(config.auto_switch, "maxWaitSeconds", 7200.0)
+        wait = election.available_at - time.time()
+        if max_wait <= 0 or wait > max_wait:
+            notify.notice(
+                t(
+                    "autoswitch.wait_too_long",
+                    slot=election.target,
+                    label=target_label,
+                    opens=autoswitch.stamp(election.available_at),
+                    minutes=int(wait / 60) + 1,
+                    limit=int(max_wait / 60),
+                ),
+                live=True,
+            )
+            return False
 
     if process.poll() is not None:
         # The user quit while we were checking. Relaunching now would reopen a
         # session they just closed on purpose.
         log.write("autoswitch: session ended before the switch, standing down")
-        return
+        return False
 
-    decision["target"] = election.target
-    decision["mode"] = signal.permission_mode
-
+    strategy = config.auto_switch.get("strategy")
     too_soon = not_before and time.time() < not_before
-    if config.auto_switch.get("strategy") == "notify" or not may_kill or too_soon:
+    if strategy == "notify" or not may_kill or too_soon:
         hint = autoswitch.relaunch_args(
             [], session_id=session_id, mode=signal.permission_mode, config=config
         )
-        _notice(
+        if strategy == "notify":
+            why = "notify strategy"
+        elif not may_kill:
+            why = "switch budget spent"
+        else:
+            why = "cooldown"
+        log.write(f"autoswitch: not switching ({why})")
+        notify.notice(
             t(
                 "autoswitch.notify_command",
                 command=f"claude {election.target} {' '.join(hint)}".strip(),
-            )
+            ),
+            live=True,
         )
-        decision.pop("target", None)
-        return
+        return False
 
-    target_label = accounts.ensure(election.target).label
-    _notice(
-        t(
-            "autoswitch.switching",
-            from_slot=slot_number,
-            to_slot=election.target,
-            label=target_label,
-            mode=signal.permission_mode or t("common.none"),
+    decision["target"] = election.target
+    decision["mode"] = signal.permission_mode
+    if election.must_wait():
+        decision["wait_until"] = election.available_at
+        notify.notice(
+            t(
+                "autoswitch.switching_later",
+                from_slot=slot_number,
+                to_slot=election.target,
+                label=target_label,
+                opens=autoswitch.stamp(election.available_at),
+            ),
+            live=True,
         )
-    )
+    else:
+        notify.notice(
+            t(
+                "autoswitch.switching",
+                from_slot=slot_number,
+                to_slot=election.target,
+                label=target_label,
+                mode=signal.permission_mode or t("common.none"),
+            ),
+            live=True,
+        )
     terminate(process)
+    return True
 
 
 def _store_usage(payloads: dict[int, dict[str, Any]]) -> None:
@@ -684,23 +830,34 @@ def _store_usage(payloads: dict[int, dict[str, Any]]) -> None:
     update_accounts(_write)
 
 
-def _refresh_candidates(accounts: Accounts, *, current: int, tried: set[int]) -> None:
-    """Make sure the ranking is done on numbers worth ranking by."""
+def _refresh_candidates(
+    accounts: Accounts, *, current: int, tried: set[int], include_current: bool
+) -> None:
+    """Rank on numbers fetched now, not on whatever was lying in the store.
+
+    This used to skip any slot whose snapshot was younger than six hours, and a
+    5-hour window empties and refills inside that. The store would say every
+    account was spent while one of them had been free for hours, and the
+    session stayed put. A handful of requests once per wall is cheap; a wrong
+    "no target" costs the rest of the evening.
+    """
     from ui import usage as usage_module
 
-    pool = autoswitch.candidates(accounts, current=current, tried=tried)
-    stale = [
-        slot for slot in pool if not usage_module.is_usable_for_ranking(slot.usage)
-    ]
-    if not stale:
+    wanted = autoswitch.candidates(accounts, current=current, tried=tried)
+    if include_current:
+        wanted = [*wanted, accounts.ensure(current)]
+    if not wanted:
         return
 
     fresh = usage_module.refresh_slots(
-        stale, refresh_timeout=usage_module.INTERACTIVE_REFRESH_TIMEOUT
+        wanted, refresh_timeout=usage_module.INTERACTIVE_REFRESH_TIMEOUT
     )
     for number, payload in fresh.items():
         accounts.ensure(number).usage = payload
     _store_usage(fresh)
+    missed = sorted(slot.number for slot in wanted if slot.number not in fresh)
+    if missed:
+        log.write(f"autoswitch: no fresh usage for slots {missed}, ranking on stored data")
 
 
 def main(argv: list[str] | None = None) -> int:

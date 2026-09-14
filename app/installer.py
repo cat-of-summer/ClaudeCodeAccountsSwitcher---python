@@ -17,6 +17,7 @@ from core.store import (
     app_dir,
     bin_dir,
     creds_file,
+    default_resume_prompt,
     ensure_layout,
     ensure_slot_dir,
     identity_file,
@@ -276,6 +277,10 @@ def install(
     # so Enter still means "leave it alone".
     previous_skip = DEFAULT_ARGS[0] in previous.default_args
     auto_switch = dict(previous.auto_switch)
+    if not upgrading and not str(auto_switch.get("resumePrompt") or "").strip():
+        # A fresh install gets the sentence that makes a resumed session pick
+        # its work back up; an upgrade keeps whatever the user settled on.
+        auto_switch["resumePrompt"] = default_resume_prompt()
 
     if skip_permissions is not None:
         default_args = list(DEFAULT_ARGS) if skip_permissions else []

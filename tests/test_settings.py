@@ -205,3 +205,31 @@ class TestConfigCommand(TempHome):
     def test_an_unknown_key_exits(self) -> None:
         with self.assertRaises(SystemExit):
             self._run(key="nope", value="1")
+
+    def test_migration_fills_an_empty_resume_prompt(self) -> None:
+        """Schema 3: a session resumed after a switch must be told to carry on."""
+        store.write_json_atomic(
+            store.config_path(),
+            {"schema": 2, "autoSwitch": {"enabled": True, "resumePrompt": ""}},
+        )
+        self.assertTrue(store.migrate_config())
+        prompt = Config.load().auto_switch["resumePrompt"]
+        self.assertEqual(prompt, i18n.t("autoswitch.default_resume_prompt"))
+        self.assertTrue(prompt.strip())
+
+    def test_migration_keeps_a_prompt_the_user_wrote(self) -> None:
+        store.write_json_atomic(
+            store.config_path(),
+            {"schema": 2, "autoSwitch": {"resumePrompt": "carry on, quietly"}},
+        )
+        store.migrate_config()
+        self.assertEqual(Config.load().auto_switch["resumePrompt"], "carry on, quietly")
+
+    def test_the_wait_limit_is_edited_in_minutes(self) -> None:
+        Config().save()
+        setting = settings.find("auto-switch-max-wait")
+        self.assertEqual(setting.get(Config.load()), 120)
+        settings.apply(setting, settings.parse(setting, "45"))
+        self.assertEqual(Config.load().auto_switch["maxWaitSeconds"], 45 * 60)
+        with self.assertRaises(settings.SettingError):
+            settings.parse(setting, "100000")

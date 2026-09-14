@@ -64,6 +64,30 @@ def _require_installed() -> tuple[Config, Accounts]:
     return Config.load(), Accounts.load()
 
 
+def _name_known_slots(accounts: Accounts) -> None:
+    """Fill in names the store lost but the identity files still hold."""
+    if accounts.backfill_identity():
+        update_accounts(lambda current: current.backfill_identity())
+
+
+def _start_claude(config: Config, slot: Slot, args: list[str]) -> int:
+    """Hand the terminal to claude on `slot`, in this very process.
+
+    Not `os.execv`: the wrapper's supervision -- the transcript watch, the
+    switch on a spent quota -- lives in `run_slot`, and running it here means a
+    session started from the menu behaves exactly like one started by typing
+    `claude N`.
+    """
+    from app import wrapper
+
+    update_accounts(lambda current: setattr(current, "active", slot.number))
+    print(t("cli.active_slot", slot=slot.number, label=slot.label))
+    try:
+        return wrapper.run_slot(config, slot.number, args)
+    except wrapper.WrapperError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _resolve_target(accounts: Accounts, token: str) -> Slot:
     probe = token.strip()
 
@@ -177,6 +201,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     _, accounts = _require_installed()
+    _name_known_slots(accounts)
     slots = accounts.ordered()
     if not slots:
         print(t("cli.no_slots_hint"))
@@ -202,6 +227,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
         print(t("cli.no_slots_hint"))
         return 0
 
+    _name_known_slots(accounts)
     from ui import menu
 
     chosen = menu.choose(config, accounts)
@@ -216,10 +242,17 @@ def cmd_menu(args: argparse.Namespace) -> int:
         print(t("cli.free_slot_hint", slot=chosen))
         return 0
 
-    update_accounts(lambda current: setattr(current, "active", chosen))
-    print(t("cli.active_slot", slot=chosen, label=target.label))
-    print(t("cli.run_claude_hint"))
-    return 0
+    return _start_claude(config, target, [])
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    config, accounts = _require_installed()
+    slot = _resolve_target(accounts, args.target)
+    if not slot.has_credentials():
+        print(t("cli.free_slot", slot=slot.number))
+        print(t("cli.free_slot_hint", slot=slot.number))
+        return 0
+    return _start_claude(config, slot, list(getattr(args, "claude_args", None) or []))
 
 
 def cmd_switch(args: argparse.Namespace) -> int:
@@ -286,6 +319,7 @@ def cmd_rename(args: argparse.Namespace) -> int:
 
 def cmd_usage(args: argparse.Namespace) -> int:
     _, accounts = _require_installed()
+    _name_known_slots(accounts)
     slots = accounts.ordered()
     if not slots:
         print(t("cli.no_slots"))
@@ -496,6 +530,11 @@ def build_parser() -> argparse.ArgumentParser:
     menu_parser = subparsers.add_parser("menu", help=t("cli.help.menu"))
     menu_parser.set_defaults(func=cmd_menu)
 
+    run_parser = subparsers.add_parser("run", help=t("cli.help.run"))
+    run_parser.add_argument("target", help=t("cli.help.target"))
+    run_parser.add_argument("claude_args", nargs=argparse.REMAINDER)
+    run_parser.set_defaults(func=cmd_run)
+
     switch_parser = subparsers.add_parser("switch", help=t("cli.help.switch"))
     switch_parser.add_argument("target", help=t("cli.help.target"))
     switch_parser.set_defaults(func=cmd_switch)
@@ -563,7 +602,9 @@ def _dispatch(parser: argparse.ArgumentParser, tokens: list[str]) -> None:
 def run_shell(parser: argparse.ArgumentParser) -> int:
     print(t("cli.shell.banner", version=__version__))
     if is_installed():
-        cmd_list(argparse.Namespace(refresh=False, cached=False))
+        # From the store, instantly: the network is asked on `r`, not before
+        # the prompt has even appeared.
+        cmd_list(argparse.Namespace(refresh=False, cached=True))
     else:
         print(t("cli.not_installed_bare"))
     print()
@@ -594,6 +635,11 @@ def run_shell(parser: argparse.ArgumentParser) -> int:
             continue
         if shortcut in {"s", "settings"}:
             _dispatch(parser, ["config"])
+            print()
+            continue
+        if shortcut.isdigit() or shortcut.startswith("go "):
+            target = shortcut[3:].strip() if shortcut.startswith("go ") else shortcut
+            _dispatch(parser, ["run", target])
             print()
             continue
 
