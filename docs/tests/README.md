@@ -19,6 +19,7 @@
 - [test_migration.py](test_migration.py.md)
 - [test_oauth.py](test_oauth.py.md)
 - [test_pathenv.py](test_pathenv.py.md)
+- [test_procs.py](test_procs.py.md)
 - [test_profiles.py](test_profiles.py.md)
 - [test_prompter.py](test_prompter.py.md)
 - [test_reinstall.py](test_reinstall.py.md)
