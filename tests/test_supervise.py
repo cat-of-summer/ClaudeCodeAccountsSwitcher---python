@@ -8,6 +8,7 @@ from unittest import mock
 from app import autoswitch, wrapper
 from core import store
 from core.store import Accounts, Config, Slot
+from system import console
 from tests.base import TempHome
 from ui import usage
 
@@ -248,6 +249,140 @@ class TestSupervisedRun(TempHome):
         calls = self._invocations()
         self.assertEqual(len(calls), 1)
         self.assertNotIn("--session-id", calls[0])
+
+    def test_the_console_is_restored_after_a_killed_claude(self) -> None:
+        """taskkill leaves ink's raw mode behind; the wrapper must undo it.
+
+        The first claude is killed by the reaper, the second exits on its own:
+        both launches end with the snapshot put back, on the launching thread.
+        """
+        state = console.State(input_mode=0x1F7, output_mode=7)
+        with (
+            mock.patch.object(console, "snapshot", return_value=state) as snapshot,
+            mock.patch.object(console, "restore") as restore,
+            mock.patch.object(console, "sanitize") as sanitize,
+        ):
+            wrapper.run_slot(self.config, 1, [])
+
+        self.assertEqual(len(self._invocations()), 2)
+        self.assertEqual(snapshot.call_count, 2)
+        self.assertEqual(restore.call_args_list, [mock.call(state), mock.call(state)])
+        self.assertEqual(sanitize.call_count, 2)
+
+
+class TestLaunchRestoresConsole(TempHome):
+    def _config(self) -> Config:
+        return Config(
+            real_claude_path=sys.executable, cred_mode="env", default_args=["-c", "pass"]
+        )
+
+    def test_a_clean_exit_still_restores(self) -> None:
+        state = console.State(input_mode=0x1F7, output_mode=7)
+        with (
+            mock.patch.object(console, "snapshot", return_value=state),
+            mock.patch.object(console, "restore") as restore,
+            mock.patch.object(console, "sanitize") as sanitize,
+        ):
+            code = wrapper.launch(self._config(), 1, [])
+
+        self.assertEqual(code, 0)
+        restore.assert_called_once_with(state)
+        sanitize.assert_called_once()
+
+    def test_a_launch_that_fails_to_start_does_not_touch_the_console(self) -> None:
+        config = Config(real_claude_path=str(self.home / "missing.exe"), cred_mode="env")
+        with (
+            mock.patch.object(console, "snapshot") as snapshot,
+            mock.patch.object(console, "restore") as restore,
+        ):
+            with self.assertRaises(wrapper.WrapperError):
+                wrapper.launch(config, 1, [])
+        snapshot.assert_not_called()
+        restore.assert_not_called()
+
+
+class TestWaitForReset(TempHome):
+    """The wait screen answers to keys directly, whatever state the console is in."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._margin = mock.patch.object(wrapper, "RESET_MARGIN_SECONDS", 0.0)
+        self._margin.start()
+        self.addCleanup(self._margin.stop)
+
+    def _keys(self, *keys: str):
+        """A poll_key that plays `keys` in order, then reports silence."""
+        queue = list(keys)
+
+        def _poll(timeout: float) -> str:
+            if queue:
+                return queue.pop(0)
+            time.sleep(min(timeout, 0.02))
+            return ""
+
+        return mock.patch.object(console, "poll_key", side_effect=_poll)
+
+    def test_the_wait_ends_when_the_slot_opens(self) -> None:
+        with self._keys():
+            waited, message = wrapper._wait_for_reset(
+                time.time() + 0.2, slot=2, label="two"
+            )
+        self.assertTrue(waited)
+        self.assertEqual(message, "")
+
+    def test_q_and_ctrl_c_and_escape_give_up(self) -> None:
+        for key in ("q", "\x03", "\x1b"):
+            with self._keys(key):
+                waited, message = wrapper._wait_for_reset(
+                    time.time() + 5, slot=2, label="two"
+                )
+            self.assertFalse(waited, repr(key))
+            self.assertEqual(message, "")
+
+    def test_a_typed_line_is_queued_for_the_resumed_session(self) -> None:
+        with self._keys("g", "o", " ", "o", "n", "\r"):
+            waited, message = wrapper._wait_for_reset(
+                time.time() + 0.3, slot=2, label="two"
+            )
+        self.assertTrue(waited)
+        self.assertEqual(message, "go on")
+
+    def test_backspace_edits_and_escape_drops_the_line(self) -> None:
+        # "ab" + backspace -> "a"; Esc drops it; "q" would cancel now, so type
+        # "ok" and confirm instead.
+        with self._keys("a", "b", "\x08", "\x1b", "o", "k", "\r"):
+            waited, message = wrapper._wait_for_reset(
+                time.time() + 0.3, slot=2, label="two"
+            )
+        self.assertTrue(waited)
+        self.assertEqual(message, "ok")
+
+    def test_q_inside_a_line_is_a_letter(self) -> None:
+        with self._keys("s", "q", "l", "\r"):
+            waited, message = wrapper._wait_for_reset(
+                time.time() + 0.3, slot=2, label="two"
+            )
+        self.assertTrue(waited)
+        self.assertEqual(message, "sql")
+
+    def test_the_last_confirmed_line_wins(self) -> None:
+        with self._keys("a", "\r", "b", "\r"):
+            _, message = wrapper._wait_for_reset(time.time() + 0.3, slot=2, label="two")
+        self.assertEqual(message, "b")
+
+    def test_the_queued_line_reaches_the_relaunch(self) -> None:
+        """What was typed during the wait is the resumed session's first prompt."""
+        config = Config(cred_mode="env")
+        config.auto_switch = {**config.auto_switch, "resumePrompt": "configured"}
+
+        args = autoswitch.relaunch_args(
+            [], session_id="a" * 8 + "-" + "b" * 4 + "-" + "c" * 4 + "-" + "d" * 4 + "-" + "e" * 12,
+            config=config, resume_prompt="typed",
+        )
+        self.assertEqual(args[-1], "typed")
+
+        fallback = autoswitch.relaunch_args([], session_id=None, config=config)
+        self.assertEqual(fallback[-1], "configured")
 
 
 def _run_in_background(config: Config, slot: int):

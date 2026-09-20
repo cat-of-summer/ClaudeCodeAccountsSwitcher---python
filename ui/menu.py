@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 
 from core.store import Accounts, Config, Slot, update_accounts
+from system import console
 from ui import usage
 from ui.i18n import t
 from ui.screen import BOLD, CYAN, DIM, GREEN, RESET, Surface, enable_ansi, read_key
@@ -62,6 +63,7 @@ def choose(config: Config, accounts: Accounts) -> int | None:
     if not slots:
         return accounts.next_free_number()
 
+    console.repair()
     enable_ansi()
 
     cursor = 0

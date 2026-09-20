@@ -18,6 +18,10 @@ def iso(offset: float = 0.0) -> str:
     return datetime.fromtimestamp(time.time() + offset, timezone.utc).isoformat()
 
 
+def _at(moment: float) -> str:
+    return datetime.fromtimestamp(moment, timezone.utc).isoformat()
+
+
 def limit_record(*, at: str, text: str = "You've hit your session limit") -> str:
     return json.dumps(
         {
@@ -456,6 +460,73 @@ class TestElection(TempHome):
         self.assertIsNone(election.target)
         self.assertFalse(autoswitch.switch_plan_path().exists())
 
+    def test_a_plan_whose_target_ran_dry_is_not_followed(self) -> None:
+        """The plan outlives its wait; the target may not have."""
+        accounts = self._accounts()
+        first = autoswitch.elect_target(accounts, current=1, tried={1}, threshold=95)
+        self.assertEqual(first.target, 2)
+
+        # Fresh numbers arrive: slot 2 is now spent with no reset in sight.
+        accounts.slots[2].usage = {
+            "fetchedAtMs": time.time() * 1000,
+            "five_hour": {"utilization": 100.0},
+            "seven_day": {"utilization": 5.0},
+        }
+        second = autoswitch.elect_target(accounts, current=1, tried={1}, threshold=95)
+
+        self.assertFalse(second.followed)
+        self.assertEqual(second.target, 3)
+
+    def test_a_plan_whose_target_was_already_tried_is_not_followed(self) -> None:
+        accounts = self._accounts()
+        autoswitch.elect_target(accounts, current=1, tried={1}, threshold=95)
+
+        again = autoswitch.elect_target(accounts, current=1, tried={1, 2}, threshold=95)
+        self.assertFalse(again.followed)
+        self.assertEqual(again.target, 3)
+
+    def test_a_waiting_plan_takes_the_fresh_reset_moment(self) -> None:
+        """A plan that waits names a spent slot on purpose; only the moment moves."""
+        accounts = self._accounts()
+        soon = time.time() + 600
+        later = time.time() + 1200
+        for number in (2, 3):
+            accounts.slots[number].usage = {
+                "fetchedAtMs": time.time() * 1000,
+                "five_hour": {
+                    "utilization": 100.0,
+                    "resets_at": _at(soon if number == 2 else later),
+                },
+                "seven_day": {"utilization": 5.0},
+            }
+        first = autoswitch.elect_target(accounts, current=1, tried={1}, threshold=95)
+        self.assertEqual(first.target, 2)
+        self.assertAlmostEqual(first.available_at, soon, delta=1.0)
+
+        # Slot 2 pushed its reset out by ten minutes since the plan was written.
+        moved = soon + 600
+        accounts.slots[2].usage["five_hour"]["resets_at"] = _at(moved)
+        second = autoswitch.elect_target(accounts, current=1, tried={1}, threshold=95)
+
+        self.assertTrue(second.followed)
+        self.assertEqual(second.target, 2)
+        self.assertAlmostEqual(second.available_at, moved, delta=1.0)
+
+    def test_the_verdict_names_every_slot(self) -> None:
+        accounts = self._accounts()
+        accounts.slots[4] = Slot(number=4)  # never signed in
+        accounts.slots[5] = Slot(number=5, usage={"fetchedAtMs": 1})  # ancient data
+        self.write_credentials(store.creds_file(5))
+
+        verdicts = autoswitch.explain(accounts, current=1, tried={1, 3}, threshold=95)
+        self.assertEqual(
+            verdicts,
+            {1: "current", 2: "free", 3: "tried", 4: "no-credentials", 5: "no-data"},
+        )
+
+        election = autoswitch.elect_target(accounts, current=1, tried={1, 3}, threshold=95)
+        self.assertEqual(election.detail, verdicts)
+
 
 class TestExhaustion(TempHome):
     def test_five_hour_over_the_threshold_counts(self) -> None:
@@ -505,9 +576,27 @@ class TestQuotaLimits(TempHome):
         self.assertEqual(autoswitch._window_of(record), autoswitch.SEVEN_DAY)
 
     def test_the_reset_moment_is_lifted(self) -> None:
-        self.assertEqual(autoswitch._reset_of(self._record(resetsAt=1789317000)), 1789317000.0)
-        self.assertEqual(autoswitch._reset_of(self._record()), 0.0)
-        self.assertEqual(autoswitch._reset_of({}), 0.0)
+        now = 1789300000.0
+        self.assertEqual(
+            autoswitch._reset_of(self._record(resetsAt=1789317000), now=now), 1789317000.0
+        )
+        self.assertEqual(autoswitch._reset_of(self._record(), now=now), 0.0)
+        self.assertEqual(autoswitch._reset_of({}, now=now), 0.0)
+
+    def test_milliseconds_are_recognised_by_their_size(self) -> None:
+        now = 1789300000.0
+        self.assertEqual(
+            autoswitch._reset_of(self._record(resetsAt=1789317000000), now=now),
+            1789317000.0,
+        )
+
+    def test_a_reset_beyond_the_horizon_is_not_trusted(self) -> None:
+        """An absurd reset would be waited for, or declined, in silence."""
+        now = 1789300000.0
+        far = now + autoswitch.RESET_HORIZON_SECONDS + 1
+        self.assertEqual(autoswitch._reset_of(self._record(resetsAt=far), now=now), 0.0)
+        near = now + autoswitch.RESET_HORIZON_SECONDS - 1
+        self.assertEqual(autoswitch._reset_of(self._record(resetsAt=near), now=now), near)
 
     def test_the_signal_carries_the_reset(self) -> None:
         signal = autoswitch.LimitSignal()

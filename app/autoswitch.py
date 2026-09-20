@@ -193,8 +193,13 @@ def relaunch_args(
     session_id: str | None,
     mode: str = "",
     config: Config | None = None,
+    resume_prompt: str | None = None,
 ) -> list[str]:
-    """Rebuild the command line that resumes this conversation on another slot."""
+    """Rebuild the command line that resumes this conversation on another slot.
+
+    `resume_prompt` is what the user typed while the switch was waiting for a
+    reset; given, it replaces the configured `resumePrompt` for this relaunch.
+    """
     auto = (config.auto_switch if config is not None else {}) or {}
     rest = strip_session_flags(args)
 
@@ -218,7 +223,9 @@ def relaunch_args(
     else:
         head = ["--continue", *head]
 
-    prompt = str(auto.get("resumePrompt") or "").strip()
+    prompt = (
+        resume_prompt if resume_prompt is not None else str(auto.get("resumePrompt") or "")
+    ).strip()
     tail = [prompt] if prompt else []
     return [*head, *rest, *tail]
 
@@ -463,12 +470,34 @@ def _window_of(record: dict[str, Any]) -> str:
     return ""
 
 
-def _reset_of(record: dict[str, Any]) -> float:
-    """When the wall comes down, as epoch seconds -- 0 when the record is silent."""
+# Above this an epoch value can only be milliseconds: 1e11 seconds is the year
+# 5138, while 1e11 milliseconds is 1973.
+EPOCH_MS_FLOOR = 1e11
+# A reset further out than the weekly window plus slack is not a reset we can
+# act on -- it would be waited for, or the wait declined, in silence.
+RESET_HORIZON_SECONDS = 30 * 24 * 3600.0
+
+
+def _reset_of(record: dict[str, Any], *, now: float | None = None) -> float:
+    """When the wall comes down, as epoch seconds -- 0 when the record is silent.
+
+    The unit is not stated in the transcript, so it is inferred from the size:
+    a value that would land in the year 5138 was milliseconds. Anything more
+    than a month away is discarded rather than trusted -- an absurd reset
+    makes `available_at` absurd, and the switch is then quietly declined by
+    the `maxWaitSeconds` guard with no sign of why.
+    """
     value = _quota(record).get("resetsAt")
-    if isinstance(value, (int, float)) and value > 0:
-        return float(value)
-    return 0.0
+    if not isinstance(value, (int, float)) or value <= 0:
+        return 0.0
+    moment = float(value)
+    if moment > EPOCH_MS_FLOOR:
+        moment /= 1000.0
+    reference = time.time() if now is None else now
+    if moment > reference + RESET_HORIZON_SECONDS:
+        log.write(f"transcript: resetsAt {value!r} is beyond the horizon, ignored")
+        return 0.0
+    return moment
 
 
 def stamp(moment: float) -> str:
@@ -647,6 +676,73 @@ def pick_target(
     return soonest[1], "waiting", soonest[0]
 
 
+def explain(
+    accounts: Accounts, *, current: int, tried: set[int], threshold: float
+) -> dict[int, str]:
+    """Why each slot is, or is not, a place to go -- for the journal.
+
+    A "no target" used to be a single line with nothing behind it, and the
+    evening's question was always the same: which slot was rejected for what.
+    """
+    verdicts: dict[int, str] = {}
+    for slot in accounts.ordered():
+        if not slot.has_credentials():
+            verdicts[slot.number] = "no-credentials"
+        elif claudecfg.token_state(creds_file(slot.number)) == "stale":
+            verdicts[slot.number] = "stale-token"
+        elif slot.number == current:
+            verdicts[slot.number] = "current"
+        elif slot.number in tried:
+            verdicts[slot.number] = "tried"
+        elif not usage.is_usable_for_ranking(slot.usage):
+            verdicts[slot.number] = "no-data"
+        elif is_exhausted(slot.usage, threshold=threshold):
+            verdicts[slot.number] = "spent"
+        else:
+            verdicts[slot.number] = "free"
+    return verdicts
+
+
+def _plan_still_holds(
+    accounts: Accounts,
+    target: int,
+    planned_opens: float,
+    *,
+    tried: set[int],
+    threshold: float,
+    now: float,
+) -> float | None:
+    """Re-check a plan another terminal wrote against what is known now.
+
+    Returns when the target opens (0 for right away), or None when the plan
+    should be dropped. The plan outlives its own wait on purpose, and in that
+    time the target can run dry on its own; following it regardless is how a
+    session ended up resumed on a slot as spent as the one it left.
+
+    A plan that was waiting for a reset names a spent slot by design, so
+    "spent" alone is not a reason to drop it -- the fresh reset moment simply
+    replaces the planned one.
+    """
+    if target in tried:
+        return None
+    slot = accounts.get(target)
+    if slot is None or not slot.has_credentials():
+        return None
+    if claudecfg.token_state(creds_file(target)) == "stale":
+        return None
+    if not usage.is_usable_for_ranking(slot.usage):
+        return planned_opens
+
+    fresh = available_at(slot.usage, threshold=threshold, now=now)
+    if math.isinf(fresh):
+        # Spent, and the data names no reset: nothing to wait for either.
+        return None
+    if planned_opens <= now and fresh > now:
+        # Promised free now, found spent since: decide afresh.
+        return None
+    return fresh
+
+
 def _round_robin(pool: list[Slot], *, current: int) -> int:
     numbers = sorted(slot.number for slot in pool)
     for number in numbers:
@@ -714,17 +810,31 @@ def elect_target(
     """
     moment = time.time() if now is None else now
 
+    verdicts = explain(accounts, current=current, tried=tried, threshold=threshold)
+    summary = ", ".join(f"{number}={why}" for number, why in sorted(verdicts.items()))
+
     with file_lock(switch_plan_lock_path(), timeout=PLAN_LOCK_TIMEOUT):
         plan = read_json(switch_plan_path())
         if _plan_valid(plan, current, moment):
             target = int(plan["to"])
-            opens = float(plan.get("availableAt", 0) or 0)
-            log.write(f"autoswitch: following plan {current} -> {target}")
-            return Election(
-                target,
-                str(plan.get("reason") or "followed"),
-                followed=True,
-                available_at=opens,
+            planned = float(plan.get("availableAt", 0) or 0)
+            opens = _plan_still_holds(
+                accounts, target, planned, tried=tried, threshold=threshold, now=moment
+            )
+            if opens is not None:
+                log.write(
+                    f"autoswitch: following plan {current} -> {target} ({summary})"
+                )
+                return Election(
+                    target,
+                    str(plan.get("reason") or "followed"),
+                    followed=True,
+                    available_at=opens,
+                    detail=dict(verdicts),
+                )
+            log.write(
+                f"autoswitch: plan {current} -> {target} no longer holds "
+                f"({verdicts.get(target, 'unknown')}), deciding afresh"
             )
 
         target, reason, opens = pick_target(
@@ -737,7 +847,8 @@ def elect_target(
             now=moment,
         )
         if target is None:
-            return Election(None, reason)
+            log.write(f"autoswitch: no target ({reason}): {summary}")
+            return Election(None, reason, detail=dict(verdicts))
 
         write_json_atomic(
             switch_plan_path(),
@@ -757,6 +868,6 @@ def elect_target(
     log.write(
         f"autoswitch: elected {current} -> {target} ({reason}"
         + (f", opens {stamp(opens)}" if opens > moment else "")
-        + ")"
+        + f"; {summary})"
     )
-    return Election(target, reason, available_at=opens)
+    return Election(target, reason, available_at=opens, detail=dict(verdicts))

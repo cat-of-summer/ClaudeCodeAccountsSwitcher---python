@@ -7,6 +7,7 @@
 - [test_arguments.py](test_arguments.py.md)
 - [test_autoswitch.py](test_autoswitch.py.md)
 - [test_claude_config.py](test_claude_config.py.md)
+- [test_console.py](test_console.py.md)
 - [test_concurrency.py](test_concurrency.py.md)
 - [test_credentials.py](test_credentials.py.md)
 - [test_i18n.py](test_i18n.py.md)

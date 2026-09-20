@@ -37,6 +37,7 @@ from core.store import (
     update_accounts,
     write_json_atomic,
 )
+from system import console
 from ui import notify
 from ui.i18n import t
 
@@ -371,6 +372,10 @@ def launch(
     env = build_environment(config, slot)
     log.write(f"launch slot={slot} mode={config.cred_mode} args={args}")
 
+    # Taken before claude touches the console and put back after it is gone,
+    # on this thread: the reaper that kills claude runs while we are still in
+    # wait(), and restoring from there would race the child for the console.
+    console_state = console.snapshot()
     try:
         process = subprocess.Popen(command, env=env)
     except OSError as exc:
@@ -379,14 +384,18 @@ def launch(
     if on_started is not None:
         on_started(process)
 
-    while True:
-        try:
-            return process.wait()
-        except KeyboardInterrupt:
-            # Ctrl-C reached claude too and it handles its own shutdown. Waiting
-            # again is what keeps us from returning while the child still owns
-            # the terminal.
-            continue
+    try:
+        while True:
+            try:
+                return process.wait()
+            except KeyboardInterrupt:
+                # Ctrl-C reached claude too and it handles its own shutdown.
+                # Waiting again is what keeps us from returning while the
+                # child still owns the terminal.
+                continue
+    finally:
+        console.restore(console_state)
+        console.sanitize()
 
 
 def run_once(
@@ -573,15 +582,23 @@ def _supervise(config: Config, slot_number: int, plan: autoswitch.SessionPlan) -
                     notify.notice(t("autoswitch.gave_up", count=switches), live=False)
                 return code
 
+            queued = ""
             wait_until = float(decision.get("wait_until") or 0.0)
             if wait_until > time.time():
                 label = Accounts.load().ensure(int(target)).label
-                if not _wait_for_reset(wait_until, slot=int(target), label=label):
+                waited, queued = _wait_for_reset(
+                    wait_until, slot=int(target), label=label
+                )
+                if not waited:
                     return code
 
             mode = str(decision.get("mode") or "")
             args = autoswitch.relaunch_args(
-                args, session_id=session_id, mode=mode, config=config
+                args,
+                session_id=session_id,
+                mode=mode,
+                config=config,
+                resume_prompt=queued or None,
             )
             slot_number = int(target)
             switches += 1
@@ -591,12 +608,24 @@ def _supervise(config: Config, slot_number: int, plan: autoswitch.SessionPlan) -
         notify.clear_title()
 
 
-def _wait_for_reset(moment: float, *, slot: int, label: str) -> bool:
-    """Sit out the time until `slot` opens again; False if the user gave up.
+CANCEL_KEYS = frozenset({"\x03", "\x1b"})
+ENTER_KEYS = frozenset({"\r", "\n"})
+BACKSPACE_KEYS = frozenset({"\x08", "\x7f"})
+
+
+def _wait_for_reset(moment: float, *, slot: int, label: str) -> tuple[bool, str]:
+    """Sit out the time until `slot` opens again.
+
+    Returns (waited, message): `waited` is False when the user gave up, and
+    `message` is whatever they typed and confirmed with Enter meanwhile -- it
+    goes to the resumed session as its first prompt, the way claude's own
+    "continuing automatically" banner queues input while it waits.
 
     claude has already been stopped by now, so the terminal is ours: one line
-    says what is happening and the title carries the countdown. Sleeping in
-    short slices is what keeps Ctrl-C answering.
+    says what is happening and the title carries the countdown. The keyboard
+    is polled directly rather than relying on Ctrl-C alone, because the very
+    thing that put us here -- a killed claude -- may have left the console in
+    a state where Ctrl-C is a keystroke and not a signal.
     """
     resume_at = moment + RESET_MARGIN_SECONDS
     minutes = max(1, int((resume_at - time.time()) / 60) + 1)
@@ -610,19 +639,60 @@ def _wait_for_reset(moment: float, *, slot: int, label: str) -> bool:
         ),
         live=False,
     )
+    notify.notice(t("autoswitch.wait_keys"), live=False)
 
+    typed = ""
+    queued = ""
     try:
         while True:
             remaining = resume_at - time.time()
             if remaining <= 0:
-                return True
+                _draw_input("")
+                return True, queued
             notify.title(
                 t("autoswitch.waiting_title", slot=slot, minutes=int(remaining / 60) + 1)
             )
-            time.sleep(min(1.0, remaining))
+
+            key = console.poll_key(min(1.0, remaining))
+            if not key:
+                continue
+            if key in CANCEL_KEYS:
+                if key == "\x1b" and typed:
+                    # Escape while composing drops the line, not the wait.
+                    typed = ""
+                    _draw_input(typed)
+                    continue
+                raise KeyboardInterrupt
+            if key == "q" and not typed:
+                raise KeyboardInterrupt
+            if key in ENTER_KEYS:
+                if typed.strip():
+                    queued = typed.strip()
+                    _draw_input("")
+                    notify.notice(t("autoswitch.wait_queued", text=queued), live=False)
+                typed = ""
+                continue
+            if key in BACKSPACE_KEYS:
+                typed = typed[:-1]
+                _draw_input(typed)
+                continue
+            if key.isprintable():
+                typed += key
+                _draw_input(typed)
     except KeyboardInterrupt:
+        _draw_input("")
         notify.notice(t("autoswitch.wait_cancelled"), live=False)
-        return False
+        return False, ""
+
+
+def _draw_input(typed: str) -> None:
+    """Redraw the line being composed under the wait notice; empty clears it."""
+    stream = sys.stderr
+    if stream is None or not stream.isatty():
+        return
+    with contextlib.suppress(OSError, ValueError):
+        stream.write(f"\r\033[K{'> ' + typed if typed else ''}")
+        stream.flush()
 
 
 def _reap(
@@ -726,9 +796,7 @@ def _decide(
         _store_usage({slot_number: slot.usage})
         confirmed_here = True
 
-    _refresh_candidates(
-        accounts, current=slot_number, tried=tried, include_current=not confirmed_here
-    )
+    _refresh_candidates(accounts, skip={slot_number} if confirmed_here else set())
 
     election = autoswitch.elect_target(
         accounts,
@@ -830,9 +898,7 @@ def _store_usage(payloads: dict[int, dict[str, Any]]) -> None:
     update_accounts(_write)
 
 
-def _refresh_candidates(
-    accounts: Accounts, *, current: int, tried: set[int], include_current: bool
-) -> None:
+def _refresh_candidates(accounts: Accounts, *, skip: set[int]) -> None:
     """Rank on numbers fetched now, not on whatever was lying in the store.
 
     This used to skip any slot whose snapshot was younger than six hours, and a
@@ -840,12 +906,18 @@ def _refresh_candidates(
     account was spent while one of them had been free for hours, and the
     session stayed put. A handful of requests once per wall is cheap; a wrong
     "no target" costs the rest of the evening.
+
+    Every slot that could ever be waited for is refreshed, the current and the
+    already-tried ones included: when nobody is free the election falls back
+    to "who opens first", and that answer was being read off snapshots nobody
+    had touched since the slot was left. `skip` names slots fetched moments
+    ago by the caller.
     """
     from ui import usage as usage_module
 
-    wanted = autoswitch.candidates(accounts, current=current, tried=tried)
-    if include_current:
-        wanted = [*wanted, accounts.ensure(current)]
+    wanted = [
+        slot for slot in autoswitch.waitable(accounts) if slot.number not in skip
+    ]
     if not wanted:
         return
 
@@ -863,6 +935,11 @@ def _refresh_candidates(
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     args = argv[1:]
+
+    # A claude killed in this window earlier may have left the console in raw
+    # mode; the session about to start would inherit it.
+    if console.repair():
+        log.write("console repaired at startup")
 
     if not is_installed():
         sys.stderr.write(t("error.not_installed_wrapper") + "\n")

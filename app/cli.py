@@ -25,7 +25,7 @@ from core.store import (
     update_accounts,
 )
 from core.version import __version__
-from system import secure
+from system import console, secure
 from ui import i18n, usage
 from ui.i18n import t
 
@@ -655,6 +655,9 @@ def run_shell(parser: argparse.ArgumentParser) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
+    # A claude killed in this window earlier leaves the console in raw mode:
+    # the menu would paint and then take no input.
+    console.repair()
     installer.apply_pending_upgrade()
     migrate_config()
 
