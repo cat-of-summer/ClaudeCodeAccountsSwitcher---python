@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from app import installer
-from core import claudecfg, detect, settings
+from core import claudecfg, detect, hookbus, settings
 from core.store import (
     Accounts,
     Config,
@@ -375,6 +375,159 @@ def _print_settings() -> None:
     print(t("config.hint"))
 
 
+def cmd_hooks(args: argparse.Namespace) -> int:
+    """External handlers for claude's hook events, kept in config.json."""
+    _require_installed()
+    action = getattr(args, "hooks_action", None) or "list"
+
+    if action == "add":
+        if args.event != "*" and not all(
+            name in hookbus.HOOK_EVENTS for name in args.event.split("|")
+        ):
+            raise SystemExit(
+                t("hooks.unknown_event", event=args.event, events=", ".join(hookbus.HOOK_EVENTS))
+            )
+        handler = hookbus.Handler(
+            event=args.event,
+            command=args.command,
+            matcher=args.matcher or "",
+            sync=bool(args.sync),
+            timeout=float(args.timeout) if args.timeout else hookbus.HANDLER_TIMEOUT_SECONDS,
+        )
+        config = Config.load()
+        config.hooks = [*config.hooks, handler.to_dict()]
+        config.save()
+        print(t("hooks.added", index=len(config.hooks), event=handler.event))
+        return 0
+
+    if action == "remove":
+        config = Config.load()
+        index = int(args.index)
+        if not 1 <= index <= len(config.hooks):
+            raise SystemExit(t("hooks.no_such", index=index))
+        removed = config.hooks.pop(index - 1)
+        config.save()
+        print(t("hooks.removed", index=index, event=removed.get("event", "?")))
+        return 0
+
+    config = Config.load()
+    handlers = hookbus.parse_handlers(config.hooks)
+    if not handlers:
+        print(t("hooks.none"))
+        return 0
+    for index, handler in enumerate(handlers, start=1):
+        mode = t("hooks.mode_sync") if handler.sync else t("hooks.mode_async")
+        matcher = f" [{handler.matcher}]" if handler.matcher else ""
+        print(f"{index:>2}. {handler.event}{matcher}  {mode}  {handler.command}")
+    print()
+    print(t("hooks.bus_state", state=t("config.value_on") if config.hooks_bus else t("config.value_off")))
+    return 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    _require_installed()
+    from app import daemon
+
+    action = getattr(args, "daemon_action", None) or "status"
+    if action == "run":
+        return daemon.Daemon(Config.load()).run(hidden=bool(getattr(args, "hidden", False)))
+    if action == "start":
+        if daemon.read_daemon() is not None:
+            print(t("daemon.status_up_short"))
+            return 0
+        if not daemon.configured(Config.load()):
+            raise SystemExit(t("daemon.not_configured"))
+        if not daemon.spawn_detached():
+            raise SystemExit(t("daemon.start_failed"))
+        print(t("daemon.started"))
+        return 0
+    if action == "stop":
+        if daemon.read_daemon() is None:
+            print(t("daemon.status_down"))
+            return 0
+        print(t("daemon.stopped") if daemon.request_stop() else t("daemon.stop_failed"))
+        return 0
+    for line in daemon.status_text(Config.load()):
+        print(line)
+    return 0
+
+
+def cmd_session(args: argparse.Namespace) -> int:
+    """Named session profiles: a name bound to a chat, a directory, a slot."""
+    _require_installed()
+    from app.transport.routing import valid_alias
+
+    action = getattr(args, "session_action", None) or "list"
+    config = Config.load()
+    profiles = dict(config.telegram.get("sessions") or {})
+
+    if action == "add":
+        name = args.name.strip()
+        if not valid_alias(name):
+            raise SystemExit(t("session.bad_name", name=name))
+        cwd = Path(args.cwd).expanduser()
+        if not cwd.is_dir():
+            raise SystemExit(t("config.bad_dir", path=cwd))
+        from app.transport.routing import tokenize
+
+        profile = {
+            "chat": int(args.chat) if args.chat is not None else int(config.telegram.get("chat") or 0),
+            "thread": int(args.thread or 0),
+            "cwd": str(cwd),
+            "slot": int(args.slot or 0),
+            "args": tokenize(getattr(args, "claude_args", None) or ""),
+        }
+        profiles[name] = profile
+        config.telegram = {**config.telegram, "sessions": profiles}
+        config.save()
+        print(t("session.saved", name=name, cwd=cwd, chat=profile["chat"]))
+        return 0
+
+    if action == "remove":
+        name = args.name.strip()
+        if name not in profiles:
+            raise SystemExit(t("session.no_such", name=name))
+        profiles.pop(name)
+        config.telegram = {**config.telegram, "sessions": profiles}
+        config.save()
+        print(t("session.removed", name=name))
+        return 0
+
+    if not profiles:
+        print(t("session.none"))
+        return 0
+    width = max(len(name) for name in profiles)
+    for name, profile in sorted(profiles.items()):
+        extra = " ".join(str(part) for part in (profile.get("args") or []))
+        slot = profile.get("slot") or "-"
+        print(f"{name:<{width}}  chat {profile.get('chat')}  slot {slot}  {profile.get('cwd')}  {extra}".rstrip())
+    return 0
+
+
+def cmd_telegram(args: argparse.Namespace) -> int:
+    """`ccas telegram test`: prove the token and the chat before going live."""
+    _require_installed()
+    from core import telegram
+
+    config = Config.load()
+    token = str(config.telegram.get("token") or "")
+    chat = int(config.telegram.get("chat") or 0)
+    if not telegram.looks_like_token(token):
+        raise SystemExit(t("tg.no_token"))
+    bot = telegram.Bot(token)
+    try:
+        me = bot.get_me()
+        print(t("telegram.test_bot", username=me.get("username") or "?", id=me.get("id")))
+        if chat:
+            bot.send_message(chat, t("telegram.test_message"), thread_id=int(config.telegram.get("thread") or 0))
+            print(t("telegram.test_sent", chat=chat))
+        else:
+            print(t("tg.no_chat"))
+    except (telegram.TelegramError, telegram.Unreachable) as exc:
+        raise SystemExit(t("telegram.test_failed", error=exc)) from exc
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     del args
     problems = 0
@@ -444,6 +597,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
     else:
         report(OK, t("doctor.auto_switch_off"))
+
+    report(
+        OK if config.hooks_bus else WARN,
+        t("doctor.hooks_bus_on", handlers=len(config.hooks)) if config.hooks_bus else t("doctor.hooks_bus_off"),
+    )
+
+    from app import daemon
+    from core import telegram
+    from system import autostart
+
+    if daemon.configured(config):
+        token = str(config.telegram.get("token") or "")
+        report(OK, t("doctor.telegram_configured", bot=telegram.bot_id(token), chat=config.telegram.get("chat")))
+        record = daemon.read_daemon()
+        if config.telegram.get("daemon"):
+            if record is not None:
+                report(OK, t("doctor.daemon_running", pid=record.get("pid")))
+            else:
+                report(WARN, t("doctor.daemon_not_running"))
+            if not autostart.is_registered():
+                report(WARN, t("doctor.autostart_missing"))
+        elif record is not None:
+            report(OK, t("doctor.daemon_running", pid=record.get("pid")))
+        else:
+            report(OK, t("doctor.daemon_off"))
+    else:
+        report(OK, t("doctor.telegram_unset"))
 
     if not accounts.slots:
         report(WARN, t("doctor.no_slots"))
@@ -567,6 +747,47 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor", help=t("cli.help.doctor"))
     doctor_parser.set_defaults(func=cmd_doctor)
 
+    hooks_parser = subparsers.add_parser("hooks", help=t("cli.help.hooks"))
+    hooks_parser.set_defaults(func=cmd_hooks)
+    hooks_sub = hooks_parser.add_subparsers(dest="hooks_action")
+    hooks_sub.add_parser("list", help=t("cli.help.hooks_list"))
+    hooks_add = hooks_sub.add_parser("add", help=t("cli.help.hooks_add"))
+    hooks_add.add_argument("event", help=t("cli.help.hooks_event"))
+    hooks_add.add_argument("command", help=t("cli.help.hooks_command"))
+    hooks_add.add_argument("--matcher", help=t("cli.help.hooks_matcher"))
+    hooks_add.add_argument("--sync", action="store_true", help=t("cli.help.hooks_sync"))
+    hooks_add.add_argument("--timeout", type=float, help=t("cli.help.hooks_timeout"))
+    hooks_remove = hooks_sub.add_parser("remove", help=t("cli.help.hooks_remove"))
+    hooks_remove.add_argument("index", type=int)
+
+    daemon_parser = subparsers.add_parser("daemon", help=t("cli.help.daemon"))
+    daemon_parser.set_defaults(func=cmd_daemon)
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_action")
+    daemon_sub.add_parser("status", help=t("cli.help.daemon_status"))
+    daemon_sub.add_parser("start", help=t("cli.help.daemon_start"))
+    daemon_sub.add_parser("stop", help=t("cli.help.daemon_stop"))
+    daemon_run = daemon_sub.add_parser("run", help=t("cli.help.daemon_run"))
+    daemon_run.add_argument("--hidden", action="store_true", help=t("cli.help.daemon_hidden"))
+
+    session_parser = subparsers.add_parser("session", help=t("cli.help.session"))
+    session_parser.set_defaults(func=cmd_session)
+    session_sub = session_parser.add_subparsers(dest="session_action")
+    session_sub.add_parser("list", help=t("cli.help.session_list"))
+    session_add = session_sub.add_parser("add", help=t("cli.help.session_add"))
+    session_add.add_argument("name")
+    session_add.add_argument("--cwd", required=True, help=t("cli.help.session_cwd"))
+    session_add.add_argument("--chat", type=int, help=t("cli.help.session_chat"))
+    session_add.add_argument("--thread", type=int, help=t("cli.help.session_thread"))
+    session_add.add_argument("--slot", type=int, help=t("cli.help.session_slot"))
+    session_add.add_argument("--args", dest="claude_args", help=t("cli.help.session_args"))
+    session_remove = session_sub.add_parser("remove", help=t("cli.help.session_remove"))
+    session_remove.add_argument("name")
+
+    telegram_parser = subparsers.add_parser("telegram", help=t("cli.help.telegram"))
+    telegram_parser.set_defaults(func=cmd_telegram)
+    telegram_sub = telegram_parser.add_subparsers(dest="telegram_action")
+    telegram_sub.add_parser("test", help=t("cli.help.telegram_test"))
+
     return parser
 
 
@@ -663,6 +884,13 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv[1:])
+
+    if is_installed() and getattr(args, "command", None) != "daemon":
+        config = Config.load()
+        if config.telegram.get("daemon"):
+            from app import daemon
+
+            daemon.ensure_running(config)
 
     if not getattr(args, "func", None):
         if _interactive():

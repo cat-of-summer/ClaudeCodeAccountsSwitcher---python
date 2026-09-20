@@ -151,3 +151,38 @@ def read_usage_cache() -> dict[str, Any] | None:
         return None
     cached = raw.get("cachedUsageUtilization")
     return cached if isinstance(cached, dict) else None
+
+
+def known_projects() -> list[str]:
+    """Directories claude has been run in, newest first.
+
+    `~/.claude.json` keeps them under `projects`, keyed by the real path (not
+    the slug the transcript directory uses), appended as they are first seen.
+    Paths that no longer exist are dropped; the same directory spelt two
+    ways -- forward and backward slashes -- counts once.
+    """
+    target = freshest_config_target()
+    if target is None:
+        return []
+    raw = read_json(target)
+    projects = raw.get("projects") if isinstance(raw, dict) else None
+    if not isinstance(projects, dict):
+        return []
+
+    seen: set[str] = set()
+    found: list[str] = []
+    for key in reversed(list(projects)):
+        if not isinstance(key, str) or not key:
+            continue
+        path = Path(key)
+        try:
+            if not path.is_dir():
+                continue
+            marker = os.path.normcase(str(path.resolve()))
+        except OSError:
+            continue
+        if marker in seen:
+            continue
+        seen.add(marker)
+        found.append(str(path))
+    return found

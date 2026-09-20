@@ -12,12 +12,17 @@
 ~/.claude-switcher/
   bin/  claude[.exe]              копия артефакта -> режим обёртки
         ccas[.exe]                копия артефакта -> режим менеджера
-  config.json                     версия, путь к claude, режим кредов, язык, автосмена
+  config.json                     версия, путь к claude, режим кредов, язык, автосмена,
+                                  шина хуков и внешние обработчики, Telegram-транспорт и профили
   accounts.json                   слоты: alias, email, accountUuid, usage, token
   creds/<n>/.credentials.json     сюда указывает CLAUDE_SECURESTORAGE_CONFIG_DIR
   creds/<n>/.refresh.lock         лок обмена refresh-токена (core/oauth.py)
   identity/<n>.json               oauthAccount + userID слота
   sessions/<pid>.json             живые обёртки (core/sessions.py)
+  sessions/<pid>.settings.json    хуки для claude этой сессии (core/hookbus.py), живёт с ней
+  telegram/<bot_id>.lock          кто опрашивает бота (app/transport/poller.py)
+  telegram/chats.json             каталог по умолчанию для каждого чата (app/daemon.py)
+  daemon.json                     живой демон: pid, порт, бот (app/daemon.py)
   switch-plan.json                на какой слот переезжают сессии (app/autoswitch.py)
   backups/claude.json.<ts>        ротируемые бекапы общего конфига
   logs/ccas.log
@@ -61,5 +66,10 @@
 прошлой версией, не содержит ключа, добавленного этой, и чтение такого ключа упало бы в самый
 неподходящий момент.
 
-`migrate_config` поднимает `schema` с бекапом. Данных сегодня конвертировать нечего — всё читается
-через дефолт, — но версия на диске нужна, чтобы будущее ломающее изменение знало, что видит.
+`telegram` сливается с `DEFAULT_TELEGRAM` так же; `hooks` — список обработчиков как есть;
+`hooksBus` — выключатель шины (по умолчанию включена). Id бота отдельно не хранится: он — часть
+токена до двоеточия.
+
+`migrate_config` поднимает `schema` с бекапом. Схема 4 добавила хуки и Telegram, но данных
+конвертировать не пришлось — всё читается через дефолт; версия на диске нужна, чтобы будущее
+ломающее изменение знало, что видит.

@@ -358,6 +358,15 @@ def install(
 def uninstall(*, purge: bool = False, reporter: Callable[[str], None] = print) -> None:
     remove_path_entry()
 
+    # The daemon must not outlive the binary it would be restarted as.
+    from app import daemon
+    from system import autostart
+
+    with contextlib.suppress(Exception):
+        daemon.request_stop()
+    with contextlib.suppress(Exception):
+        autostart.unregister()
+
     for name in (shim_name(), manager_name(), "claude", "claude.cmd", "ccas", "ccas.cmd"):
         candidate = bin_dir() / name
         with contextlib.suppress(OSError):

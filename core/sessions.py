@@ -15,17 +15,31 @@ def sessions_dir() -> Path:
     return app_dir() / "sessions"
 
 
-def register_session(slot: int) -> None:
+def session_file() -> Path:
+    return sessions_dir() / f"{os.getpid()}.json"
+
+
+def register_session(slot: int, **extra: Any) -> None:
     write_json_atomic(
-        sessions_dir() / f"{os.getpid()}.json",
-        {"pid": os.getpid(), "slot": slot, "at": time.time()},
+        session_file(),
+        {"pid": os.getpid(), "slot": slot, "at": time.time(), **extra},
         harden=False,
     )
 
 
+def update_session(**fields: Any) -> None:
+    """Add to this process's record: the hook-bus port, the transport, the
+    session id -- facts that are only known once claude is on its way."""
+    raw = read_json(session_file())
+    if not isinstance(raw, dict):
+        return
+    raw.update(fields)
+    write_json_atomic(session_file(), raw, harden=False)
+
+
 def unregister_session() -> None:
     with contextlib.suppress(OSError):
-        (sessions_dir() / f"{os.getpid()}.json").unlink()
+        session_file().unlink()
 
 
 def other_live_sessions() -> list[dict[str, Any]]:

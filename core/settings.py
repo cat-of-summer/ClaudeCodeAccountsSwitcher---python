@@ -5,7 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.store import AUTO_SWITCH_STRATEGIES, Config
+from core import telegram
+from core.store import AUTO_SWITCH_STRATEGIES, TELEGRAM_VERBOSITIES, Config
 from ui import i18n
 from ui.i18n import t
 
@@ -22,14 +23,16 @@ class SettingError(Exception):
 @dataclass(frozen=True)
 class Setting:
     key: str
-    kind: str  # "bool" | "int" | "choice" | "text" | "path"
+    kind: str  # "bool" | "int" | "choice" | "text" | "path" | "dir"
     get: Callable[[Config], Any]
     set: Callable[[Config, Any], None]
     choices: tuple[str, ...] = ()
+    # Both zero means "any integer": chat ids are negative and unbounded.
     minimum: int = 0
     maximum: int = 0
     editable_in_screen: bool = True
     choice_labels: dict[str, str] = field(default_factory=dict)
+    secret: bool = False
 
     @property
     def label(self) -> str:
@@ -46,7 +49,13 @@ class Setting:
         if self.kind == "choice" and value in self.choice_labels:
             return t(self.choice_labels[value])
         text = str(value or "")
+        if self.secret and text:
+            return telegram.mask(text)
         return text or t("config.value_empty")
+
+    @property
+    def bounded(self) -> bool:
+        return not (self.minimum == 0 and self.maximum == 0)
 
 
 def _auto(key: str) -> Callable[[Config], Any]:
@@ -98,6 +107,45 @@ def _set_claude_path(config: Config, value: Any) -> None:
     if not candidate.is_file():
         raise SettingError(t("error.claude_path_invalid", path=candidate))
     config.real_claude_path = str(candidate)
+
+
+def _tg(key: str) -> Callable[[Config], Any]:
+    return lambda config: config.telegram.get(key)
+
+
+def _set_tg(key: str) -> Callable[[Config, Any], None]:
+    def _apply(config: Config, value: Any) -> None:
+        config.telegram = {**config.telegram, key: value}
+
+    return _apply
+
+
+def _set_token(config: Config, value: Any) -> None:
+    token = str(value or "").strip()
+    if token and not telegram.looks_like_token(token):
+        raise SettingError(t("config.bad_token"))
+    _set_tg("token")(config, token)
+
+
+def _set_workdir(config: Config, value: Any) -> None:
+    text = str(value or "").strip()
+    if text:
+        candidate = Path(text).expanduser()
+        if not candidate.is_dir():
+            raise SettingError(t("config.bad_dir", path=candidate))
+        text = str(candidate)
+    _set_tg("workdir")(config, text)
+
+
+def _set_daemon(config: Config, value: Any) -> None:
+    """The setting and the OS autostart entry move together."""
+    _set_tg("daemon")(config, bool(value))
+    from system import autostart
+
+    if value:
+        autostart.register()
+    else:
+        autostart.unregister()
 
 
 SETTINGS: tuple[Setting, ...] = (
@@ -155,6 +203,35 @@ SETTINGS: tuple[Setting, ...] = (
         editable_in_screen=False,
     ),
     Setting(
+        "hooks-bus",
+        "bool",
+        lambda config: config.hooks_bus,
+        lambda config, value: setattr(config, "hooks_bus", bool(value)),
+    ),
+    Setting("telegram-token", "text", _tg("token"), _set_token, editable_in_screen=False, secret=True),
+    Setting("telegram-chat", "int", _tg("chat"), _set_tg("chat"), editable_in_screen=False),
+    Setting("telegram-thread", "int", _tg("thread"), _set_tg("thread"), editable_in_screen=False),
+    Setting("telegram-prefix", "text", _tg("prefix"), _set_tg("prefix"), editable_in_screen=False),
+    Setting("telegram-workdir", "dir", _tg("workdir"), _set_workdir, editable_in_screen=False),
+    Setting("telegram-daemon", "bool", _tg("daemon"), _set_daemon),
+    Setting("telegram-console", "bool", _tg("console"), _set_tg("console")),
+    Setting(
+        "telegram-verbosity",
+        "choice",
+        _tg("verbosity"),
+        _set_tg("verbosity"),
+        choices=TELEGRAM_VERBOSITIES,
+        choice_labels={name: f"config.verbosity_{name}" for name in TELEGRAM_VERBOSITIES},
+    ),
+    Setting(
+        "telegram-prompt-timeout",
+        "int",
+        _tg("promptTimeoutMinutes"),
+        _set_tg("promptTimeoutMinutes"),
+        minimum=0,
+        maximum=1440,
+    ),
+    Setting(
         "language",
         "choice",
         lambda config: config.language or i18n.current_language(),
@@ -202,7 +279,7 @@ def parse(setting: Setting, raw: str) -> Any:
             raise SettingError(
                 t("config.bad_value", key=setting.key, value=raw)
             ) from None
-        if not setting.minimum <= number <= setting.maximum:
+        if setting.bounded and not setting.minimum <= number <= setting.maximum:
             raise SettingError(
                 t(
                     "config.out_of_range",

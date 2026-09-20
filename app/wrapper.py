@@ -8,12 +8,12 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 from app import autoswitch
-from core import claudecfg, log
+from core import claudecfg, hookbus, log
 from core.detect import CRED_MODE_COPY, CRED_MODE_ENV
 from core.sessions import (  # noqa: F401  -- re-exported, see note below
     LOCK_STALE_SECONDS,
@@ -24,6 +24,7 @@ from core.sessions import (  # noqa: F401  -- re-exported, see note below
     release_lock,
     sessions_dir,
     unregister_session,
+    update_session,
 )
 from core.store import (
     Accounts,
@@ -357,16 +358,57 @@ def _taskkill(pid: int, *, force: bool) -> None:
     )
 
 
+def settings_file() -> Path:
+    return sessions_dir() / f"{os.getpid()}.settings.json"
+
+
+def wants_hook_bus(config: Config, args: list[str]) -> bool:
+    """Whether this launch is a session whose hooks are worth listening to.
+
+    Subcommands (`claude mcp list`) fire nothing, and `--bare`/`--safe-mode`
+    switch hooks off on claude's side, so a bus for them would only sit there.
+    """
+    if not config.hooks_bus:
+        return False
+    if args and args[0] in CLAUDE_SUBCOMMANDS:
+        return False
+    return not hookbus.hooks_disabled_by(args)
+
+
+def open_hook_bus(config: Config, slot: int) -> hookbus.HookBus:
+    bus = hookbus.HookBus(hookbus.parse_handlers(config.hooks), slot=slot)
+    bus.start()
+    update_session(port=bus.port)
+    return bus
+
+
+def close_hook_bus(bus: hookbus.HookBus | None) -> None:
+    if bus is None:
+        return
+    bus.stop()
+    with contextlib.suppress(OSError):
+        settings_file().unlink()
+
+
 def launch(
     config: Config,
     slot: int,
     args: list[str],
     *,
     on_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    bus: hookbus.HookBus | None = None,
 ) -> int:
     executable = config.real_claude_path
     if not executable or not Path(executable).exists():
         raise WrapperError(t("error.real_claude_missing"))
+
+    # A bus handed in by the caller outlives this launch (the supervisor keeps
+    # one across a switch); one opened here is closed here.
+    own_bus: hookbus.HookBus | None = None
+    if bus is None and wants_hook_bus(config, args):
+        bus = own_bus = open_hook_bus(config, slot)
+    if bus is not None:
+        args = hookbus.prepare_args(bus, args, settings_file())
 
     command = [executable, *merge_default_args(config.default_args, args)]
     env = build_environment(config, slot)
@@ -379,6 +421,7 @@ def launch(
     try:
         process = subprocess.Popen(command, env=env)
     except OSError as exc:
+        close_hook_bus(own_bus)
         raise WrapperError(t("error.launch_failed", error=exc)) from exc
 
     if on_started is not None:
@@ -394,18 +437,19 @@ def launch(
                 # child still owns the terminal.
                 continue
     finally:
+        close_hook_bus(own_bus)
         console.restore(console_state)
         console.sanitize()
 
 
-def run_once(
-    config: Config,
-    slot_number: int,
-    args: list[str],
-    *,
-    on_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
-) -> int:
-    """One claude, start to finish, with the per-slot bookkeeping around it."""
+@contextlib.contextmanager
+def slot_session(config: Config, slot_number: int, **record: Any) -> Iterator[bool]:
+    """The per-slot bookkeeping around one claude, whoever drives it.
+
+    Yields whether this is a fresh login. `record` goes into the session
+    file next to the pid and slot -- the transport names itself there so
+    `ccas` can list what is running where.
+    """
     ensure_slot_dir(slot_number)
     launched_at = time.time()
     copy_mode = config.cred_mode == CRED_MODE_COPY
@@ -442,12 +486,9 @@ def run_once(
     if copy_mode:
         acquire_lock(slot_number)
 
-    if state["fresh_login"]:
-        _print_login_hint(slot_number)
-
-    register_session(slot_number)
+    register_session(slot_number, **record)
     try:
-        return launch(config, slot_number, args, on_started=on_started)
+        yield state["fresh_login"]
     finally:
         try:
             unregister_session()
@@ -464,6 +505,20 @@ def run_once(
                 release_lock()
         except Exception as exc:
             log.write(f"post-run bookkeeping failed: {exc!r}")
+
+
+def run_once(
+    config: Config,
+    slot_number: int,
+    args: list[str],
+    *,
+    on_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+) -> int:
+    """One claude, start to finish, with the per-slot bookkeeping around it."""
+    with slot_session(config, slot_number) as fresh_login:
+        if fresh_login:
+            _print_login_hint(slot_number)
+        return launch(config, slot_number, args, on_started=on_started)
 
 
 def run_slot(config: Config, slot_number: int, args: list[str]) -> int:
@@ -948,6 +1003,13 @@ def main(argv: list[str] | None = None) -> int:
     config = Config.load()
     accounts = Accounts.load()
 
+    if config.telegram.get("daemon"):
+        # Imported only when wanted: the transport modules are a cost every
+        # plain `claude` launch need not pay.
+        from app import daemon
+
+        daemon.ensure_running(config)
+
     try:
         slot_number, rest, explicit = resolve_slot(args, accounts)
     except WrapperError as exc:
@@ -961,6 +1023,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if slot_number is None:
         slot_number = default_slot(accounts)
+
+    from app.transport.routing import split_launch_options
+
+    options, rest = split_launch_options(rest)
+    if options.wants_transport:
+        from app import transport
+
+        try:
+            return transport.run(config, slot_number, rest, options)
+        except (WrapperError, transport.TransportError) as exc:
+            sys.stderr.write(f"{exc}\n")
+            return 2
 
     try:
         return run_slot(config, slot_number, rest)

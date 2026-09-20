@@ -39,6 +39,27 @@ DEFAULT_AUTO_SWITCH: dict[str, Any] = {
 
 AUTO_SWITCH_STRATEGIES = ("limits", "order", "notify")
 
+# The bot token carries the bot id (the part before the colon), so there is
+# no separate field for it. `sessions` are named profiles: a name that
+# `/claude -n <name>` in that chat resolves to a directory, a slot and the
+# extra arguments to launch with.
+DEFAULT_TELEGRAM: dict[str, Any] = {
+    "token": "",
+    "chat": 0,
+    "thread": 0,
+    "users": [],
+    "prefix": "",
+    "workdir": "",
+    "roots": [],
+    "daemon": False,
+    "console": True,
+    "verbosity": "tools",
+    "promptTimeoutMinutes": 0,
+    "sessions": {},
+}
+
+TELEGRAM_VERBOSITIES = ("text", "tools", "all")
+
 
 def home() -> Path:
     return Path.home()
@@ -230,6 +251,11 @@ class Config:
     auto_switch: dict[str, Any] = field(
         default_factory=lambda: dict(DEFAULT_AUTO_SWITCH)
     )
+    # On by default: it changes nothing visible, only lets ccas see the
+    # session's hook events. The switch exists for the day it misbehaves.
+    hooks_bus: bool = True
+    hooks: list[dict[str, Any]] = field(default_factory=list)
+    telegram: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_TELEGRAM))
 
     @classmethod
     def load(cls) -> "Config":
@@ -237,6 +263,8 @@ class Config:
         if not isinstance(raw, dict):
             return cls()
         stored = raw.get("autoSwitch")
+        stored_telegram = raw.get("telegram")
+        stored_hooks = raw.get("hooks")
         # An explicitly empty list means "add nothing", and must not be
         # confused with an absent key: `[] or DEFAULT_ARGS` used to hand the
         # bypass flag back to a user who had just turned it off.
@@ -262,6 +290,15 @@ class Config:
                 **DEFAULT_AUTO_SWITCH,
                 **(stored if isinstance(stored, dict) else {}),
             },
+            hooks_bus=bool(raw.get("hooksBus", True)),
+            hooks=[
+                entry for entry in (stored_hooks if isinstance(stored_hooks, list) else [])
+                if isinstance(entry, dict)
+            ],
+            telegram={
+                **DEFAULT_TELEGRAM,
+                **(stored_telegram if isinstance(stored_telegram, dict) else {}),
+            },
         )
 
     def save(self) -> None:
@@ -278,6 +315,9 @@ class Config:
                 "shimDir": self.shim_dir,
                 "language": self.language,
                 "autoSwitch": self.auto_switch,
+                "hooksBus": self.hooks_bus,
+                "hooks": self.hooks,
+                "telegram": self.telegram,
             },
         )
 
@@ -305,6 +345,10 @@ def migrate_config() -> bool:
     told to carry on. An empty value still means "say nothing" once it has been
     set deliberately -- this only reaches configs written before the key had a
     meaningful default.
+
+    Schema 4 adds the hook bus, external hook handlers and the Telegram
+    transport; `load()` already fills their defaults, so the migration only
+    has to write them out and stamp the version.
     """
     if not is_installed():
         return False
