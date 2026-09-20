@@ -605,6 +605,8 @@ class Conversation:
                 self._say(f"{mark} <pre>{_plain(content[:TOOL_RESULT_PREVIEW])}</pre>")
         elif event.kind == "ask":
             self._show_prompt(self.prompter.on_ask(event))
+        elif event.kind == "elicit":
+            self._show_prompt(self.prompter.on_elicit(event))
         elif event.kind == "cancel":
             key = self.prompter.on_cancel(str(data.get("request_id") or ""))
             if key:

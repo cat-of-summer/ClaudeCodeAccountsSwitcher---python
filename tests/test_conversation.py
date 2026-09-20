@@ -382,6 +382,32 @@ class StartingOver(ConversationBase):
         self.assertIsNone(conversation._relaunch.slot)
 
 
+class ServerAsksSomething(ConversationBase):
+    """An MCP elicitation reaches the chat instead of stalling the session."""
+
+    def test_the_question_gets_buttons_and_the_answer_goes_back(self) -> None:
+        conversation = self.make()
+        conversation._on_event(
+            Event(
+                "elicit",
+                {
+                    "request_id": "e1",
+                    "server": "registry",
+                    "message": "Дать доступ к проекту?",
+                    "mode": "form",
+                    "schema": {"type": "object", "properties": {"approve": {"type": "boolean", "title": "Разрешить?"}}},
+                },
+            )
+        )
+        shown = self.bot.sent[-1]
+        self.assertIn("Дать доступ", shown["text"])
+        self.assertIsNotNone(shown["markup"])
+        data = shown["markup"]["inline_keyboard"][0][0]["callback_data"]
+
+        conversation._on_incoming(press(data))
+        self.assertEqual(self.driver.responses[-1], ("e1", {"action": "accept", "content": {"approve": True}}))
+
+
 class WorkStaysAtTheBottom(ConversationBase):
     """A question answered mid-turn is a record; the work moves below it."""
 

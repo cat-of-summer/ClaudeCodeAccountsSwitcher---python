@@ -363,5 +363,17 @@
   "config.help_telegram-idle-hours": "сколько сессия может простоять без сообщений, прежде чем закроется и вернёт память; окно тоже закрывается, если демон сможет поднять профиль заново (0 — никогда)",
   "tg.greeting_no_alias": "нет — просто пиши сюда",
   "tg.limit_switched": "🛑 достигнут лимит на слоте {from_slot}, продолжаю на слоте {to_slot} ({label})",
-  "tg.cleared": "🧹 Контекст очищен, начинаю новую сессию."
+  "tg.cleared": "🧹 Контекст очищен, начинаю новую сессию.",
+  "tg.elicit_title": "Запрос от {server}",
+  "tg.elicit_accept": "✅ Разрешить",
+  "tg.elicit_decline": "⛔ Отказать",
+  "tg.elicit_cancel": "✖️ Отмена",
+  "tg.elicit_done": "✅ Готово",
+  "tg.elicit_yes": "✅ Да",
+  "tg.elicit_no": "⛔ Нет",
+  "tg.elicit_type": "Напишите ответ следующим сообщением.",
+  "tg.elicit_need_number": "нужно число",
+  "tg.elicit_accepted": "разрешено",
+  "tg.elicit_declined": "отказано",
+  "tg.elicit_cancelled": "отменено"
 }

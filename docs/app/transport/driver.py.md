@@ -18,9 +18,24 @@
 
 Отказ — `{"behavior":"deny","message":"…"}`. После старта драйвер шлёт `initialize` — в ответе список slash-команд сессии.
 
+## Запрос MCP-сервера (`elicitation`)
+
+Сервер MCP может спросить человека сам — так реестр спрашивает про доступ к проекту. Приходит это отдельным субтипом:
+
+```json
+{"type":"control_request","request_id":"…","request":{"subtype":"elicitation","mcp_server_name":"registry","message":"Дать агенту доступ к проекту «adzhubey» до конца сессии?","mode":"form","requested_schema":{"type":"object","properties":{"approve":{"type":"boolean","title":"Разрешить?"}}}}}
+```
+
+Ответ — `{"action":"accept"|"decline"|"cancel","content":{…}}`, где `content` заполняет `requested_schema`. Поля `mode: "url"`, `url`, `title`, `display_name`, `description` необязательны.
+
+> [!warning]
+> Ответ вида `{"subtype":"error"}` claude **отбрасывает** и продолжает ждать («not a human choice; dialog stays parked»). Пока запрос не отвечен, вызов инструмента не возвращается и ход стоит намертво — именно так сессия и зависала, пока драйвер отвечал на неизвестный субтип ошибкой. Поэтому неизвестные субтипы теперь ещё и пишутся в журнал.
+
+Есть и субтип `request_user_dialog`, но он приходит, только если клиент объявил `supportedDialogKinds` в `initialize`; ccas не объявляет ничего, поэтому такие запросы не приходят.
+
 ## События
 
-Поток stdout разбирается построчно в `Event(kind, data)`: `init`, `text`, `tool_use`, `tool_result`, `result` (с `api_error_status`, `terminal_reason`), `ask`, `cancel`, `rate_limit` (`rate_limit_event` claude: статус, окно, `resetsAt`), `exit`. Слушатель получает их из потока чтения; сессия складывает в свою очередь.
+Поток stdout разбирается построчно в `Event(kind, data)`: `init`, `text`, `tool_use`, `tool_result`, `result` (с `api_error_status`, `terminal_reason`), `ask`, `elicit`, `cancel`, `rate_limit` (`rate_limit_event` claude: статус, окно, `resetsAt`), `exit`. Слушатель получает их из потока чтения; сессия складывает в свою очередь.
 
 ## Управление
 

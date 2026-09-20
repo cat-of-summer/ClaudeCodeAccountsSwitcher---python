@@ -363,5 +363,17 @@
   "config.help_telegram-idle-hours": "how long a session may sit with nobody talking to it before it is closed and its memory given back; the window closes too when the daemon can raise the profile again (0 - never)",
   "tg.greeting_no_alias": "none — just write here",
   "tg.limit_switched": "🛑 limit reached on slot {from_slot}, carrying on with slot {to_slot} ({label})",
-  "tg.cleared": "🧹 Context cleared, starting a new session."
+  "tg.cleared": "🧹 Context cleared, starting a new session.",
+  "tg.elicit_title": "{server} is asking",
+  "tg.elicit_accept": "✅ Allow",
+  "tg.elicit_decline": "⛔ Refuse",
+  "tg.elicit_cancel": "✖️ Cancel",
+  "tg.elicit_done": "✅ Done",
+  "tg.elicit_yes": "✅ Yes",
+  "tg.elicit_no": "⛔ No",
+  "tg.elicit_type": "Write the answer in the next message.",
+  "tg.elicit_need_number": "a number is expected",
+  "tg.elicit_accepted": "allowed",
+  "tg.elicit_declined": "refused",
+  "tg.elicit_cancelled": "cancelled"
 }

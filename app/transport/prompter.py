@@ -2,7 +2,8 @@
 
 Two things arrive as `can_use_tool` requests: a permission prompt for a
 tool call, and an `AskUserQuestion` -- the multiple-choice dialog the TUI
-draws. Both become a message with buttons; a free-text option waits for the
+draws. An MCP server's `elicitation` request is a third: its form is walked
+field by field and answered with `accept` / `decline` / `cancel`. Both become a message with buttons; a free-text option waits for the
 next message from the same chat. When the last answer is in, the request is
 answered over the control channel; when nobody answers in time, it is denied
 with a reason so that claude carries on instead of hanging.
@@ -70,6 +71,11 @@ class _Pending:
     tool_input: dict[str, Any]
     suggestions: list[dict[str, Any]]
     opened_at: float = field(default_factory=time.time)
+    # An MCP elicitation: the request as it arrived, the form fields left to
+    # ask about, and what has been filled in so far.
+    elicit: dict[str, Any] | None = None
+    fields: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    content: dict[str, Any] = field(default_factory=dict)
     questions: list[dict[str, Any]] = field(default_factory=list)
     answers: dict[str, str] = field(default_factory=dict)
     index: int = 0
@@ -83,6 +89,10 @@ class _Pending:
     @property
     def is_plan(self) -> bool:
         return self.tool_name == PLAN_TOOL
+
+    @property
+    def is_elicit(self) -> bool:
+        return self.elicit is not None
 
     def key(self) -> str:
         return f"{self.number}:{self.index}"
@@ -134,6 +144,28 @@ class Prompter:
         self._by_number[pending.number] = pending
         return self._prompt_for(pending)
 
+    def on_elicit(self, event: Event) -> Prompt:
+        data = event.data
+        self._counter += 1
+        pending = _Pending(
+            number=self._counter,
+            request_id=str(data.get("request_id") or ""),
+            tool_name=str(data.get("server") or ""),
+            tool_input={},
+            suggestions=[],
+            elicit=dict(data),
+        )
+        # A url elicitation has nothing to fill in: the person opens the link
+        # and says when they are done.
+        if str(data.get("mode") or "") != "url":
+            schema = data.get("schema")
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            if isinstance(properties, dict):
+                pending.fields = [(str(k), v) for k, v in properties.items() if isinstance(v, dict)]
+        self._pending[pending.request_id] = pending
+        self._by_number[pending.number] = pending
+        return self._elicit_prompt(pending)
+
     def on_cancel(self, request_id: str) -> str:
         pending = self._pending.pop(request_id, None)
         if pending is None:
@@ -151,10 +183,13 @@ class Prompter:
             if now - pending.opened_at < self.timeout:
                 continue
             self._finish(pending)
-            self.driver.respond(
-                pending.request_id,
-                result={"behavior": "deny", "message": t("tg.prompt_timed_out_reason")},
-            )
+            if pending.is_elicit:
+                self.driver.respond(pending.request_id, result={"action": "cancel"})
+            else:
+                self.driver.respond(
+                    pending.request_id,
+                    result={"behavior": "deny", "message": t("tg.prompt_timed_out_reason")},
+                )
             outcomes.append(
                 Outcome(close_prompt=pending.key(), summary=t("tg.prompt_timed_out"), finished_request=pending.request_id)
             )
@@ -187,6 +222,9 @@ class Prompter:
             pending.awaiting_text = False
             return self._answer(pending, text.strip())
         probe = text.strip().lower()
+        if pending.is_elicit:
+            mapping = {"1": "y", "y": "y", "yes": "y", "2": "n", "n": "n", "no": "n"}
+            return self._choose(pending, mapping[probe]) if probe in mapping else Outcome()
         if pending.is_question:
             options = self._options(pending)
             if probe.isdigit() and 1 <= int(probe) <= len(options):
@@ -218,6 +256,8 @@ class Prompter:
         return str(pending.questions[pending.index].get("question") or "")
 
     def _prompt_for(self, pending: _Pending) -> Prompt:
+        if pending.is_elicit:
+            return self._elicit_prompt(pending)
         if pending.is_question:
             return self._question_prompt(pending)
         if pending.is_plan:
@@ -272,7 +312,123 @@ class Prompter:
         ]
         return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
 
+    def _elicit_field(self, pending: _Pending) -> tuple[str, dict[str, Any]]:
+        if pending.index < len(pending.fields):
+            return pending.fields[pending.index]
+        return "", {}
+
+    def _elicit_prompt(self, pending: _Pending) -> Prompt:
+        info = pending.elicit or {}
+        head = str(info.get("title") or info.get("display_name") or "") or t(
+            "tg.elicit_title", server=str(info.get("server") or "")
+        )
+        lines = [f"🔐 <b>{_esc(head)}</b>"]
+        for key in ("description", "message", "url"):
+            value = str(info.get(key) or "").strip()
+            if value:
+                lines.append(_esc(value[:INPUT_PREVIEW_LIMIT]))
+        cancel = [Choice(t("tg.elicit_cancel"), f"a:{pending.number}:{pending.index}:c")]
+
+        name, spec = self._elicit_field(pending)
+        if not name:
+            done = t("tg.elicit_done") if info.get("url") else t("tg.elicit_accept")
+            rows = [
+                [
+                    Choice(done, f"a:{pending.number}:0:y"),
+                    Choice(t("tg.elicit_decline"), f"a:{pending.number}:0:d"),
+                ],
+                cancel,
+            ]
+            return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+
+        lines.append(f"<b>{_esc(str(spec.get('title') or name))}</b>")
+        if spec.get("description"):
+            lines.append(_esc(str(spec["description"])[:INPUT_PREVIEW_LIMIT]))
+        if len(pending.fields) > 1:
+            lines.insert(0, f"<i>{pending.index + 1}/{len(pending.fields)}</i>")
+        choices = spec.get("enum") if isinstance(spec.get("enum"), list) else None
+        if spec.get("type") == "boolean":
+            rows = [
+                [
+                    Choice(t("tg.elicit_yes"), f"a:{pending.number}:{pending.index}:y"),
+                    Choice(t("tg.elicit_no"), f"a:{pending.number}:{pending.index}:n"),
+                ],
+                cancel,
+            ]
+        elif choices:
+            rows = [
+                [Choice(str(value)[:60], f"a:{pending.number}:{pending.index}:o{index}")]
+                for index, value in enumerate(choices)
+            ]
+            rows.append(cancel)
+        else:
+            # Nothing to press: the answer is whatever the person types next.
+            pending.awaiting_text = True
+            lines.append(f"<i>{_esc(t('tg.elicit_type'))}</i>")
+            rows = [cancel]
+        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+
+    def _decide_elicit(self, pending: _Pending, option: str) -> Outcome:
+        if option == "c":
+            return self._settle_elicit(pending, {"action": "cancel"}, f"✖️ {_esc(t('tg.elicit_cancelled'))}")
+        if option == "d":
+            return self._settle_elicit(pending, {"action": "decline"}, f"⛔ {_esc(t('tg.elicit_declined'))}")
+        name, spec = self._elicit_field(pending)
+        if not name:
+            if option != "y":
+                return Outcome()
+            return self._settle_elicit(
+                pending,
+                {"action": "accept", "content": pending.content},
+                f"{DONE_MARK} {_esc(t('tg.elicit_accepted'))}",
+            )
+        if spec.get("type") == "boolean" and option in {"y", "n"}:
+            return self._store_elicit(pending, option == "y", t("tg.elicit_yes") if option == "y" else t("tg.elicit_no"))
+        if option.startswith("o"):
+            choices = spec.get("enum") if isinstance(spec.get("enum"), list) else []
+            try:
+                index = int(option[1:])
+            except ValueError:
+                return Outcome()
+            if not 0 <= index < len(choices):
+                return Outcome()
+            return self._store_elicit(pending, choices[index], str(choices[index]))
+        return Outcome()
+
+    def _answer_elicit(self, pending: _Pending, text: str) -> Outcome:
+        name, spec = self._elicit_field(pending)
+        if not name:
+            return Outcome()
+        kind = spec.get("type")
+        value: Any = text
+        if kind in {"number", "integer"}:
+            try:
+                value = int(text) if kind == "integer" else float(text)
+            except ValueError:
+                pending.awaiting_text = True
+                return Outcome(ack=t("tg.elicit_need_number"), consumed=True)
+        return self._store_elicit(pending, value, text)
+
+    def _store_elicit(self, pending: _Pending, value: Any, shown: str) -> Outcome:
+        name, spec = self._elicit_field(pending)
+        pending.content[name] = value
+        summary = f"{DONE_MARK} {_esc(str(spec.get('title') or name))} — <b>{_esc(shown)}</b>"
+        key = pending.key()
+        pending.index += 1
+        pending.awaiting_text = False
+        if pending.index < len(pending.fields):
+            return Outcome(consumed=True, close_prompt=key, summary=summary, next_prompt=self._elicit_prompt(pending))
+        outcome = self._settle_elicit(pending, {"action": "accept", "content": pending.content}, summary)
+        return Outcome(consumed=True, close_prompt=key, summary=summary, finished_request=outcome.finished_request)
+
+    def _settle_elicit(self, pending: _Pending, result: dict[str, Any], summary: str) -> Outcome:
+        self._finish(pending)
+        self.driver.respond(pending.request_id, result=result)
+        return Outcome(consumed=True, close_prompt=pending.key(), summary=summary, finished_request=pending.request_id)
+
     def _choose(self, pending: _Pending, option: str) -> Outcome:
+        if pending.is_elicit:
+            return self._decide_elicit(pending, option)
         if not pending.is_question:
             return self._decide_permission(pending, option)
 
@@ -302,6 +458,8 @@ class Prompter:
         return self._answer(pending, str(options[index].get("label") or ""))
 
     def _answer(self, pending: _Pending, answer: str) -> Outcome:
+        if pending.is_elicit:
+            return self._answer_elicit(pending, answer)
         if not pending.is_question:
             return Outcome()
         pending.answers[self._question_text(pending)] = answer

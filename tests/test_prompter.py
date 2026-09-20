@@ -216,3 +216,101 @@ class LeavingPlanMode(TempHome):
         self.prompter.on_ask(plan("p5"))
         self.assertTrue(self.prompter.on_text("1").consumed)
         self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "acceptEdits")  # type: ignore[index]
+
+
+def elicitation(request_id: str, **fields: Any) -> Event:
+    """The frame claude sends when an MCP server asks the person something."""
+    data: dict[str, Any] = {
+        "request_id": request_id,
+        "server": "registry",
+        "message": "Дать агенту доступ к проекту?",
+        "mode": "form",
+        "url": "",
+        "schema": {},
+        "title": "",
+        "display_name": "",
+        "description": "",
+    }
+    data.update(fields)
+    return Event("elicit", data)
+
+
+APPROVE = {
+    "type": "object",
+    "properties": {"approve": {"type": "boolean", "title": "Разрешить?", "description": "Да или нет"}},
+    "required": ["approve"],
+}
+
+
+class Elicitations(TempHome):
+    """An MCP server's question: unanswered, the tool call never returns."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.driver = FakeDriver()
+        self.prompter = Prompter(self.driver)  # type: ignore[arg-type]
+
+    def test_a_boolean_form_is_answered_with_accept_and_the_value(self) -> None:
+        prompt = self.prompter.on_elicit(elicitation("e1", schema=APPROVE))
+        self.assertIn("Дать агенту доступ", prompt.text)
+        self.assertIn("Разрешить?", prompt.text)
+
+        outcome = self.prompter.on_callback(prompt.rows[0][0].data)
+        self.assertTrue(outcome.consumed)
+        self.assertEqual(outcome.finished_request, "e1")
+        request_id, result, _ = self.driver.responses[-1]
+        self.assertEqual(request_id, "e1")
+        self.assertEqual(result, {"action": "accept", "content": {"approve": True}})
+
+    def test_saying_no_still_answers_the_server(self) -> None:
+        prompt = self.prompter.on_elicit(elicitation("e2", schema=APPROVE))
+        self.prompter.on_callback(prompt.rows[0][1].data)
+        self.assertEqual(self.driver.responses[-1][1], {"action": "accept", "content": {"approve": False}})
+
+    def test_cancel_settles_the_request(self) -> None:
+        prompt = self.prompter.on_elicit(elicitation("e3", schema=APPROVE))
+        self.prompter.on_callback(prompt.rows[-1][0].data)
+        self.assertEqual(self.driver.responses[-1][1], {"action": "cancel"})
+
+    def test_a_free_text_field_takes_the_next_message(self) -> None:
+        schema = {"type": "object", "properties": {"reason": {"type": "string", "title": "Причина"}}}
+        self.prompter.on_elicit(elicitation("e4", schema=schema))
+        self.assertTrue(self.prompter.awaiting_text)
+        outcome = self.prompter.on_text("потому что")
+        self.assertTrue(outcome.consumed)
+        self.assertEqual(self.driver.responses[-1][1], {"action": "accept", "content": {"reason": "потому что"}})
+
+    def test_several_fields_are_asked_one_after_another(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {
+                "approve": {"type": "boolean", "title": "Разрешить?"},
+                "scope": {"type": "string", "enum": ["сессия", "навсегда"], "title": "Надолго?"},
+            },
+        }
+        prompt = self.prompter.on_elicit(elicitation("e5", schema=schema))
+        outcome = self.prompter.on_callback(prompt.rows[0][0].data)
+        self.assertIsNotNone(outcome.next_prompt)
+        assert outcome.next_prompt is not None
+        self.assertEqual(self.driver.responses, [])
+        self.prompter.on_callback(outcome.next_prompt.rows[1][0].data)
+        self.assertEqual(
+            self.driver.responses[-1][1],
+            {"action": "accept", "content": {"approve": True, "scope": "навсегда"}},
+        )
+
+    def test_a_url_elicitation_only_needs_done_or_cancel(self) -> None:
+        prompt = self.prompter.on_elicit(
+            elicitation("e6", mode="url", url="https://example.test/auth", schema=APPROVE)
+        )
+        self.assertIn("example.test", prompt.text)
+        self.prompter.on_callback(prompt.rows[0][0].data)
+        self.assertEqual(self.driver.responses[-1][1], {"action": "accept", "content": {}})
+
+    def test_an_unanswered_elicitation_is_cancelled_not_denied(self) -> None:
+        prompter = Prompter(self.driver, timeout_seconds=0.01)  # type: ignore[arg-type]
+        prompter.on_elicit(elicitation("e7", schema=APPROVE))
+        time.sleep(0.02)
+        outcomes = prompter.tick()
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(self.driver.responses[-1][1], {"action": "cancel"})

@@ -252,7 +252,26 @@ class Driver:
                     description=str(request.get("description") or ""),
                     tool_use_id=str(request.get("tool_use_id") or ""),
                 )
+            elif request.get("subtype") == "elicitation":
+                # An MCP server asking the person something (the registry's
+                # "may the agent touch this project?"). Unanswered, the tool
+                # call never returns and the session simply stops.
+                self._emit(
+                    "elicit",
+                    request_id=request_id,
+                    server=str(request.get("mcp_server_name") or ""),
+                    message=str(request.get("message") or ""),
+                    mode=str(request.get("mode") or ""),
+                    url=str(request.get("url") or ""),
+                    schema=request.get("requested_schema") or {},
+                    title=str(request.get("title") or ""),
+                    display_name=str(request.get("display_name") or ""),
+                    description=str(request.get("description") or ""),
+                )
             else:
+                # claude discards an error-shaped answer and keeps waiting, so
+                # the log is the only sign of a subtype we do not render yet.
+                log.write(f"transport: unsupported control request {request.get('subtype')}")
                 self.respond(request_id, error=f"unsupported: {request.get('subtype')}")
             return
 

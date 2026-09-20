@@ -56,6 +56,12 @@ for line in sys.stdin:
                  "request": {"subtype": "can_use_tool", "tool_name": "AskUserQuestion",
                              "input": {"questions": [question]}, "tool_use_id": "t1",
                              "requires_user_interaction": True}})
+        elif text == "elicit":
+            out({"type": "control_request", "request_id": "req_e",
+                 "request": {"subtype": "elicitation", "mcp_server_name": "registry",
+                             "message": "May I?", "mode": "form",
+                             "requested_schema": {"type": "object", "properties": {
+                                 "approve": {"type": "boolean", "title": "Allow?"}}}}})
         elif text == "wall":
             out({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected",
                  "rateLimitType": "five_hour", "resetsAt": 1790000000}})
@@ -165,6 +171,17 @@ class DriverProtocol(TempHome):
         self.assertFalse(driver.alive())
         with self.assertRaises(DriverError):
             driver.send_user("too late")
+
+    def test_an_mcp_elicitation_becomes_an_event_to_answer(self) -> None:
+        """Left unanswered by ccas, the tool call behind it never returns."""
+        driver = self._start()
+        self._next("init")
+        driver.send_user("elicit")
+        event = self._next("elicit")
+        self.assertEqual(event.data["request_id"], "req_e")
+        self.assertEqual(event.data["server"], "registry")
+        self.assertEqual(event.data["message"], "May I?")
+        self.assertIn("approve", event.data["schema"]["properties"])
 
     def test_close_ends_a_quiet_session(self) -> None:
         driver = self._start()
