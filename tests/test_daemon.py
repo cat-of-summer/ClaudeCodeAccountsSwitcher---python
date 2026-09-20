@@ -119,17 +119,18 @@ class ProfileOwnsItsChat(DaemonBase):
         self.project = self.home / "RIKROOT"
         self.project.mkdir()
 
-    def test_the_chat_it_claims_needs_no_alias(self) -> None:
+    def test_a_named_profile_hears_only_its_name(self) -> None:
         self.profile("rikroot", chats=((PROJECT_CHAT, 0),), cwd=str(self.project))
         daemon = self.daemon()
         route = self._route(daemon, "rikroot")
 
-        daemon.deliver(incoming("build it", chat=PROJECT_CHAT))
-        self.assertEqual([entry["text"] for entry in route.take(0)], ["build it"])
+        daemon.deliver(incoming("rikroot build it", chat=PROJECT_CHAT))
+        self.assertEqual([entry["text"] for entry in route.take(0)], ["rikroot build it"])
 
-        # The same line in another chat belongs to the default profile, which
-        # is not running, so nothing happens.
-        daemon.deliver(incoming("build it", chat=HOME_CHAT))
+        # Plain talk in its own chat is not for it -- that is how a person
+        # stops the conversation -- and neither is the other chat.
+        daemon.deliver(incoming("and then we had lunch", chat=PROJECT_CHAT))
+        daemon.deliver(incoming("rikroot build it", chat=HOME_CHAT))
         self.assertEqual(route.take(0), [])
         self.assertEqual(self.bot.sent, [])
 
@@ -141,9 +142,9 @@ class ProfileOwnsItsChat(DaemonBase):
         project = self._route(daemon, "rikroot", pid=2)
 
         daemon.deliver(incoming("for home", chat=HOME_CHAT))
-        daemon.deliver(incoming("for the project", chat=PROJECT_CHAT))
+        daemon.deliver(incoming("rikroot for the project", chat=PROJECT_CHAT))
         self.assertEqual([entry["text"] for entry in home.take(0)], ["for home"])
-        self.assertEqual([entry["text"] for entry in project.take(0)], ["for the project"])
+        self.assertEqual([entry["text"] for entry in project.take(0)], ["rikroot for the project"])
 
         # A chat neither of them named is nobody's now that default has one.
         daemon.deliver(incoming("elsewhere", chat=-777))
@@ -154,7 +155,7 @@ class ProfileOwnsItsChat(DaemonBase):
         self.profile("rikroot", chats=((PROJECT_CHAT, 0),), cwd=str(self.project), daemon=True, slot=3)
         daemon = self.daemon()
 
-        daemon.deliver(incoming("wake up and build", chat=PROJECT_CHAT))
+        daemon.deliver(incoming("rikroot wake up and build", chat=PROJECT_CHAT))
         self.assertEqual(len(self.launched), 1)
         command, cwd, env = self.launched[0]
         self.assertEqual(cwd, self.project.resolve())
@@ -165,7 +166,7 @@ class ProfileOwnsItsChat(DaemonBase):
 
         # What was said while the window came up is delivered on registration.
         route = self._route(daemon, "rikroot")
-        self.assertEqual([entry["text"] for entry in route.take(0)], ["wake up and build"])
+        self.assertEqual([entry["text"] for entry in route.take(0)], ["rikroot wake up and build"])
 
     def test_a_profile_may_not_be_started_from_a_chat_it_does_not_serve(self) -> None:
         self.profile("rikroot", chats=((PROJECT_CHAT, 0),), cwd=str(self.project))
@@ -197,20 +198,23 @@ class WhoMayTalk(DaemonBase):
         daemon = self.daemon()
         route = self._route(daemon, "rikroot")
 
-        daemon.deliver(incoming("from nine", chat=PROJECT_CHAT, user=9))  # not global
-        daemon.deliver(incoming("from seven", chat=PROJECT_CHAT, user=7))  # not on the profile
+        daemon.deliver(incoming("rikroot from nine", chat=PROJECT_CHAT, user=9))  # not global
+        daemon.deliver(incoming("rikroot from seven", chat=PROJECT_CHAT, user=7))  # not on the profile
         self.assertEqual(route.take(0), [])
-        daemon.deliver(incoming("from eight", chat=PROJECT_CHAT, user=8))
-        self.assertEqual([entry["text"] for entry in route.take(0)], ["from eight"])
+        daemon.deliver(incoming("rikroot from eight", chat=PROJECT_CHAT, user=8))
+        self.assertEqual([entry["text"] for entry in route.take(0)], ["rikroot from eight"])
 
 
 class Buttons(DaemonBase):
     def test_presses_go_to_the_transport_that_drew_them(self) -> None:
         daemon = self.daemon()
         route = self._route(daemon, "default")
-        daemon.deliver(press(f"{route.tag}:a:1:0:1"))
+        # The button carries the conversation's tag, which extends the
+        # transport's: comparing them whole answered "that session is gone"
+        # to every press.
+        daemon.deliver(press(f"{route.tag}.2:a:1:0:1"))
         self.assertEqual(len(route.take(0)), 1)
-        daemon.deliver(press("t99:a:1:0:1"))
+        daemon.deliver(press("t99.1:a:1:0:1"))
         self.assertIn("gone", self.bot.answered[-1][1])
 
 

@@ -18,19 +18,37 @@ class FakeBot:
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
         self.cleared: list[int] = []
+        self.deleted: set[int] = set()
         self.answered: list[tuple[str, str]] = []
 
     def send_message(
         self, chat_id: int, text: str, *, thread_id: int = 0, reply_markup: Any = None, reply_to: int = 0, **_: Any
     ) -> int:
         self.sent.append(
-            {"chat": chat_id, "text": text, "thread": thread_id, "markup": reply_markup, "reply_to": reply_to}
+            {
+                "id": len(self.sent) + 1,
+                "chat": chat_id,
+                "text": text,
+                "thread": thread_id,
+                "markup": reply_markup,
+                "reply_to": reply_to,
+            }
         )
         return len(self.sent)
 
     def edit_markup(self, chat_id: int, message_id: int, reply_markup: Any) -> None:
         self.cleared.append(message_id)
+
+    def edit_text(self, chat_id: int, message_id: int, text: str, **_: Any) -> bool:
+        self.edits.append({"id": message_id, "text": text})
+        if message_id in self.deleted:
+            return False
+        for entry in self.sent:
+            if entry["id"] == message_id:
+                entry["text"] = text
+        return True
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         self.answered.append((callback_id, text))
@@ -49,6 +67,7 @@ class FakeDriver:
         self.interrupts = 0
         self.turn_active = False
         self.model = "fake"
+        self.mode = ""
         self.started_at = time.time()
         self.session_id = "0123456789abcdef"
         self.commands: list[dict[str, Any]] = []
@@ -66,7 +85,7 @@ class FakeDriver:
         self.model = model
 
     def set_permission_mode(self, mode: str) -> None:
-        return
+        self.mode = mode
 
 
 def incoming(text: str, *, chat: int = -100, user: int = 7, thread: int = 0) -> telegram.Incoming:
@@ -77,7 +96,7 @@ def press(data: str, *, chat: int = -100) -> telegram.Incoming:
     return telegram.Incoming(update_id=2, chat_id=chat, thread_id=0, user_id=7, text="", message_id=6, callback_id="cb", callback_data=data)
 
 
-class ChatConversation(TempHome):
+class ConversationBase(TempHome):
     def setUp(self) -> None:
         super().setUp()
         Config().save()
@@ -85,13 +104,13 @@ class ChatConversation(TempHome):
         self.driver = FakeDriver()
         self.console: list[str] = []
 
-    def make(self, name: str = "default", user: int = 7) -> Conversation:
+    def make(self, name: str = "default", user: int = 7, **fields: Any) -> Conversation:
         target = ChatTarget(bot=self.bot, chat=-100, user=user)  # type: ignore[arg-type]
         conversation = Conversation(
             Config.load(),
             slot=1,
             target=target,
-            profile=Profile(name=name),
+            profile=Profile(name=name, **fields),
             cwd=self.home,
             args=[],
             on_console=self.console.append,
@@ -101,13 +120,15 @@ class ChatConversation(TempHome):
         conversation.session_id = self.driver.session_id
         return conversation
 
+
+class ChatConversation(ConversationBase):
     def test_what_it_is_given_goes_to_claude(self) -> None:
         conversation = self.make()
         conversation._on_incoming(incoming("hello"))
         self.assertEqual(self.driver.sent, ["hello"])
 
     def test_answers_reply_to_the_message_that_asked(self) -> None:
-        conversation = self.make()
+        conversation = self.make(expanded=True)
         conversation._on_incoming(incoming("hello"))
         conversation._on_event(Event("text", {"text": "hi"}))
         self.assertEqual(self.bot.sent[-1]["reply_to"], 5)
@@ -116,7 +137,7 @@ class ChatConversation(TempHome):
         self.assertEqual(self.bot.sent[-1]["reply_to"], 0)
 
     def test_the_console_mirror_goes_through_the_callback(self) -> None:
-        conversation = self.make()
+        conversation = self.make(expanded=True)
         conversation._on_event(Event("text", {"text": "visible"}))
         self.assertIn("visible", self.console[-1])
 
@@ -175,17 +196,101 @@ class ChatConversation(TempHome):
         conversation._on_line("n", source="console")
         self.assertEqual(self.driver.responses[-1][1]["behavior"], "deny")  # type: ignore[index]
 
-    def test_text_and_tools_are_rendered_by_verbosity(self) -> None:
-        conversation = self.make()
+    def test_a_chat_hears_answers_and_nothing_technical(self) -> None:
+        conversation = self.make(expanded=True)
         conversation._on_event(Event("text", {"text": "**bold** answer"}))
         self.assertEqual(self.bot.texts()[-1], "<b>bold</b> answer")
+
+        conversation._on_event(Event("tool_use", {"name": "Bash", "input": {"command": "git status"}}))
+        conversation._on_event(Event("tool_result", {"id": "x", "content": "clean"}))
+        conversation._on_event(Event("result", {"subtype": "success", "duration_ms": 1000, "cost": 0.1}))
+        self.assertEqual(self.bot.texts()[-1], "<b>bold</b> answer")  # nothing new reached the chat
+        self.assertTrue(any("git status" in line for line in self.console))
+
+    def test_tech_turns_the_tool_log_back_on(self) -> None:
+        conversation = self.make(expanded=True, tech=True)
         conversation._on_event(Event("tool_use", {"name": "Bash", "input": {"command": "git status"}}))
         self.assertIn("git status", self.bot.texts()[-1])
         conversation._on_event(Event("tool_result", {"id": "x", "content": "clean"}))
-        self.assertNotIn("clean", self.bot.texts()[-1])  # "tools" hides results
-        conversation.verbosity = "text"
-        conversation._on_event(Event("tool_use", {"name": "Bash", "input": {"command": "ls"}}))
-        self.assertNotIn("ls", self.bot.texts()[-1])
+        self.assertIn("clean", self.bot.texts()[-1])
+
+
+class CollapsedTurn(ConversationBase):
+    """One message per turn, rewritten -- the default way a chat reads."""
+
+    def test_the_turn_is_written_into_one_message(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("do it"))
+        conversation._on_event(Event("text", {"text": "thinking"}))
+        conversation._flush_live()
+        self.assertEqual(len(self.bot.sent), 1)
+        first = self.bot.sent[0]["id"]
+
+        conversation._on_event(Event("text", {"text": "done, here is the review"}))
+        conversation._flush_live()
+        self.assertEqual(len(self.bot.sent), 1)  # still one message in the chat
+        self.assertEqual(self.bot.sent[0]["text"], "done, here is the review")
+        self.assertEqual(self.bot.edits[-1]["id"], first)
+
+    def test_a_deleted_message_is_replaced_not_lost(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("do it"))
+        conversation._on_event(Event("text", {"text": "first"}))
+        conversation._flush_live()
+        self.bot.deleted.add(self.bot.sent[0]["id"])
+
+        conversation._on_event(Event("text", {"text": "second"}))
+        conversation._flush_live()
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertEqual(self.bot.sent[-1]["text"], "second")
+
+    def test_a_new_turn_takes_the_buttons_off_the_old_message(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("first turn"))
+        conversation._on_event(Event("text", {"text": "answer"}))
+        conversation._flush_live()
+        live = self.bot.sent[0]["id"]
+
+        conversation._on_incoming(incoming("second turn"))
+        self.assertIn(live, self.bot.cleared)
+        conversation._on_event(Event("text", {"text": "another answer"}))
+        conversation._flush_live()
+        self.assertEqual(len(self.bot.sent), 2)
+
+
+class Modes(ConversationBase):
+    def test_the_mode_is_announced_when_it_changes(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("init", {"permission_mode": "plan", "model": "m"}))
+        self.assertEqual(conversation.mode, "plan")
+        self.assertEqual(self.bot.sent, [])  # the first report only corrects the console
+
+        conversation._on_event(Event("init", {"permission_mode": "acceptEdits", "model": "m"}))
+        self.assertEqual(self.bot.texts()[-1], "🔵 acceptEdits")
+
+    def test_the_skip_flag_is_bypass_and_says_so(self) -> None:
+        self.assertEqual(self.make().mode, "bypassPermissions")
+
+    def test_commands_switch_it(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/plan"))
+        self.assertEqual(self.driver.mode, "plan")
+        self.assertEqual(conversation.mode, "plan")
+        conversation._on_incoming(incoming("/bypass"))
+        self.assertEqual(self.driver.mode, "bypassPermissions")
+        self.assertIn("bypassPermissions", self.bot.texts()[-1])
+
+    def test_the_starting_mode_comes_from_the_settings(self) -> None:
+        # Without the skip flag, which is a bypass of its own and wins.
+        config = Config.load()
+        config.default_args = []
+        config.save()
+        (self.home / ".claude").mkdir(exist_ok=True)
+        (self.home / ".claude" / "settings.json").write_text(
+            '{"permissions": {"defaultMode": "acceptEdits"}}', encoding="utf-8"
+        )
+        conversation = self.make()
+        self.assertEqual(conversation.mode, "acceptEdits")
 
     def test_cd_requests_a_relaunch_and_save_writes_a_profile(self) -> None:
         conversation = self.make("rikroot")

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from core import telegram
-from core.store import AUTO_SWITCH_STRATEGIES, TELEGRAM_VERBOSITIES, Config
+from core.store import AUTO_SWITCH_STRATEGIES, Config
 from ui import i18n
 from ui.i18n import t
 
@@ -212,12 +212,12 @@ SETTINGS: tuple[Setting, ...] = (
         maximum=64,
     ),
     Setting(
-        "telegram-verbosity",
-        "choice",
-        _tg("verbosity"),
-        _set_tg("verbosity"),
-        choices=TELEGRAM_VERBOSITIES,
-        choice_labels={name: f"config.verbosity_{name}" for name in TELEGRAM_VERBOSITIES},
+        "telegram-idle-hours",
+        "int",
+        _tg("idleHours"),
+        _set_tg("idleHours"),
+        minimum=0,
+        maximum=168,
     ),
     Setting(
         "telegram-prompt-timeout",

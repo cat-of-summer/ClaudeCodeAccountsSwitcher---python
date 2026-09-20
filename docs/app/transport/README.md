@@ -25,5 +25,6 @@ Telegram-транспорт: сессия claude, живущая в чате.
 - [prompter.py](prompter.py.md) — вопросы и разрешения как кнопки
 - [routing.py](routing.py.md) — кому строка: разбор `/claude`, префикса и имён профилей
 - [poller.py](poller.py.md) — поллер токена и его лок
+- [../../system/childjob.py](../../system/childjob.py.md) — дети, умирающие вместе с окном
 - [daemonlink.py](daemonlink.py.md) — как сессия и CLI говорят с демоном
 - [__init__.py](__init__.py.md) — вход из обёртки: `claude -t telegram`

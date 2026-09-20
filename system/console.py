@@ -353,3 +353,28 @@ def _poll_key_posix(timeout: float) -> str:
         return sys.stdin.read(1)
     finally:
         termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+
+def quiet_input_mode() -> int:
+    """A console nobody types into, and that never stalls a write.
+
+    QuickEdit is the trap: one click inside the window puts the console into
+    selection mode and every write blocks until it is dismissed. For a window
+    that only mirrors a chat that reads as "the integration froze", so the bit
+    comes off -- and with it line input and echo, since nothing is read here.
+    ENABLE_EXTENDED_FLAGS has to be set for the console to honour the absence
+    of QuickEdit at all.
+    """
+    return ENABLE_PROCESSED_INPUT | ENABLE_EXTENDED_FLAGS
+
+
+def quiet() -> State | None:
+    """Put this console into that mode; returns what it was, for `restore`."""
+    if not IS_WINDOWS:
+        return None
+    with contextlib.suppress(*_GUARD):
+        state = _snapshot_windows()
+        handle = _console_handle(STD_INPUT_HANDLE, "CONIN$")
+        _set_mode(handle, quiet_input_mode())
+        return state
+    return None

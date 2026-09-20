@@ -495,6 +495,16 @@ def cmd_profile(args: argparse.Namespace) -> int:
                 raise SystemExit(t("profile.bad_chat", chat=", ".join(bad)))
             chats = tuple(ref for ref in parsed if ref is not None)
 
+        mode = current.mode
+        if args.mode is not None:
+            from app.autoswitch import PERMISSION_MODES
+
+            mode = args.mode.strip()
+            if mode and mode not in PERMISSION_MODES:
+                raise SystemExit(
+                    t("profile.bad_mode", mode=mode, modes=", ".join(sorted(PERMISSION_MODES)))
+                )
+
         users = current.users
         if args.users is not None:
             if not all(part.strip().lstrip("-").isdigit() for part in args.users):
@@ -509,6 +519,9 @@ def cmd_profile(args: argparse.Namespace) -> int:
                 slot=int(args.slot) if args.slot is not None else current.slot,
                 daemon=_profile_flag(args.daemon, current.daemon, "daemon"),
                 multi=_profile_flag(args.multi, current.multi, "multi"),
+                tech=_profile_flag(args.tech, current.tech, "tech"),
+                expanded=_profile_flag(args.expanded, current.expanded, "expanded"),
+                mode=mode,
                 users=users,
                 args=tuple(tokenize(args.claude_args)) if args.claude_args is not None else current.args,
             )
@@ -840,6 +853,9 @@ def build_parser() -> argparse.ArgumentParser:
     profile_set.add_argument("--slot", type=int, help=t("cli.help.profile_slot"))
     profile_set.add_argument("--daemon", help=t("cli.help.profile_daemon"))
     profile_set.add_argument("--multi", help=t("cli.help.profile_multi"))
+    profile_set.add_argument("--tech", help=t("cli.help.profile_tech"))
+    profile_set.add_argument("--expanded", help=t("cli.help.profile_expanded"))
+    profile_set.add_argument("--mode", help=t("cli.help.profile_mode"))
     profile_set.add_argument("--users", nargs="*", help=t("cli.help.profile_users"))
     profile_set.add_argument("--args", dest="claude_args", help=t("cli.help.profile_args"))
     profile_remove = profile_sub.add_parser("remove", help=t("cli.help.profile_remove"))

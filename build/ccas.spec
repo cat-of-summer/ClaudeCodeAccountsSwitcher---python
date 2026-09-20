@@ -74,6 +74,7 @@ HIDDEN = [
     "core.telegram",
     "core.version",
     "system.autostart",
+    "system.childjob",
     "system.console",
     "system.secure",
     "ui.i18n",

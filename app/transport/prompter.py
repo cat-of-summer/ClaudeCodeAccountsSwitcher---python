@@ -22,8 +22,13 @@ from app.transport.driver import Driver, Event
 from ui.i18n import t
 
 ASK_TOOL = "AskUserQuestion"
+# Leaving plan mode is a tool call the host approves, and approving it is
+# also where the next mode is chosen -- the same two choices the TUI offers.
+PLAN_TOOL = "ExitPlanMode"
+PLAN_CHOICES = {"e": "acceptEdits", "m": "manual"}
 CUSTOM_ANSWER = "__custom__"
 INPUT_PREVIEW_LIMIT = 600
+PLAN_PREVIEW_LIMIT = 3000
 DONE_MARK = "✅"
 
 
@@ -49,6 +54,7 @@ class Outcome:
     """What the session should do after a press or a typed line."""
 
     ack: str = ""
+    mode: str = ""  # the permission mode this answer switched claude into
     consumed: bool = False
     close_prompt: str = ""  # key of the prompt whose keyboard is done
     summary: str = ""  # a line to show in place of the keyboard
@@ -73,6 +79,10 @@ class _Pending:
     @property
     def is_question(self) -> bool:
         return self.tool_name == ASK_TOOL
+
+    @property
+    def is_plan(self) -> bool:
+        return self.tool_name == PLAN_TOOL
 
     def key(self) -> str:
         return f"{self.number}:{self.index}"
@@ -184,7 +194,10 @@ class Prompter:
             if probe.isdigit() and int(probe) == len(options) + 1:
                 return self._choose(pending, "t")
             return Outcome()
-        mapping = {"1": "y", "y": "y", "yes": "y", "2": "s", "3": "n", "n": "n", "no": "n"}
+        if pending.is_plan:
+            mapping = {"1": "e", "2": "m", "3": "n", "n": "n", "no": "n"}
+        else:
+            mapping = {"1": "y", "y": "y", "yes": "y", "2": "s", "3": "n", "n": "n", "no": "n"}
         if probe in mapping:
             return self._choose(pending, mapping[probe])
         return Outcome()
@@ -207,6 +220,8 @@ class Prompter:
     def _prompt_for(self, pending: _Pending) -> Prompt:
         if pending.is_question:
             return self._question_prompt(pending)
+        if pending.is_plan:
+            return self._plan_prompt(pending)
         return self._permission_prompt(pending)
 
     def _question_prompt(self, pending: _Pending) -> Prompt:
@@ -231,6 +246,20 @@ class Prompter:
         if len(pending.questions) > 1:
             lines.insert(0, f"<i>{pending.index + 1}/{len(pending.questions)}</i>")
         return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, multi=multi)
+
+    def _plan_prompt(self, pending: _Pending) -> Prompt:
+        plan = str(pending.tool_input.get("plan") or "").strip()
+        lines = [f"📋 <b>{_esc(t('tg.plan_ready'))}</b>"]
+        if plan:
+            lines.append(_esc(plan[:PLAN_PREVIEW_LIMIT]))
+        rows = [
+            [
+                Choice(t("tg.plan_go"), f"a:{pending.number}:0:e"),
+                Choice(t("tg.plan_ask"), f"a:{pending.number}:0:m"),
+            ],
+            [Choice(t("tg.plan_revise"), f"a:{pending.number}:0:n")],
+        ]
+        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
 
     def _permission_prompt(self, pending: _Pending) -> Prompt:
         lines = [f"🔐 <b>{_esc(pending.tool_name)}</b>", f"<pre>{_esc(describe_input(pending.tool_name, pending.tool_input))}</pre>"]
@@ -289,8 +318,31 @@ class Prompter:
         return Outcome(consumed=True, close_prompt=f"{pending.number}:{pending.index - 1}", summary=summary, finished_request=pending.request_id)
 
     def _decide_permission(self, pending: _Pending, option: str) -> Outcome:
+        if pending.is_plan and option in PLAN_CHOICES:
+            mode = PLAN_CHOICES[option]
+            result = {
+                "behavior": "allow",
+                "updatedInput": pending.tool_input,
+                # Approving the plan *is* the mode switch: claude applies the
+                # update itself, exactly as the TUI's "how do you want to
+                # proceed" does.
+                "updatedPermissions": [
+                    {"type": "setMode", "mode": mode, "destination": "session"}
+                ],
+            }
+            self._finish(pending)
+            self.driver.respond(pending.request_id, result=result)
+            return Outcome(
+                consumed=True,
+                close_prompt=pending.key(),
+                summary=f"{DONE_MARK} {_esc(t('tg.plan_accepted', mode=mode))}",
+                finished_request=pending.request_id,
+                mode=mode,
+            )
+
         if option == "n":
-            result: dict[str, Any] = {"behavior": "deny", "message": t("tg.perm_denied_reason")}
+            reason = t("tg.plan_revise_reason") if pending.is_plan else t("tg.perm_denied_reason")
+            result: dict[str, Any] = {"behavior": "deny", "message": reason}
             summary = f"⛔ {_esc(pending.tool_name)} — {_esc(t('tg.perm_deny'))}"
         elif option in {"y", "s"}:
             result = {"behavior": "allow", "updatedInput": pending.tool_input}

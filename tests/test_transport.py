@@ -106,9 +106,21 @@ class ConversationsPerPerson(TransportBase):
 
     def test_multi_puts_the_whole_chat_in_one_session(self) -> None:
         transport = self.transport(Profile(name="team", multi=True))
-        transport._on_incoming(incoming("hello", user=7))
-        transport._on_incoming(incoming("hello", user=8))
+        transport._on_incoming(incoming("team hello", user=7))
+        transport._on_incoming(incoming("team hello", user=8))
         self.assertEqual(list(transport.conversations), [(CHAT, 0, 0)])
+
+    def test_an_idle_conversation_is_closed_and_its_memory_given_back(self) -> None:
+        transport = self.transport(Profile(name="default"))
+        transport.idle_seconds = 0.05
+        transport._on_incoming(incoming("hello", user=7))
+        conversation = next(iter(transport.conversations.values()))
+        self.wait_for(lambda: conversation.session_id != "")
+
+        time.sleep(0.1)
+        transport._retire_idle()
+        self.wait_for(lambda: not transport.conversations)
+        self.assertFalse(conversation.driver.alive())
 
     def test_a_topic_is_a_conversation_of_its_own(self) -> None:
         transport = self.transport(Profile(name="default"))
@@ -161,7 +173,7 @@ class WhatTheTransportServes(TransportBase):
         transport._on_incoming(incoming("hello", user=7))
         self.assertEqual(len(transport.conversations), 1)
 
-    def test_the_alias_and_prefix_are_stripped_before_claude_sees_the_line(self) -> None:
+    def test_a_named_profile_only_hears_its_name(self) -> None:
         config = Config.load()
         config.telegram = {**config.telegram, "prefix": "cc:"}
         config.save()
@@ -170,14 +182,18 @@ class WhatTheTransportServes(TransportBase):
 
         self.assertEqual(transport._strip("cc: rikroot build it"), "build it")
         self.assertEqual(transport._strip("rikroot build it"), "build it")
-        self.assertEqual(transport._strip("cc: build it"), "build it")
+        self.assertIsNone(transport._strip("cc: build it"))
         self.assertIsNone(transport._strip("build it"))
+
+    def test_the_default_profile_takes_plain_lines(self) -> None:
+        transport = self.transport(Profile(name="default"))
+        self.assertEqual(transport._strip("build it"), "build it")
 
 
 class ProfileSavedFromTheChat(TransportBase):
     def test_save_pins_the_chat_to_the_profile(self) -> None:
         transport = self.transport(Profile(name="rikroot"))
-        transport._on_incoming(incoming("hello", user=7))
+        transport._on_incoming(incoming("rikroot hello", user=7))
         conversation = next(iter(transport.conversations.values()))
         conversation._save_profile()
 

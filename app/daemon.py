@@ -52,6 +52,8 @@ ONE_SHOT_TIMEOUT_SECONDS = 180.0
 PROJECTS_PER_PAGE = 8
 LIST_LIMIT = 40
 DAEMON_TAG = "d"
+# Separates a transport's tag from the conversation's within it: "t1.2".
+CONVERSATION_SEPARATOR = "."
 
 # `claude <subcommand>` and print-mode runs finish on their own: they are
 # run to completion and their output posted, not given a window.
@@ -398,12 +400,16 @@ class Daemon:
         here = self._routes_in(incoming.chat_id, incoming.thread_id)
 
         if incoming.is_callback:
+            # A button carries the conversation's tag ("t1.2"); the route is
+            # the transport that drew it ("t1"). Comparing the two whole was
+            # what made every press answer "that session is gone".
             tag = incoming.callback_data.split(":", 1)[0]
             if tag == DAEMON_TAG:
                 self._on_button(incoming)
                 return
+            owner = tag.split(CONVERSATION_SEPARATOR, 1)[0]
             for route in here:
-                if route.tag == tag:
+                if route.tag == owner:
                     route.push(incoming)
                     return
             self.bot.answer_callback(incoming.callback_id, t("daemon.button_expired"))
@@ -420,6 +426,10 @@ class Daemon:
         if routed is None:
             return
         profile = known[routed.profile]
+        if not profile.open_to(incoming.chat_id, incoming.thread_id):
+            # Named from a chat this profile does not work in: saying the
+            # name somewhere else must not reach it.
+            return
         if not profile.allows(incoming.user_id, self._users()):
             return
 

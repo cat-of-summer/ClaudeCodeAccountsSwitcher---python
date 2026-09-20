@@ -191,11 +191,14 @@ def route(
 ) -> Routed | None:
     """Whose line this is, or None when it is nobody's.
 
-    The order is the one a person would guess: a name at the front wins; a
-    chat named by exactly one profile belongs to that profile; otherwise the
-    default profile takes it, but only where it is allowed to work. A named
-    profile that listed no chats is reachable by its name alone -- it has not
-    claimed anything, so plain talk in a shared chat is not silently its.
+    A name at the front wins, and for a named profile it is the *only* way
+    in: a profile with an alias hears nothing that does not say its name.
+    That is what makes a conversation endable -- stop saying the name and the
+    agent stops answering.
+
+    What is left over belongs to `default`, the profile without a name, but
+    not in a chat some named profile has claimed: a chat dedicated to one
+    agent stays quiet rather than answering the people talking in it.
     """
     line = text.strip()
     if prefix and line.startswith(prefix):
@@ -211,19 +214,16 @@ def route(
     if prefix and not prefixed and not line.startswith("/"):
         return None
 
-    owners = [
-        name
-        for name, profile in profiles.items()
-        if profile.claims(chat, thread)
-    ]
-    if len(owners) == 1:
-        return Routed(owners[0], line)
-    if owners:
-        # Several profiles named the same chat: only an explicit alias can
-        # tell them apart, so a plain line has no owner.
-        return None
-
     fallback = profiles.get(DEFAULT_PROFILE)
-    if fallback is not None and fallback.open_to(chat, thread):
+    if fallback is None:
+        return None
+    if fallback.claims(chat, thread):
         return Routed(DEFAULT_PROFILE, line)
-    return None
+
+    claimed = any(
+        name != DEFAULT_PROFILE and profile.claims(chat, thread)
+        for name, profile in profiles.items()
+    )
+    if claimed or not fallback.open_to(chat, thread):
+        return None
+    return Routed(DEFAULT_PROFILE, line)

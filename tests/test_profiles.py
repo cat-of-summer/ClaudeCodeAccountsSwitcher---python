@@ -149,3 +149,44 @@ class Migration(TempHome):
         first = Config.load().telegram
         self.assertFalse(store.migrate_config())
         self.assertEqual(Config.load().telegram, first)
+
+
+class ShapeOfTheChat(TempHome):
+    def test_new_flags_default_to_the_quiet_shape(self) -> None:
+        profile = profiles_module.load(Config())["default"]
+        self.assertFalse(profile.tech)      # answers only
+        self.assertFalse(profile.expanded)  # one message per turn
+        self.assertEqual(profile.mode, "")  # whatever claude would start in
+
+    def test_the_mode_is_worked_out_without_starting_claude(self) -> None:
+        config = Config(default_args=[])
+        self.assertEqual(Profile(name="x").resolve_mode(config), "")
+        self.assertEqual(Profile(name="x", mode="plan").resolve_mode(config), "plan")
+
+        # The skip flag ccas passes *is* bypass, whoever put it there.
+        self.assertEqual(
+            Profile(name="x", args=("--dangerously-skip-permissions",)).resolve_mode(config),
+            "bypassPermissions",
+        )
+        self.assertEqual(
+            Profile(name="x").resolve_mode(Config(default_args=["--dangerously-skip-permissions"])),
+            "bypassPermissions",
+        )
+
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text('{"permissions": {"defaultMode": "acceptEdits"}}', encoding="utf-8")
+        self.assertEqual(Profile(name="x").resolve_mode(config), "acceptEdits")
+        # A profile with its own mode does not care what the settings say.
+        self.assertEqual(Profile(name="x", mode="plan").resolve_mode(config), "plan")
+
+    def test_schema_six_drops_the_global_verbosity(self) -> None:
+        store.write_json_atomic(
+            store.config_path(),
+            {"schema": 5, "telegram": {"verbosity": "all", "profiles": {"rik": {"cwd": "/tmp"}}}},
+            harden=False,
+        )
+        self.assertTrue(store.migrate_config())
+        telegram = Config.load().telegram
+        self.assertNotIn("verbosity", telegram)
+        self.assertEqual(telegram["profiles"]["rik"]["cwd"], "/tmp")

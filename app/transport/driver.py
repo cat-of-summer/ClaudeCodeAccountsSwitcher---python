@@ -27,6 +27,7 @@ from typing import Any
 from app import wrapper
 from core import hookbus, log
 from core.store import Config
+from system import childjob
 
 INITIALIZE_TIMEOUT_SECONDS = 60.0
 CONTROL_TIMEOUT_SECONDS = 30.0
@@ -137,6 +138,9 @@ class Driver:
             )
         except OSError as exc:
             raise DriverError(str(exc)) from exc
+        # Whatever becomes of this process, claude goes with it: a window
+        # closed with the X used to leave one behind holding a slot.
+        childjob.adopt(self.process)
         self.started_at = time.time()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
@@ -168,6 +172,7 @@ class Driver:
         """End the session politely: no more input, then wait a little."""
         if self.process is None:
             return
+        childjob.forget(self.process)
         with contextlib.suppress(OSError, ValueError):
             if self.process.stdin:
                 self.process.stdin.close()
@@ -262,7 +267,15 @@ class Driver:
                 self.model = str(message.get("model") or "")
                 tools = message.get("tools")
                 self.tools = [tool for tool in tools if isinstance(tool, str)] if isinstance(tools, list) else []
-                self._emit("init", session_id=self.session_id, model=self.model, cwd=str(message.get("cwd") or ""))
+                self._emit(
+                    "init",
+                    session_id=self.session_id,
+                    model=self.model,
+                    cwd=str(message.get("cwd") or ""),
+                    # claude spells it camelCase here and snake_case in hook
+                    # payloads; the transport only ever sees this one name.
+                    permission_mode=str(message.get("permissionMode") or ""),
+                )
             return
 
         if kind == "assistant":

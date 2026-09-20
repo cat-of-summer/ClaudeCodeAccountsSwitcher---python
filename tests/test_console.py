@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import unittest
 from unittest import mock
 
@@ -110,3 +111,26 @@ class TestRepair(unittest.TestCase):
             mock.patch.object(console, "_snapshot_windows", return_value=None),
         ):
             self.assertFalse(console.repair())
+
+
+class QuietWindow(unittest.TestCase):
+    """The mode a mirroring window wants: no QuickEdit, nothing to type into."""
+
+    def test_quick_edit_is_off_and_extended_flags_on(self) -> None:
+        mode = console.quiet_input_mode()
+        # QuickEdit is the trap: a click in the window blocks every write
+        # until it is dismissed, which reads as "the integration froze".
+        self.assertFalse(mode & console.ENABLE_QUICK_EDIT_MODE)
+        # Without this bit the console ignores the absence of QuickEdit.
+        self.assertTrue(mode & console.ENABLE_EXTENDED_FLAGS)
+        self.assertFalse(mode & console.ENABLE_LINE_INPUT)
+        self.assertFalse(mode & console.ENABLE_ECHO_INPUT)
+
+    def test_the_sane_mode_still_lets_a_person_type(self) -> None:
+        sane = console.sane_input_mode()
+        self.assertTrue(sane & console.ENABLE_LINE_INPUT)
+        self.assertTrue(sane & console.ENABLE_QUICK_EDIT_MODE)
+
+    @unittest.skipIf(os.name == "nt", "the registry-free path is what is checked here")
+    def test_quiet_is_a_no_op_away_from_windows(self) -> None:
+        self.assertIsNone(console.quiet())

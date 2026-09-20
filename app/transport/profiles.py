@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core import claudecfg
 from core.store import DEFAULT_PROFILE, DEFAULT_TELEGRAM_PROFILE, Config
 
 # A chat entry is the chat id, optionally narrowed to one forum topic:
@@ -52,6 +53,9 @@ class Profile:
     slot: int = 0
     daemon: bool = False
     multi: bool = False
+    tech: bool = False
+    expanded: bool = False
+    mode: str = ""
     users: tuple[int, ...] = ()
     args: tuple[str, ...] = field(default_factory=tuple)
 
@@ -80,6 +84,20 @@ class Profile:
             return False
         return not self.users or user_id in self.users
 
+    def resolve_mode(self, config: Config, cwd: Path | None = None) -> str:
+        """The mode this profile will start in, worked out without starting.
+
+        The profile wins; otherwise the flags ccas already passes decide (the
+        skip flag *is* bypass); otherwise claude's own `permissions.defaultMode`
+        from its settings. Empty means the mode that asks about everything.
+        """
+        if self.mode:
+            return self.mode
+        skip = "--dangerously-skip-permissions"
+        if skip in config.default_args or skip in self.args:
+            return "bypassPermissions"
+        return claudecfg.default_permission_mode(cwd)
+
     def resolve_cwd(self, config: Config) -> Path:
         for candidate in (self.cwd, str(config.telegram.get("workdir") or "")):
             if candidate and Path(candidate).is_dir():
@@ -93,6 +111,9 @@ class Profile:
             "slot": self.slot,
             "daemon": self.daemon,
             "multi": self.multi,
+            "tech": self.tech,
+            "expanded": self.expanded,
+            "mode": self.mode,
             "users": list(self.users),
             "args": list(self.args),
         }
@@ -109,6 +130,9 @@ class Profile:
             slot=int(merged.get("slot") or 0),
             daemon=bool(merged.get("daemon")),
             multi=bool(merged.get("multi")),
+            tech=bool(merged.get("tech")),
+            expanded=bool(merged.get("expanded")),
+            mode=str(merged.get("mode") or ""),
             users=tuple(users),
             args=tuple(str(part) for part in (merged.get("args") or [])),
         )
@@ -182,7 +206,13 @@ def describe(profile: Profile) -> str:
         flags.append("daemon")
     if profile.multi:
         flags.append("multi")
+    if profile.tech:
+        flags.append("tech")
+    if profile.expanded:
+        flags.append("expanded")
     parts = [f"chats {chats}"]
+    if profile.mode:
+        parts.append(profile.mode)
     if profile.slot:
         parts.append(f"slot {profile.slot}")
     if profile.cwd:

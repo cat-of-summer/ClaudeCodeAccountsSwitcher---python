@@ -10,9 +10,9 @@ their own, keyed by `(chat, thread, user)`. That is the difference between
 a shared workroom and a bot that answers each person privately, and it is
 the one thing a group chat gets wrong by default.
 
-The console window belongs to the process, not to a conversation: every
-conversation's lines are mirrored there with a short tag, and what is typed
-goes to the one that spoke last, or to `#tag text` by name.
+The console window is a journal and nothing else: every conversation's lines
+are mirrored there with a short tag, and nothing is read back from it -- a
+stray keystroke in that window used to reach the agent as a prompt.
 """
 
 from __future__ import annotations
@@ -29,10 +29,12 @@ from typing import Any
 from app.transport import daemonlink
 from app.transport import poller as poller_module
 from app.transport import profiles as profiles_module
+from app.transport import conversation as conversation_module
 from app.transport.conversation import ChatTarget, Conversation
 from app.transport.profiles import Profile
 from core import log, telegram
 from core.store import Config
+from system import childjob, console
 from ui.i18n import t
 
 FEED_WAIT_SECONDS = 25
@@ -41,6 +43,9 @@ FEED_FAILURES_BEFORE_TAKEOVER = 3
 LOCK_REFRESH_SECONDS = 60.0
 TICK_SECONDS = 1.0
 DEFAULT_MAX_SESSIONS = 8
+DEFAULT_IDLE_HOURS = 6.0
+# Separates this transport's tag from the conversation's within it: "t1.2".
+CONVERSATION_SEPARATOR = "."
 
 
 class Transport:
@@ -72,15 +77,20 @@ class Transport:
 
         limit = config.telegram.get("maxSessions")
         self.max_sessions = int(limit) if isinstance(limit, (int, float)) and limit else DEFAULT_MAX_SESSIONS
+        hours = config.telegram.get("idleHours")
+        hours = float(hours) if isinstance(hours, (int, float)) else DEFAULT_IDLE_HOURS
+        self.idle_seconds = hours * 3600.0
+        self.started_at = time.time()
 
         self.conversations: dict[tuple[int, int, int], Conversation] = {}
         self._lock = threading.Lock()
         self._inbox: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._stop = threading.Event()
         self._counter = 0
-        self._last_active: Conversation | None = None
         self._refused: set[tuple[int, int, int]] = set()
         self.poller: poller_module.Poller | None = None
+        self._console_state: Any = None
+        self._last_seen = time.time()
         self._feed_port = 0
         self._last_lock_refresh = 0.0
         self.exit_code = 0
@@ -91,8 +101,11 @@ class Transport:
         """Listen until every conversation is done and the chat goes quiet."""
         if not self._attach():
             return 2
-        if sys.stdin is not None and sys.stdin.isatty():
-            threading.Thread(target=self._console_loop, daemon=True, name="console").start()
+        # Nothing is read from the window: a stray keystroke used to reach
+        # the agent as a prompt. QuickEdit is the other half of that story --
+        # a click in the window blocks every write until it is dismissed.
+        self._console_state = console.quiet()
+        childjob.on_close(self._detach)
         self._console(
             t(
                 "tg.transport_ready",
@@ -101,6 +114,7 @@ class Transport:
                 cwd=self.cwd,
             )
         )
+        self._greet()
         try:
             self._loop()
         finally:
@@ -150,6 +164,8 @@ class Transport:
         if self.poller is not None:
             self.poller.stop()
             poller_module.release(self.bot.id)
+        childjob.kill_all()
+        console.restore(self._console_state)
 
     # -- the feed ----------------------------------------------------------
 
@@ -200,6 +216,7 @@ class Transport:
                     self._feed_port = int(record.get("port") or self._feed_port)
 
     def deliver(self, incoming: telegram.Incoming) -> None:
+        self._last_seen = time.time()
         self._inbox.put(("incoming", incoming))
 
     def _on_busy(self, reason: str) -> None:
@@ -219,8 +236,6 @@ class Transport:
                 return
             if kind == "incoming":
                 self._on_incoming(item)
-            elif kind == "line":
-                self._on_typed(item)
             elif kind == "busy":
                 self._console(t("tg.token_busy", reason=item))
                 return
@@ -229,6 +244,40 @@ class Transport:
         if self.poller is not None and time.time() - self._last_lock_refresh > LOCK_REFRESH_SECONDS:
             self._last_lock_refresh = time.time()
             poller_module.refresh(self.bot.id)
+        self._retire_idle()
+
+    def _retire_idle(self) -> None:
+        """Let go of what nobody has talked to in a long while.
+
+        A conversation is a claude holding a slot and a few hundred megabytes;
+        after hours of silence it is only costing memory, and the next message
+        starts a fresh one anyway. The window itself closes too, but only when
+        the daemon can raise this profile again -- otherwise the chat would go
+        deaf with nobody to wake it.
+        """
+        if not self.idle_seconds:
+            return
+        now = time.time()
+        with self._lock:
+            stale = [c for c in self.conversations.values() if now - c.last_seen > self.idle_seconds]
+        for conversation in stale:
+            log.write(f"transport: conversation {conversation.tag} idle, closing")
+            conversation.close()
+        if stale:
+            return
+
+        with self._lock:
+            empty = not self.conversations
+        if not empty or now - self._last_activity() <= self.idle_seconds:
+            return
+        if self.profile.daemon and daemonlink.read_daemon() is not None:
+            log.write("transport: idle with nothing running; the daemon can raise us again")
+            self._stop.set()
+
+    def _last_activity(self) -> float:
+        with self._lock:
+            seen = [c.last_seen for c in self.conversations.values()]
+        return max([self.started_at, *seen, self._last_seen])
 
     # -- routing inside the profile ----------------------------------------
 
@@ -249,13 +298,15 @@ class Transport:
         if not self.profile.allows(incoming.user_id, profiles_module.global_users(self.config)):
             return
 
-        key = self._key(incoming)
         if incoming.is_callback:
-            conversation = self._find(key)
+            # By tag, not by who pressed: in a shared chat the button may be
+            # answered by someone whose own conversation is a different one.
+            conversation = self._by_tag(incoming.callback_data.split(":", 1)[0])
             if conversation is not None:
                 conversation.deliver(incoming)
-                self._last_active = conversation
             return
+
+        key = self._key(incoming)
 
         body = self._strip(incoming.text)
         if body is None:
@@ -266,15 +317,14 @@ class Transport:
             conversation = self._open(incoming, key)
             if conversation is None:
                 return
-        self._last_active = conversation
         conversation.deliver(_retext(incoming, body))
 
     def _strip(self, text: str) -> str | None:
         """Take the prefix and our own name off a line, or refuse it.
 
-        The daemon has already decided the line is this profile's, but a
-        transport polling on its own has not -- so the same rules are applied
-        here, and both cases behave alike.
+        A named profile answers only what says its name -- every time, not
+        just the first. The daemon applies the same rule; doing it here too
+        is what keeps a transport polling on its own behaving alike.
         """
         line = text.strip()
         prefixed = False
@@ -283,8 +333,8 @@ class Transport:
             prefixed = True
 
         head, _, tail = line.partition(" ")
-        if self.profile.alias and head == self.profile.alias:
-            return tail.strip()
+        if self.profile.alias:
+            return tail.strip() if head == self.profile.alias else None
         if self.prefix and not prefixed and not line.startswith("/"):
             return None
         return line
@@ -292,6 +342,10 @@ class Transport:
     def _find(self, key: tuple[int, int, int]) -> Conversation | None:
         with self._lock:
             return self.conversations.get(key)
+
+    def _by_tag(self, tag: str) -> Conversation | None:
+        with self._lock:
+            return next((c for c in self.conversations.values() if c.tag == tag), None)
 
     def _open(self, incoming: telegram.Incoming, key: tuple[int, int, int]) -> Conversation | None:
         with self._lock:
@@ -302,7 +356,7 @@ class Transport:
                 self._say(incoming, t("tg.too_many", count=self.max_sessions))
                 return None
             self._counter += 1
-            tag = f"{self.tag}{self._counter}"
+            tag = f"{self.tag}{CONVERSATION_SEPARATOR}{self._counter}"
             conversation = Conversation(
                 self.config,
                 slot=self.slot,
@@ -332,8 +386,6 @@ class Transport:
             self.conversations.pop(conversation.key, None)
             self._refused.discard(conversation.key)
             remaining = len(self.conversations)
-        if self._last_active is conversation:
-            self._last_active = None
         log.write(f"transport: conversation {conversation.tag} ended, {remaining} left")
         # A transport started by hand for one chat is done when its only
         # conversation is; one serving a profile keeps listening.
@@ -342,41 +394,6 @@ class Transport:
             self._stop.set()
 
     # -- the console window -------------------------------------------------
-
-    def _console_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                line = sys.stdin.readline()
-            except (OSError, ValueError):
-                return
-            if not line:
-                return
-            self._inbox.put(("line", line.rstrip("\r\n")))
-
-    def _on_typed(self, text: str) -> None:
-        line = text.strip()
-        if not line:
-            return
-        if line.startswith("#"):
-            head, _, tail = line[1:].partition(" ")
-            with self._lock:
-                target = next(
-                    (c for c in self.conversations.values() if c.tag == head or c.tag.endswith(head)),
-                    None,
-                )
-            if target is None:
-                self._console(t("tg.console_no_such", tag=head))
-                return
-            self._last_active = target
-            target.type_line(tail.strip())
-            return
-        if self._last_active is None:
-            with self._lock:
-                self._last_active = next(iter(self.conversations.values()), None)
-        if self._last_active is None:
-            self._console(t("tg.console_nobody"))
-            return
-        self._last_active.type_line(line)
 
     def _console(self, text: str) -> None:
         if sys.stdout is None:
@@ -391,6 +408,32 @@ class Transport:
             self.bot.send_message(
                 incoming.chat_id, text, thread_id=incoming.thread_id, reply_to=incoming.message_id
             )
+
+    def _greet(self) -> None:
+        """One line into the chat when the profile comes up.
+
+        The only message the transport sends on its own: what mode the agent
+        will be in and how to change it. Details about the slot, directory and
+        session id stay in the console window, where they are of use.
+        """
+        chat = self.chat or next((ref[0] for ref in self.profile.chats), 0)
+        if not chat:
+            return  # nothing to greet: the profile has no chat of its own yet
+        thread = self.thread or next((ref[1] for ref in self.profile.chats), 0)
+        mode = self.profile.resolve_mode(self.config, self.cwd)
+        text = t(
+            "tg.greeting",
+            mode=conversation_module.mode_line(mode),
+            modes="  ".join(conversation_module.MODE_COMMANDS),
+            address=(
+                t("tg.greeting_alias", alias=self.profile.alias)
+                if self.profile.alias
+                else t("tg.greeting_plain")
+            ),
+        )
+        self._console(telegram.strip_html(text))
+        with contextlib.suppress(telegram.TelegramError, telegram.Unreachable):
+            self.bot.send_message(chat, text, thread_id=thread)
 
     def _chats_text(self) -> str:
         if self.chat:

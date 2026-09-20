@@ -50,13 +50,11 @@ DEFAULT_TELEGRAM: dict[str, Any] = {
     "workdir": "",
     "roots": [],
     "console": True,
-    "verbosity": "tools",
     "promptTimeoutMinutes": 0,
     "maxSessions": 8,
+    "idleHours": 6,
     "profiles": {},
 }
-
-TELEGRAM_VERBOSITIES = ("text", "tools", "all")
 
 # The profile every unaliased message belongs to. It always exists, even when
 # the config file has never heard of it.
@@ -68,6 +66,15 @@ DEFAULT_TELEGRAM_PROFILE: dict[str, Any] = {
     "slot": 0,
     "daemon": False,
     "multi": False,
+    # Off on purpose: a chat wants the agent's answers, not a line per tool
+    # call -- the console window has those. Likewise a turn is one message
+    # that gets rewritten, since the last thing said is the part worth
+    # reading; `expanded` brings back the stream of messages.
+    "tech": False,
+    "expanded": False,
+    # Empty means "whatever claude would start in": its own
+    # permissions.defaultMode, or bypass when ccas passes the skip flag.
+    "mode": "",
     "users": [],
     "args": [],
 }
@@ -395,6 +402,9 @@ def migrate_config() -> bool:
     `telegram.chat`/`thread` becomes the default profile's chat list and
     `telegram.daemon` becomes that profile's own flag, so a config written
     before profiles existed keeps behaving the way it did.
+
+    Schema 6 drops `telegram.verbosity`: how much a chat sees is now the
+    profile's `tech` flag, and it starts off for everyone.
     """
     if not is_installed():
         return False
@@ -412,6 +422,10 @@ def migrate_config() -> bool:
 
     if config.schema < 5:
         config.telegram = _telegram_to_profiles(config.telegram)
+    if config.schema < 6:
+        config.telegram = {
+            key: value for key, value in config.telegram.items() if key != "verbosity"
+        }
 
     config.schema = SCHEMA_VERSION
     config.save()

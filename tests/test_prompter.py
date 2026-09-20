@@ -163,3 +163,56 @@ class Permissions(TempHome):
         self.assertEqual(describe("Bash", {"command": "ls", "description": "list"}), "ls")
         self.assertTrue(describe("Write", {"file_path": "f", "content": "body"}).startswith("file_path: f\nbody"))
         self.assertEqual(describe("Odd", {"k": 1}), '{"k": 1}')
+
+
+def plan(request_id: str, text: str = "Do the thing") -> Event:
+    return Event(
+        "ask",
+        {"request_id": request_id, "tool_name": "ExitPlanMode", "input": {"plan": text}, "suggestions": []},
+    )
+
+
+class LeavingPlanMode(TempHome):
+    """Approving the plan is also where the next mode is chosen."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.driver = FakeDriver()
+        self.prompter = Prompter(self.driver)  # type: ignore[arg-type]
+
+    def test_the_plan_is_shown_with_a_way_out(self) -> None:
+        prompt = self.prompter.on_ask(plan("p1", "Rewrite the parser"))
+        self.assertIn("Rewrite the parser", prompt.text)
+        labels = [choice.label for row in prompt.rows for choice in row]
+        self.assertEqual(len(labels), 3)
+
+    def test_approving_switches_the_mode_in_the_same_answer(self) -> None:
+        prompt = self.prompter.on_ask(plan("p2"))
+        outcome = self.prompter.on_callback(prompt.rows[0][0].data)  # go ahead
+        self.assertEqual(outcome.mode, "acceptEdits")
+        request_id, result, _ = self.driver.responses[-1]
+        self.assertEqual(request_id, "p2")
+        assert result is not None
+        self.assertEqual(result["behavior"], "allow")
+        self.assertEqual(
+            result["updatedPermissions"],
+            [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}],
+        )
+
+        prompt = self.prompter.on_ask(plan("p3"))
+        self.prompter.on_callback(prompt.rows[0][1].data)  # go, but ask
+        self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "manual")  # type: ignore[index]
+
+    def test_sending_it_back_is_a_denial_with_a_reason(self) -> None:
+        prompt = self.prompter.on_ask(plan("p4"))
+        outcome = self.prompter.on_callback(prompt.rows[1][0].data)
+        self.assertEqual(outcome.mode, "")
+        result = self.driver.responses[-1][1]
+        assert result is not None
+        self.assertEqual(result["behavior"], "deny")
+        self.assertTrue(result["message"])
+
+    def test_a_typed_digit_does_not_mean_allow_here(self) -> None:
+        self.prompter.on_ask(plan("p5"))
+        self.assertTrue(self.prompter.on_text("1").consumed)
+        self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "acceptEdits")  # type: ignore[index]

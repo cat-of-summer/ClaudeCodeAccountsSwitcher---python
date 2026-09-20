@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -186,3 +187,41 @@ def known_projects() -> list[str]:
         seen.add(marker)
         found.append(str(path))
     return found
+
+
+def settings_files(cwd: Path | None = None) -> list[Path]:
+    """The settings claude reads, weakest first.
+
+    Managed policy settings are deliberately left out: ccas reports what the
+    user can change, and a policy file would only make the answer wrong in
+    the other direction if it were missing.
+    """
+    root = Path(cwd) if cwd is not None else Path.cwd()
+    return [
+        config_dir() / "settings.json",
+        root / ".claude" / "settings.json",
+        root / ".claude" / "settings.local.json",
+    ]
+
+
+def default_permission_mode(cwd: Path | None = None) -> str:
+    """The mode claude would start in, without starting it.
+
+    `permissions.defaultMode` in the settings chain, later files winning, the
+    way claude resolves it. Empty when nothing says -- which means claude's
+    own default, the one that asks.
+    """
+    mode = ""
+    for path in settings_files(cwd):
+        raw = None
+        with contextlib.suppress(OSError, ValueError):
+            raw = read_json(path)
+        if not isinstance(raw, dict):
+            continue
+        permissions = raw.get("permissions")
+        if not isinstance(permissions, dict):
+            continue
+        found = permissions.get("defaultMode")
+        if isinstance(found, str) and found.strip():
+            mode = found.strip()
+    return mode

@@ -278,12 +278,36 @@ class Bot:
         with contextlib.suppress(TelegramError):
             self.call("editMessageReplyMarkup", params)
 
-    def edit_text(self, chat_id: int, message_id: int, text: str, *, parse_mode: str | None = "HTML") -> None:
+    def edit_text(
+        self, chat_id: int, message_id: int, text: str, *, parse_mode: str | None = "HTML"
+    ) -> bool:
+        """Rewrite a message; False when it is not there to rewrite.
+
+        A message the person deleted answers 400 "message to edit not found",
+        and a caller keeping one live message per turn has to know the
+        difference between that and a hiccup -- it has to start a new one.
+        Text Telegram will not parse falls back to plain, as sending does.
+        """
         params: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text[:MESSAGE_LIMIT]}
         if parse_mode:
             params["parse_mode"] = parse_mode
-        with contextlib.suppress(TelegramError):
+        try:
             self.call("editMessageText", params)
+        except TelegramError as exc:
+            if _message_gone(exc):
+                return False
+            if parse_mode is None or exc.code != 400:
+                raise
+            params.pop("parse_mode", None)
+            params["text"] = strip_html(text)[:MESSAGE_LIMIT]
+            try:
+                self.call("editMessageText", params)
+            except TelegramError as retry:
+                if _message_gone(retry):
+                    return False
+                if not _unchanged(retry):
+                    raise
+        return True
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         params: dict[str, Any] = {"callback_query_id": callback_id}
@@ -308,6 +332,21 @@ class Bot:
         if thread_id:
             params["message_thread_id"] = thread_id
         self.upload("sendDocument", params, field_name="document", filename=filename, content=content)
+
+
+# What Telegram says when the message is gone, and when the new text is the
+# same as the old -- neither is a failure worth raising.
+_GONE_MARKS = ("message to edit not found", "message can't be edited", "message to delete not found")
+_UNCHANGED_MARK = "message is not modified"
+
+
+def _message_gone(exc: TelegramError) -> bool:
+    lowered = exc.description.lower()
+    return exc.code == 400 and any(mark in lowered for mark in _GONE_MARKS)
+
+
+def _unchanged(exc: TelegramError) -> bool:
+    return exc.code == 400 and _UNCHANGED_MARK in exc.description.lower()
 
 
 def _decode(raw: bytes) -> dict[str, Any]:

@@ -94,11 +94,13 @@ class ProfileRouting(unittest.TestCase):
         assert alone is not None
         self.assertEqual((alone.profile, alone.body), ("rikroot", ""))
 
-    def test_the_one_profile_that_named_the_chat_takes_plain_lines(self) -> None:
+    def test_a_named_profile_is_deaf_to_lines_that_do_not_say_its_name(self) -> None:
+        """Its own chat included -- that is how a conversation is ended."""
         known = self.profiles(rikroot=((-5, 0),))
-        found = routing.route("build it", prefix="", profiles=known, chat=-5)
-        assert found is not None
-        self.assertEqual((found.profile, found.addressed), ("rikroot", False))
+        self.assertIsNone(routing.route("build it", prefix="", profiles=known, chat=-5))
+        named = routing.route("rikroot build it", prefix="", profiles=known, chat=-5)
+        assert named is not None
+        self.assertEqual((named.profile, named.body), ("rikroot", "build it"))
 
     def test_default_takes_what_nobody_claimed(self) -> None:
         known = self.profiles(rikroot=((-5, 0),))
@@ -124,30 +126,31 @@ class ProfileRouting(unittest.TestCase):
     def test_two_profiles_on_one_chat_need_the_name(self) -> None:
         known = self.profiles(a=((-5, 0),), b=((-5, 0),))
         self.assertIsNone(routing.route("hello", prefix="", profiles=known, chat=-5))
+        self.assertIsNone(routing.route("c hello", prefix="", profiles=known, chat=-5))
         found = routing.route("b hello", prefix="", profiles=known, chat=-5)
         assert found is not None
         self.assertEqual(found.profile, "b")
 
     def test_topics_narrow_a_chat(self) -> None:
         known = self.profiles(rikroot=((-5, 7),))
-        inside = routing.route("hello", prefix="", profiles=known, chat=-5, thread=7)
-        assert inside is not None
-        self.assertEqual(inside.profile, "rikroot")
+        # The claimed topic is the agent's, so plain talk there is nobody's;
+        # the rest of the chat is ordinary and belongs to default.
+        self.assertIsNone(routing.route("hello", prefix="", profiles=known, chat=-5, thread=7))
         outside = routing.route("hello", prefix="", profiles=known, chat=-5, thread=8)
         assert outside is not None
         self.assertEqual(outside.profile, "default")
 
     def test_the_prefix_is_required_but_never_for_names_or_commands(self) -> None:
         known = self.profiles(rikroot=((-5, 0),))
-        self.assertIsNone(routing.route("hello", prefix="cc:", profiles=known, chat=-5))
-        with_prefix = routing.route("cc: hello", prefix="cc:", profiles=known, chat=-5)
+        self.assertIsNone(routing.route("hello", prefix="cc:", profiles=known, chat=-9))
+        with_prefix = routing.route("cc: hello", prefix="cc:", profiles=known, chat=-9)
         assert with_prefix is not None
-        self.assertEqual((with_prefix.profile, with_prefix.body), ("rikroot", "hello"))
+        self.assertEqual((with_prefix.profile, with_prefix.body), ("default", "hello"))
 
         by_name = routing.route("rikroot hello", prefix="cc:", profiles=known, chat=-9)
         assert by_name is not None
         self.assertEqual(by_name.profile, "rikroot")
 
-        command = routing.route("/claude", prefix="cc:", profiles=known, chat=-5)
+        command = routing.route("/claude", prefix="cc:", profiles=known, chat=-9)
         assert command is not None
         self.assertEqual(command.body, "/claude")
