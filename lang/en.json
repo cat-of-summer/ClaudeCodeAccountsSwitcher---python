@@ -253,7 +253,6 @@
   "tg.switch_bad": "no usable slot '{target}'. See: ccas list",
   "tg.switch_none": "no other slot with quota left",
   "tg.switch_same": "already on slot {slot}",
-  "tg.switching": "🔀 switching to slot {slot} ({label}), the conversation continues…",
   "tg.switch_button": "🔀 switch to slot {slot}",
   "tg.rate_limited": "🛑 slot {slot} hit its limit ({window})",
   "tg.rate_limited_hint": "slot {slot} ({label}) is free: /switch {slot}",
@@ -337,7 +336,7 @@
   "profile.reset": "profile {name} reset to its defaults",
   "profile.no_such": "there is no profile '{name}'. Known: {names}",
   "profile.runs_in": "runs in {path}",
-  "profile.hint": "Change: ccas profile set <name> --cwd <dir> --chat <id> [--daemon on] [--multi on]. Raise by hand: claude -t telegram -n <name>",
+  "profile.hint": "Change: ccas profile set <name> [--cwd <dir>] [--chat <id>] [--slot N] [--mode plan] [--daemon on] [--multi on] [--tech on] [--expanded on] [--users …] [--args \"…\"]. Raise by hand: claude -t telegram -n <name>",
   "config.label_telegram-max-sessions": "sessions at once",
   "config.help_telegram-max-sessions": "how many claude sessions one profile may hold at the same time; with per-person sessions a busy group reaches this quickly",
   "daemon.not_running": "profile '{name}' is not running. Start it on the PC (claude -t telegram -n {name}), or /claude here, or let the daemon raise it: ccas profile set {name} --daemon on",
@@ -352,9 +351,7 @@
   "cli.help.profile_expanded": "on/off: a message per block (on) or one message per turn, rewritten (off)",
   "cli.help.profile_mode": "permission mode to start in: plan, acceptEdits, auto, dontAsk, manual, bypassPermissions; empty means claude's own default",
   "profile.bad_mode": "'{mode}' is not a permission mode. Known: {modes}",
-  "tg.greeting": "{mode} · modes: {modes} · /help — the rest\n{address}",
-  "tg.greeting_alias": "Say <b>{alias}</b> at the start of a message to reach the agent; without it nothing is sent.",
-  "tg.greeting_plain": "Write here and the message goes to the agent.",
+  "tg.greeting": "{mark} Mode: <b>{mode}</b>\n🏷 Agent alias: <b>{alias}</b>\nModes: {modes}\nHelp: /help",
   "tg.mode_now": "mode: {mode}",
   "tg.plan_ready": "The plan is ready",
   "tg.plan_go": "✅ Go ahead",
@@ -363,5 +360,7 @@
   "tg.plan_accepted": "plan accepted, mode {mode}",
   "tg.plan_revise_reason": "The user wants the plan revised before it is carried out.",
   "config.label_telegram-idle-hours": "idle timeout, hours",
-  "config.help_telegram-idle-hours": "how long a session may sit with nobody talking to it before it is closed and its memory given back; the window closes too when the daemon can raise the profile again (0 - never)"
+  "config.help_telegram-idle-hours": "how long a session may sit with nobody talking to it before it is closed and its memory given back; the window closes too when the daemon can raise the profile again (0 - never)",
+  "tg.greeting_no_alias": "none — just write here",
+  "tg.limit_switched": "🛑 limit reached on slot {from_slot}, carrying on with slot {to_slot} ({label})"
 }

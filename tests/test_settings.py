@@ -233,3 +233,22 @@ class TestConfigCommand(TempHome):
         self.assertEqual(Config.load().auto_switch["maxWaitSeconds"], 45 * 60)
         with self.assertRaises(settings.SettingError):
             settings.parse(setting, "100000")
+
+
+class ResumePromptWording(TempHome):
+    """The stock sentence changes; a sentence the user wrote does not."""
+
+    def test_an_old_stock_sentence_is_replaced(self) -> None:
+        config = Config()
+        config.auto_switch = {**config.auto_switch, "resumePrompt": store.LEGACY_RESUME_PROMPTS[2]}
+        config.save()
+        self.assertTrue(store.refresh_resume_prompt())
+        self.assertEqual(Config.load().auto_switch["resumePrompt"], store.default_resume_prompt())
+        self.assertFalse(store.refresh_resume_prompt())
+
+    def test_a_sentence_of_the_users_own_is_kept(self) -> None:
+        config = Config()
+        config.auto_switch = {**config.auto_switch, "resumePrompt": "keep going, quietly"}
+        config.save()
+        self.assertFalse(store.refresh_resume_prompt())
+        self.assertEqual(Config.load().auto_switch["resumePrompt"], "keep going, quietly")

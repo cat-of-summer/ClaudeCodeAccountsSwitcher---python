@@ -253,7 +253,6 @@
   "tg.switch_bad": "нет пригодного слота '{target}'. См.: ccas list",
   "tg.switch_none": "другого слота с остатком квоты нет",
   "tg.switch_same": "уже на слоте {slot}",
-  "tg.switching": "🔀 переключаюсь на слот {slot} ({label}), разговор продолжается…",
   "tg.switch_button": "🔀 на слот {slot}",
   "tg.rate_limited": "🛑 слот {slot} упёрся в лимит ({window})",
   "tg.rate_limited_hint": "слот {slot} ({label}) свободен: /switch {slot}",
@@ -337,7 +336,7 @@
   "profile.reset": "профиль {name} сброшен к значениям по умолчанию",
   "profile.no_such": "профиля '{name}' нет. Известные: {names}",
   "profile.runs_in": "работает в {path}",
-  "profile.hint": "Изменить: ccas profile set <имя> --cwd <каталог> --chat <id> [--daemon on] [--multi on]. Поднять руками: claude -t telegram -n <имя>",
+  "profile.hint": "Изменить: ccas profile set <имя> [--cwd <каталог>] [--chat <id>] [--slot N] [--mode plan] [--daemon on] [--multi on] [--tech on] [--expanded on] [--users …] [--args \"…\"]. Поднять руками: claude -t telegram -n <имя>",
   "config.label_telegram-max-sessions": "сессий одновременно",
   "config.help_telegram-max-sessions": "сколько сессий claude один профиль держит одновременно; при сессии на каждого участника людный чат упирается в это быстро",
   "daemon.not_running": "профиль '{name}' не запущен. Подними на ПК (claude -t telegram -n {name}), или /claude здесь, или разреши демону: ccas profile set {name} --daemon on",
@@ -352,9 +351,7 @@
   "cli.help.profile_expanded": "on/off: сообщение на каждый блок (on) или одно сообщение на ход с перезаписью (off)",
   "cli.help.profile_mode": "режим разрешений при старте: plan, acceptEdits, auto, dontAsk, manual, bypassPermissions; пусто — как у самого claude",
   "profile.bad_mode": "'{mode}' — не режим разрешений. Известные: {modes}",
-  "tg.greeting": "{mode} · режимы: {modes} · /help — остальное\n{address}",
-  "tg.greeting_alias": "Пиши <b>{alias}</b> в начале сообщения, чтобы обратиться к агенту; без этого ничего не уходит.",
-  "tg.greeting_plain": "Пиши сюда — сообщение уходит агенту.",
+  "tg.greeting": "{mark} Выбранный режим: <b>{mode}</b>\n🏷 Алиас агента: <b>{alias}</b>\nРежимы работы: {modes}\nСправка: /help",
   "tg.mode_now": "режим: {mode}",
   "tg.plan_ready": "План готов",
   "tg.plan_go": "✅ Выполнять",
@@ -363,5 +360,7 @@
   "tg.plan_accepted": "план принят, режим {mode}",
   "tg.plan_revise_reason": "Пользователь просит доработать план, прежде чем выполнять.",
   "config.label_telegram-idle-hours": "таймаут простоя, часов",
-  "config.help_telegram-idle-hours": "сколько сессия может простоять без сообщений, прежде чем закроется и вернёт память; окно тоже закрывается, если демон сможет поднять профиль заново (0 — никогда)"
+  "config.help_telegram-idle-hours": "сколько сессия может простоять без сообщений, прежде чем закроется и вернёт память; окно тоже закрывается, если демон сможет поднять профиль заново (0 — никогда)",
+  "tg.greeting_no_alias": "нет — просто пиши сюда",
+  "tg.limit_switched": "🛑 достигнут лимит на слоте {from_slot}, продолжаю на слоте {to_slot} ({label})"
 }

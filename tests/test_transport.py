@@ -200,3 +200,20 @@ class ProfileSavedFromTheChat(TransportBase):
         saved = profiles_module.load(Config.load())["rikroot"]
         self.assertEqual(saved.chats, ((CHAT, 0),))
         self.assertEqual(saved.cwd, str(self.home))
+
+
+class Greeting(TransportBase):
+    def test_one_line_with_the_mode_and_the_alias(self) -> None:
+        transport = self.transport(Profile(name="rikroot", chats=((CHAT, 0),), mode="plan"))
+        transport._greet()
+        text = self.bot.texts()[-1]
+        self.assertIn("🟡", text)
+        self.assertIn("plan", text)
+        self.assertIn("rikroot", text)
+        self.assertIn("/plan", text)
+        self.assertIn("/help", text)
+
+    def test_nothing_to_greet_without_a_chat(self) -> None:
+        transport = self.transport(Profile(name="default"))
+        transport._greet()
+        self.assertEqual(self.bot.sent, [])

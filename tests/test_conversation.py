@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ class FakeBot:
         self.edits: list[dict[str, Any]] = []
         self.cleared: list[int] = []
         self.deleted: set[int] = set()
+        self.deleted_messages: list[int] = []
         self.answered: list[tuple[str, str]] = []
 
     def send_message(
@@ -52,6 +54,9 @@ class FakeBot:
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         self.answered.append((callback_id, text))
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        self.deleted_messages.append(message_id)
 
     def typing(self, chat_id: int, *, thread_id: int = 0) -> None:
         return
@@ -323,3 +328,75 @@ class Directories(TempHome):
         self.assertEqual(resolve_dir(str(inside), Path("/"), roots=[str(self.home)]), inside.resolve())
         self.assertIsNone(resolve_dir(str(inside), Path("/"), roots=[str(self.home / "elsewhere")]))
         self.assertIsNone(resolve_dir("missing", self.home, roots=[]))
+
+
+class SwitchingSlots(ConversationBase):
+    """A limit is announced with a button; the switch tidies the chat up."""
+
+    def _two_slots(self) -> None:
+        from core import store
+        from core.store import Accounts, Slot
+
+        accounts = Accounts()
+        for number in (1, 2):
+            self.write_credentials(store.creds_file(number))
+            accounts.slots[number] = Slot(number=number, alias=f"s{number}")
+        accounts.save()
+
+    def test_the_limit_messages_go_and_one_line_stays(self) -> None:
+        self._two_slots()
+        config = Config.load()
+        config.auto_switch = {**config.auto_switch, "resumePrompt": "carry on"}
+        config.save()
+        conversation = self.make()
+        conversation.config = Config.load()
+
+        with mock.patch.object(conversation, "_elect", return_value=2):
+            conversation._on_event(Event("rate_limit", {"status": "rejected", "window": "five_hour"}))
+        limit_message = self.bot.sent[-1]
+        self.assertIsNotNone(limit_message["markup"])
+        self.assertEqual(conversation._limit_messages, [limit_message["id"]])
+
+        conversation._on_incoming(press(f"{conversation.tag}:sw:2"))
+        self.assertIn(limit_message["id"], self.bot.deleted_messages)
+        self.assertIn("2", self.bot.texts()[-1])
+        self.assertIn("1", self.bot.texts()[-1])
+        assert conversation._relaunch is not None
+        self.assertEqual(conversation._relaunch.slot, 2)
+        # The resumed session is told to go on, or it would sit idle until
+        # the person wrote again.
+        self.assertEqual(conversation._relaunch.prompt, "carry on")
+
+
+class WorkStaysAtTheBottom(ConversationBase):
+    """A question answered mid-turn is a record; the work moves below it."""
+
+    def test_the_working_message_is_recreated_under_an_answered_question(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("do it"))
+        conversation._on_event(Event("text", {"text": "half way"}))
+        conversation._flush_live()
+        old_live = self.bot.sent[-1]["id"]
+
+        question = {"question": "Colour?", "options": [{"label": "Red"}, {"label": "Blue"}], "multiSelect": False}
+        conversation._on_event(Event("ask", {"request_id": "q1", "tool_name": "AskUserQuestion", "input": {"questions": [question]}, "suggestions": []}))
+        asked = self.bot.sent[-1]
+        conversation._on_incoming(press(asked["markup"]["inline_keyboard"][1][0]["callback_data"]))
+
+        # The old message is gone, the same text sits below the answered
+        # question, and further work goes into the new one.
+        self.assertIn(old_live, self.bot.deleted_messages)
+        self.assertEqual(self.bot.sent[-1]["text"], "half way")
+        self.assertNotEqual(self.bot.sent[-1]["id"], old_live)
+        conversation._on_event(Event("text", {"text": "done"}))
+        conversation._flush_live()
+        self.assertEqual(self.bot.sent[-1]["text"], "done")
+        self.assertEqual(self.bot.edits[-1]["id"], self.bot.sent[-1]["id"])
+
+    def test_expanded_mode_leaves_messages_where_they_are(self) -> None:
+        conversation = self.make(expanded=True)
+        conversation._on_event(Event("text", {"text": "half way"}))
+        question = {"question": "Colour?", "options": [{"label": "Red"}], "multiSelect": False}
+        conversation._on_event(Event("ask", {"request_id": "q2", "tool_name": "AskUserQuestion", "input": {"questions": [question]}, "suggestions": []}))
+        conversation._on_incoming(press(self.bot.sent[-1]["markup"]["inline_keyboard"][0][0]["callback_data"]))
+        self.assertEqual(self.bot.deleted_messages, [])

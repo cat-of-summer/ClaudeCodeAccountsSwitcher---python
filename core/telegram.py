@@ -309,6 +309,11 @@ class Bot:
                     raise
         return True
 
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Take a message down; one already gone is not an error."""
+        with contextlib.suppress(TelegramError, Unreachable):
+            self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         params: dict[str, Any] = {"callback_query_id": callback_id}
         if text:

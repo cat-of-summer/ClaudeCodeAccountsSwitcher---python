@@ -86,6 +86,10 @@ def _plain(text: str) -> str:
 class Relaunch:
     cwd: Path | None = None
     slot: int | None = None
+    # What to say to the resumed session first. A move to another slot cuts a
+    # turn short; without a nudge the new claude sits there, resumed and
+    # idle, until the person writes again.
+    prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -158,6 +162,9 @@ class Conversation:
         self._live_edited = 0.0
         self._live_pending = ""
         self._mode_seen = False
+        # Messages about a limit, taken down once the switch has happened.
+        self._limit_messages: list[int] = []
+        self._opening_prompt = ""
         self.last_seen = time.time()
         self.exit_code = 0
         self.started_at = time.time()
@@ -204,6 +211,7 @@ class Conversation:
                     self.cwd = relaunch.cwd
                 if relaunch.slot is not None:
                     self.slot = relaunch.slot
+                self._opening_prompt = relaunch.prompt
                 self.resume = True
         finally:
             self._closing = True
@@ -262,6 +270,12 @@ class Conversation:
         # relaunch: what slot and directory a conversation runs in is what
         # the console window is for.
         self._console(self._banner() if not self.resume else t("tg.resumed", slot=self.slot, cwd=self.cwd))
+        if self._opening_prompt:
+            # stdin is buffered until claude reads it, so this can go right
+            # after the launch; the answer arrives like any other turn.
+            with contextlib.suppress(DriverError):
+                driver.send_user(self._opening_prompt)
+            self._opening_prompt = ""
 
         try:
             self._loop()
@@ -512,8 +526,17 @@ class Conversation:
         if number == self.slot:
             self._say(t("tg.switch_same", slot=number))
             return
-        self._say(t("tg.switching", slot=number, label=accounts.ensure(number).label))
-        self._relaunch = Relaunch(slot=number)
+        # The limit messages and their button have done their job: one line
+        # saying what happened is all that stays in the chat.
+        for message_id in self._limit_messages:
+            self.target.bot.delete_message(self.target.chat, message_id)
+        self._limit_messages = []
+        self._say(
+            t("tg.limit_switched", from_slot=self.slot, to_slot=number, label=_plain(accounts.ensure(number).label))
+        )
+        self._relaunch = Relaunch(
+            slot=number, prompt=str(self.config.auto_switch.get("resumePrompt") or "").strip()
+        )
 
     def _elect(self, accounts: Accounts) -> int | None:
         threshold = float(self.config.auto_switch.get("threshold") or 95)
@@ -634,7 +657,9 @@ class Conversation:
         else:
             lines.append(t("tg.switch_none"))
             markup = None
-        self._say("\n".join(lines), markup=markup)
+        sent = self._say("\n".join(lines), markup=markup)
+        if sent:
+            self._limit_messages.append(sent)
 
     # -- prompts -----------------------------------------------------------
 
@@ -659,6 +684,8 @@ class Conversation:
             self._show_prompt(outcome.next_prompt)
         elif outcome.ack and not outcome.close_prompt:
             self._console(outcome.ack)
+        if outcome.finished_request:
+            self._relocate_live()
 
     def _close_prompt(self, key: str, summary: str) -> None:
         message_id = self._prompt_messages.pop(key, 0)
@@ -710,6 +737,21 @@ class Conversation:
             # rather than lose the rest of the turn.
             self._live_id = self._say(rendered, plain=text)
 
+    def _relocate_live(self) -> None:
+        """Move the turn's message below whatever was just answered.
+
+        A question or a permission prompt lands under the working message
+        and stays there once answered -- that is fine, it is the record of
+        what was asked. But the work that follows should read at the bottom,
+        so the message is taken down and put back with the same text.
+        """
+        if self.profile.expanded or not self._live_id:
+            return
+        self.target.bot.delete_message(self.target.chat, self._live_id)
+        self._live_id = 0
+        if self._live_text:
+            self._live_id = self._say(_esc(self._live_text), plain=None, mirror=False)
+
     def _retire_live(self) -> None:
         """A new turn starts: close the old message and drop its buttons."""
         self._flush_live()
@@ -721,8 +763,16 @@ class Conversation:
 
     # -- output ------------------------------------------------------------
 
-    def _say(self, html_text: str, *, markup: dict[str, Any] | None = None, plain: str | None = None) -> int:
-        self._console(plain if plain is not None else telegram.strip_html(html_text))
+    def _say(
+        self,
+        html_text: str,
+        *,
+        markup: dict[str, Any] | None = None,
+        plain: str | None = None,
+        mirror: bool = True,
+    ) -> int:
+        if mirror:
+            self._console(plain if plain is not None else telegram.strip_html(html_text))
         reply_to, self._reply_to = self._reply_to, 0
         try:
             return self.target.bot.send_message(

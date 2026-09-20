@@ -308,6 +308,12 @@ def install(
         shim_dir=str(bin_dir()),
         language=chosen_language,
         auto_switch=auto_switch,
+        # Carried over rather than rebuilt: a reinstall is for the binary and
+        # the interception, and it used to take the bot token, the profiles
+        # and the hook handlers with it.
+        hooks_bus=previous.hooks_bus,
+        hooks=list(previous.hooks),
+        telegram=dict(previous.telegram),
     )
     config.save()
 

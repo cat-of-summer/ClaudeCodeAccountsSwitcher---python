@@ -374,6 +374,46 @@ def is_installed() -> bool:
     return config_path().exists()
 
 
+# Sentences ccas itself has put into `resumePrompt` in earlier builds, in
+# either language. Only these are swapped when the wording changes; a sentence
+# the user wrote is theirs.
+LEGACY_RESUME_PROMPTS: tuple[str, ...] = (
+    "Проверь запущенные процессы, перезапусти что отключилось, продолжай.",
+    "Carry on with the work; restart agents if needed, and if you had started processes, check how they are doing.",
+    "Продолжи работу, при необходимости перезапусти агентов и если запускал процессы - проверь их состояние.",
+)
+
+
+def stock_resume_prompts() -> set[str]:
+    """Every sentence ccas itself has ever put into `resumePrompt`."""
+    from ui import i18n
+    from ui.i18n import t
+
+    found = {sentence.strip() for sentence in LEGACY_RESUME_PROMPTS}
+    current = i18n.current_language()
+    try:
+        for code in i18n.available_languages():
+            i18n.set_language(code)
+            text = t("autoswitch.default_resume_prompt")
+            if text != "autoswitch.default_resume_prompt":
+                found.add(text.strip())
+    finally:
+        i18n.set_language(current)
+    return found
+
+
+def refresh_resume_prompt() -> bool:
+    """Swap an old stock sentence for the current one; True when it did."""
+    config = Config.load()
+    stored = str(config.auto_switch.get("resumePrompt") or "").strip()
+    wanted = default_resume_prompt()
+    if not stored or stored == wanted or stored not in stock_resume_prompts():
+        return False
+    config.auto_switch = {**config.auto_switch, "resumePrompt": wanted}
+    config.save()
+    return True
+
+
 def default_resume_prompt() -> str:
     """What to say to the resumed session so the work actually continues.
 

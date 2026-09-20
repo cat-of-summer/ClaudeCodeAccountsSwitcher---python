@@ -22,6 +22,7 @@ from core.store import (
     log_file,
     migrate_config,
     read_json,
+    refresh_resume_prompt,
     update_accounts,
 )
 from core.version import __version__
@@ -959,6 +960,8 @@ def main(argv: list[str] | None = None) -> int:
     console.repair()
     installer.apply_pending_upgrade()
     migrate_config()
+    if is_installed():
+        refresh_resume_prompt()
 
     parser = build_parser()
     args = parser.parse_args(argv[1:])

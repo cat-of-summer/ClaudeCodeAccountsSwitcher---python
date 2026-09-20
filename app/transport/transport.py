@@ -423,13 +423,10 @@ class Transport:
         mode = self.profile.resolve_mode(self.config, self.cwd)
         text = t(
             "tg.greeting",
-            mode=conversation_module.mode_line(mode),
+            mark=conversation_module.mode_mark(mode),
+            mode=mode or "default",
+            alias=self.profile.alias or t("tg.greeting_no_alias"),
             modes="  ".join(conversation_module.MODE_COMMANDS),
-            address=(
-                t("tg.greeting_alias", alias=self.profile.alias)
-                if self.profile.alias
-                else t("tg.greeting_plain")
-            ),
         )
         self._console(telegram.strip_html(text))
         with contextlib.suppress(telegram.TelegramError, telegram.Unreachable):
