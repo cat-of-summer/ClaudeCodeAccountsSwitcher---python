@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,3 +66,19 @@ class TempHome(unittest.TestCase):
         payload.update(oauth)
         store.write_json_atomic(path, {"claudeAiOauth": payload}, harden=False)
         return path
+
+    def fake_claude(self, body: str, name: str = "fake_claude") -> Path:
+        """A stand-in for the claude binary, executable on this platform.
+
+        The transport puts its own flags first, so the fake cannot ride in as
+        a default argument -- it has to *be* `real_claude_path`. Windows will
+        not exec a .py by its shebang, hence the .cmd in front of it there.
+        """
+        source = self.home / f"{name}.py"
+        source.write_text(body, encoding="utf-8")
+        if os.name == "nt":
+            shim = self.home / f"{name}.cmd"
+            shim.write_text(f'@"{sys.executable}" "{source}" %*\r\n', encoding="utf-8")
+            return shim
+        source.chmod(0o755)
+        return source

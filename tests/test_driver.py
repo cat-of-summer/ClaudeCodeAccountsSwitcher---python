@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import queue
-import sys
 
 from app.transport.driver import Driver, DriverError, Event
 from core.store import Config
@@ -76,17 +74,7 @@ sys.exit(3)
 class DriverProtocol(TempHome):
     def setUp(self) -> None:
         super().setUp()
-        # The script stands in for the claude binary itself: the driver puts
-        # its own flags first, so it cannot ride in as a default argument.
-        # Windows cannot exec a .py by its shebang, so a .cmd shim fronts it.
-        source = self.home / "fake_claude.py"
-        source.write_text(FAKE_CLAUDE, encoding="utf-8")
-        if os.name == "nt":
-            self.script = self.home / "fake_claude.cmd"
-            self.script.write_text(f'@"{sys.executable}" "{source}" %*\r\n', encoding="utf-8")
-        else:
-            self.script = source
-            self.script.chmod(0o755)
+        self.script = self.fake_claude(FAKE_CLAUDE)
         self.config = Config(real_claude_path=str(self.script), default_args=[])
         self.events: queue.Queue[Event] = queue.Queue()
         self.driver: Driver | None = None

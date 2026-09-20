@@ -48,10 +48,7 @@ def incoming(text: str, *, user: int, chat: int = CHAT, message_id: int = 1) -> 
 class TransportBase(TempHome):
     def setUp(self) -> None:
         super().setUp()
-        source = self.home / "fake_claude.py"
-        source.write_text(FAKE_CLAUDE, encoding="utf-8")
-        source.chmod(0o755)
-        config = Config(real_claude_path=str(source), default_args=[])
+        config = Config(real_claude_path=str(self.fake_claude(FAKE_CLAUDE)), default_args=[])
         config.telegram = {**config.telegram, "token": "123456:ABCDEFghijklmnopqrstuvwxyz0123456789"}
         config.save()
         self.config = Config.load()
