@@ -32,6 +32,7 @@ from app.transport.prompter import Outcome, Prompt, Prompter
 from core import hookbus, log, telegram
 from core.sessions import update_session
 from core.store import Accounts, Config, update_accounts
+from system import shell
 from ui import usage
 from ui.i18n import t
 
@@ -43,7 +44,7 @@ TOOL_RESULT_PREVIEW = 400
 # A second Ctrl-C this soon after the first ends the session instead of
 # interrupting the turn again.
 DOUBLE_INTERRUPT_SECONDS = 3.0
-HELP_COMMANDS = ("/stop", "/kill", "/status", "/usage", "/pwd", "/cd", "/switch", "/save", "/help")
+HELP_COMMANDS = ("/stop", "/kill", "/clear", "/status", "/usage", "/pwd", "/cd", "/switch", "/save", "/help")
 
 # Telegram rate-limits edits to the same message; one a second or so is what
 # a person reads anyway.
@@ -90,6 +91,9 @@ class Relaunch:
     # turn short; without a nudge the new claude sits there, resumed and
     # idle, until the person writes again.
     prompt: str = ""
+    # Start over instead of resuming: a new session id in the same directory
+    # and on the same slot, the way `/clear` does it in the TUI.
+    fresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -212,7 +216,9 @@ class Conversation:
                 if relaunch.slot is not None:
                     self.slot = relaunch.slot
                 self._opening_prompt = relaunch.prompt
-                self.resume = True
+                if relaunch.fresh:
+                    self.session_id = ""
+                self.resume = not relaunch.fresh
         finally:
             self._closing = True
             if self._on_finished is not None:
@@ -411,6 +417,13 @@ class Conversation:
             self._say(t("tg.bye", session=self.session_id[:8]))
             self._closing = True
             return True
+        if head in {"/clear", "/new"}:
+            # Headless claude has no /clear of its own: the line would go in
+            # as a prompt. A fresh session is the same thing done here.
+            self._retire_live()
+            self._say(t("tg.cleared"))
+            self._relaunch = Relaunch(fresh=True)
+            return True
         if head == "/status":
             self._say(self._status())
             return True
@@ -472,16 +485,8 @@ class Conversation:
         if not command:
             return
         try:
-            completed = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(self.cwd),
-                capture_output=True,
-                timeout=SHELL_TIMEOUT_SECONDS,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            stdout = completed.stdout.decode("utf-8", "replace")
-            stderr = completed.stderr.decode("utf-8", "replace")
+            completed = shell.run(command, cwd=self.cwd, timeout=SHELL_TIMEOUT_SECONDS)
+            stdout, stderr = completed.stdout, completed.stderr
         except subprocess.TimeoutExpired:
             stdout, stderr = "", t("tg.shell_timeout", seconds=int(SHELL_TIMEOUT_SECONDS))
         except OSError as exc:

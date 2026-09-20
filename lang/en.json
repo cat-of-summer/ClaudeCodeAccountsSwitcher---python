@@ -362,5 +362,6 @@
   "config.label_telegram-idle-hours": "idle timeout, hours",
   "config.help_telegram-idle-hours": "how long a session may sit with nobody talking to it before it is closed and its memory given back; the window closes too when the daemon can raise the profile again (0 - never)",
   "tg.greeting_no_alias": "none — just write here",
-  "tg.limit_switched": "🛑 limit reached on slot {from_slot}, carrying on with slot {to_slot} ({label})"
+  "tg.limit_switched": "🛑 limit reached on slot {from_slot}, carrying on with slot {to_slot} ({label})",
+  "tg.cleared": "🧹 Context cleared, starting a new session."
 }

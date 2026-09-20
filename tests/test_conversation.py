@@ -368,6 +368,20 @@ class SwitchingSlots(ConversationBase):
         self.assertEqual(conversation._relaunch.prompt, "carry on")
 
 
+class StartingOver(ConversationBase):
+    """`/clear` is answered here: a fresh session, not a prompt to claude."""
+
+    def test_clear_relaunches_with_a_new_session_id(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/clear"))
+        self.assertIn("🧹", self.bot.texts()[-1])
+        self.assertEqual(self.driver.sent, [])
+        assert conversation._relaunch is not None
+        self.assertTrue(conversation._relaunch.fresh)
+        self.assertIsNone(conversation._relaunch.cwd)
+        self.assertIsNone(conversation._relaunch.slot)
+
+
 class WorkStaysAtTheBottom(ConversationBase):
     """A question answered mid-turn is a record; the work moves below it."""
 

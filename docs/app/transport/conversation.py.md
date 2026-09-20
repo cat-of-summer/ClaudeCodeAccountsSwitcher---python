@@ -12,9 +12,9 @@
 
 ## Команды
 
-`/stop`, `/kill`, `/status`, `/usage`, `/pwd`, `/cd`, `/switch [слот]`, `/model`, `/mode`, `/save`, `/help`, `!cmd`. `/cd` и `/switch` не меняют процесс на лету — они завершают драйвер и поднимают новый с `--resume <session_id>` в новом каталоге или на новом слоте (`Relaunch`). `/save` дописывает текущий чат и каталог в профиль. Всё прочее уходит claude как есть.
+`/stop`, `/kill`, `/clear`, `/status`, `/usage`, `/pwd`, `/cd`, `/switch [слот]`, `/model`, `/mode`, `/save`, `/help`, `!cmd`. `/clear` — своя команда, а не строка для claude (в headless-режиме у него своего `/clear` нет): драйвер закрывается и поднимается заново с новым session id в том же каталоге и на том же слоте (`Relaunch(fresh=True)`). `/cd` и `/switch` не меняют процесс на лету — они завершают драйвер и поднимают новый с `--resume <session_id>` в новом каталоге или на новом слоте (`Relaunch`). `/save` дописывает текущий чат и каталог в профиль. Всё прочее уходит claude как есть.
 
-`!cmd` выполняется в каталоге разговора; вывод показывается и передаётся claude одним user-сообщением `<bash-input>…</bash-input><bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>` — формат снят с самого claude, так bash-режим TUI кладёт команду в контекст.
+`!cmd` выполняется в каталоге разговора через [shell.py](../../system/shell.py.md) (Windows — PowerShell, POSIX — bash); вывод показывается и передаётся claude одним user-сообщением `<bash-input>…</bash-input><bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>` — формат снят с самого claude, так bash-режим TUI кладёт команду в контекст.
 
 ## Ответы
 

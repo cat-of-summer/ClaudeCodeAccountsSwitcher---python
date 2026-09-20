@@ -77,6 +77,7 @@ HIDDEN = [
     "system.childjob",
     "system.console",
     "system.secure",
+    "system.shell",
     "ui.i18n",
     "ui.menu",
     "ui.screen",
