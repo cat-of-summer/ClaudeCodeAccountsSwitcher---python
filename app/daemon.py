@@ -31,14 +31,16 @@ from urllib.parse import parse_qs, urlsplit
 
 from app.transport import daemonlink
 from app.transport import poller as poller_module
+from app.transport import profiles as profiles_module
+from app.transport.profiles import DEFAULT_PROFILE, Profile
 from app.transport.routing import (
     CLAUDE_COMMAND,
     ClaudeCommand,
-    address,
     parse_claude_command,
+    route as route_line,
     valid_alias,
 )
-from app.transport.session import resolve_dir
+from app.transport.conversation import resolve_dir
 from core import claudecfg, log, telegram
 from core.sessions import _pid_alive
 from core.store import Config, bin_dir, manager_name, read_json, shim_name, write_json_atomic
@@ -65,20 +67,44 @@ def chats_file() -> Path:
 
 
 def configured(config: Config) -> bool:
-    settings = config.telegram
-    return telegram.looks_like_token(str(settings.get("token") or "")) and bool(int(settings.get("chat") or 0))
+    """A token is all the daemon needs; what it listens to is up to profiles."""
+    return telegram.looks_like_token(str(config.telegram.get("token") or ""))
 
 
 def ensure_running(config: Config) -> bool:
-    """Start the daemon in the background if the setting says so and it is
-    not up. Cheap when it is: one file read and one pid probe."""
-    if not config.telegram.get("daemon") or not configured(config):
+    """Start the daemon in the background unless it is already up.
+
+    Called both by a transport that wants the token multiplexed and by
+    `reconcile_autostart`; cheap when the daemon is up, since that is one
+    file read and one pid probe.
+    """
+    if not configured(config):
         return False
     if read_daemon() is not None:
         return False
     if os.environ.get("CCAS_DAEMON_CHILD"):
         return False
     return spawn_detached()
+
+
+def reconcile_autostart(config: Config) -> bool:
+    """Keep the OS autostart entry in step with the profiles.
+
+    There is no switch of its own: the daemon has to be up before anyone
+    types anything exactly when some profile may be raised on its own, and
+    that is the whole condition. Returns whether it is registered now.
+    """
+    from system import autostart
+
+    wanted = configured(config) and profiles_module.daemon_wanted(config)
+    if wanted:
+        if not autostart.is_registered():
+            autostart.register()
+        ensure_running(config)
+    else:
+        if autostart.is_registered():
+            autostart.unregister()
+    return wanted
 
 
 def spawn_detached() -> bool:
@@ -113,6 +139,7 @@ class Route:
     chat: int
     thread: int
     alias: str
+    profile: str = DEFAULT_PROFILE
     cwd: str = ""
     slot: int = 0
     seen_at: float = field(default_factory=time.time)
@@ -131,8 +158,24 @@ class Route:
             batch, self.pending = self.pending, []
             return batch
 
+    def serves(self, chat: int, thread: int) -> bool:
+        """A transport with no chat of its own takes whatever its profile is
+        routed; one started with --tg-chat is pinned to that chat."""
+        if self.chat and self.chat != chat:
+            return False
+        return not self.thread or self.thread == thread
+
     def describe(self) -> dict[str, Any]:
-        return {"pid": self.pid, "tag": self.tag, "chat": self.chat, "thread": self.thread, "alias": self.alias, "cwd": self.cwd, "slot": self.slot}
+        return {
+            "pid": self.pid,
+            "tag": self.tag,
+            "chat": self.chat,
+            "thread": self.thread,
+            "alias": self.alias,
+            "profile": self.profile,
+            "cwd": self.cwd,
+            "slot": self.slot,
+        }
 
 
 class Daemon:
@@ -140,11 +183,10 @@ class Daemon:
         self.config = config
         settings = config.telegram
         self.bot = telegram.Bot(str(settings.get("token") or ""))
-        self.chat = int(settings.get("chat") or 0)
-        self.thread = int(settings.get("thread") or 0)
         self.prefix = str(settings.get("prefix") or "")
-        self.users = [int(user) for user in (settings.get("users") or []) if str(user).strip().lstrip("-").isdigit()]
         self.routes: dict[int, Route] = {}
+        # Lines that arrived while a profile's window was still coming up.
+        self._pending: dict[str, list[telegram.Incoming]] = {}
         self._routes_lock = threading.Lock()
         self._stop = threading.Event()
         self._server: ThreadingHTTPServer | None = None
@@ -173,11 +215,14 @@ class Daemon:
         poller_module.acquire(self.bot.id, port=self.port)
         write_json_atomic(
             daemon_file(),
-            {"pid": os.getpid(), "port": self.port, "botId": self.bot.id, "chat": self.chat, "at": time.time()},
+            {"pid": os.getpid(), "port": self.port, "botId": self.bot.id, "at": time.time()},
             harden=False,
         )
-        log.write(f"daemon: up, bot {self.bot.id}, chat {self.chat}, port {self.port}")
-        _say_local(t("daemon.listening", bot=self.bot.id, chat=self.chat, port=self.port))
+        watched = [name for name, profile in self.profiles().items() if profile.daemon]
+        log.write(f"daemon: up, bot {self.bot.id}, port {self.port}, watching {watched or '-'}")
+        _say_local(
+            t("daemon.listening", bot=self.bot.id, port=self.port, profiles=", ".join(watched) or "—")
+        )
 
         self.poller = poller_module.Poller(self.bot, self.deliver, on_busy=lambda reason: self._stop.set())
         self.poller.start()
@@ -292,15 +337,18 @@ class Daemon:
         route = Route(
             pid=pid,
             tag=tag,
-            chat=int(body.get("chat") or self.chat),
+            chat=int(body.get("chat") or 0),
             thread=int(body.get("thread") or 0),
             alias=str(body.get("alias") or ""),
+            profile=str(body.get("profile") or "") or DEFAULT_PROFILE,
             cwd=str(body.get("cwd") or ""),
             slot=int(body.get("slot") or 0),
         )
         with self._routes_lock:
             self.routes[pid] = route
-        log.write(f"daemon: route {tag} pid={pid} chat={route.chat} alias={route.alias or '-'}")
+        log.write(f"daemon: route {tag} pid={pid} profile={route.profile} chat={route.chat or '*'}")
+        for queued in self._pending.pop(route.profile, []):
+            route.push(queued)
         return route
 
     def unregister(self, pid: int) -> None:
@@ -331,23 +379,23 @@ class Daemon:
             "pid": os.getpid(),
             "port": self.port,
             "botId": self.bot.id,
-            "chat": self.chat,
             "routes": routes,
             "updates": self.poller.state.updates if self.poller else 0,
         }
 
     def _routes_in(self, chat: int, thread: int) -> list[Route]:
         with self._routes_lock:
-            return [r for r in self.routes.values() if r.chat == chat and (not r.thread or r.thread == thread)]
+            return [route for route in self.routes.values() if route.serves(chat, thread)]
 
     # -- routing -----------------------------------------------------------
 
     def deliver(self, incoming: telegram.Incoming) -> None:
+        """Hand one update to the profile it belongs to, or drop it.
+
+        Nothing is listened to by default: a chat no profile claims and that
+        the default profile is not open to gets silence, not a hint.
+        """
         here = self._routes_in(incoming.chat_id, incoming.thread_id)
-        if incoming.chat_id != self.chat and not here:
-            return
-        if incoming.chat_id == self.chat and self.users and incoming.user_id not in self.users:
-            return
 
         if incoming.is_callback:
             tag = incoming.callback_data.split(":", 1)[0]
@@ -361,28 +409,47 @@ class Daemon:
             self.bot.answer_callback(incoming.callback_id, t("daemon.button_expired"))
             return
 
-        aliases = [route.alias for route in here if route.alias]
-        parsed = address(incoming.text, prefix=self.prefix, aliases=aliases)
-        if parsed is None:
+        known = self.profiles()
+        routed = route_line(
+            incoming.text,
+            prefix=self.prefix,
+            profiles=known,
+            chat=incoming.chat_id,
+            thread=incoming.thread_id,
+        )
+        if routed is None:
             return
-        if parsed.alias:
-            for route in here:
-                if route.alias == parsed.alias:
-                    route.push(incoming)
-                    return
-        body = parsed.body
-        command = parse_claude_command(body)
+        profile = known[routed.profile]
+        if not profile.allows(incoming.user_id, self._users()):
+            return
+
+        command = parse_claude_command(routed.body)
         if command is not None:
-            self._launch(command, incoming)
+            # Checked before the running transport is handed the line: to a
+            # conversation `/claude ...` is just text, and the one thing it
+            # certainly means is "start something".
+            # An explicit request from someone allowed here is honoured even
+            # when the profile is not one the daemon may raise on its own.
+            self._launch(command, incoming, profile)
             return
-        if body.startswith("/") and self._own_command(body, incoming):
+
+        for existing in here:
+            if existing.profile == profile.name:
+                existing.push(incoming)
+                return
+
+        if routed.body.startswith("/") and self._own_command(routed.body, incoming):
             return
-        nameless = [route for route in here if not route.alias]
-        if nameless:
-            nameless[-1].push(incoming)
+
+        if profile.daemon:
+            self._pending.setdefault(profile.name, []).append(incoming)
+            bare = parse_claude_command(CLAUDE_COMMAND)
+            assert bare is not None
+            self._launch(bare, incoming, profile, quiet=True)
             return
-        if body.startswith("/") or self.prefix:
-            self._say(incoming, t("daemon.no_session"))
+
+        if routed.addressed or routed.body.startswith("/"):
+            self._say(incoming, t("daemon.not_running", name=profile.alias or DEFAULT_PROFILE))
 
     def _say(self, incoming: telegram.Incoming, text: str, *, markup: dict[str, Any] | None = None) -> None:
         with contextlib.suppress(telegram.TelegramError, telegram.Unreachable):
@@ -497,10 +564,13 @@ class Daemon:
     def _sessions_text(self, incoming: telegram.Incoming) -> str:
         here = self._routes_in(incoming.chat_id, incoming.thread_id)
         if not here:
-            return t("daemon.no_session")
+            return t("daemon.nothing_running")
         lines = []
         for route in here:
-            lines.append(f"• <b>{_plain(route.alias or '—')}</b> · slot {route.slot} · <code>{_plain(route.cwd)}</code> · pid {route.pid}")
+            lines.append(
+                f"• <b>{_plain(route.profile)}</b> · slot {route.slot} · "
+                f"<code>{_plain(route.cwd)}</code> · pid {route.pid}"
+            )
         return "\n".join(lines)
 
     # -- per-chat directory -----------------------------------------------
@@ -526,29 +596,59 @@ class Daemon:
 
     # -- /claude -----------------------------------------------------------
 
-    def _launch(self, command: ClaudeCommand, incoming: telegram.Incoming) -> None:
+    def _launch(
+        self,
+        command: ClaudeCommand,
+        incoming: telegram.Incoming,
+        profile: Profile | None = None,
+        *,
+        quiet: bool = False,
+    ) -> None:
         options, args = command.options, list(command.args)
-        if options.name and not valid_alias(options.name):
-            self._say(incoming, t("daemon.bad_alias", name=options.name))
-            return
+        known = self.profiles()
 
-        profile = self._profile(options.name)
-        if options.name and profile is not None:
-            bound_chat = int(profile.get("chat") or 0)
-            if bound_chat and bound_chat != incoming.chat_id:
-                self._say(incoming, t("daemon.profile_elsewhere", name=options.name, chat=bound_chat))
+        if options.name:
+            if not valid_alias(options.name):
+                self._say(incoming, t("daemon.bad_alias", name=options.name))
                 return
+            wanted = known.get(options.name)
+            if wanted is None:
+                self._say(
+                    incoming,
+                    t("daemon.no_profile", name=options.name, names=", ".join(sorted(known))),
+                )
+                return
+            profile = wanted
+        elif profile is None:
+            routed = route_line(
+                CLAUDE_COMMAND,
+                prefix="",
+                profiles=known,
+                chat=incoming.chat_id,
+                thread=incoming.thread_id,
+            )
+            profile = known[routed.profile] if routed is not None else known[DEFAULT_PROFILE]
+
+        if not profile.open_to(incoming.chat_id, incoming.thread_id):
+            self._say(
+                incoming,
+                t(
+                    "daemon.profile_elsewhere",
+                    name=profile.name,
+                    chats=", ".join(profiles_module.format_chat(ref) for ref in profile.chats),
+                ),
+            )
+            return
+        if not profile.allows(incoming.user_id, self._users()):
+            return
 
         if args and (args[0] in _subcommands() or set(args) & ONE_SHOT_FLAGS):
             self._one_shot(args, incoming)
             return
 
         here = self._routes_in(incoming.chat_id, incoming.thread_id)
-        if options.name and any(route.alias == options.name for route in here):
-            self._say(incoming, t("daemon.alias_taken", name=options.name))
-            return
-        if not options.name and any(not route.alias for route in here):
-            self._say(incoming, t("daemon.nameless_taken"))
+        if any(existing.profile == profile.name for existing in here):
+            self._say(incoming, t("daemon.already_up", name=profile.alias or DEFAULT_PROFILE))
             return
 
         cwd = self._launch_dir(options.cwd, profile, incoming)
@@ -559,23 +659,21 @@ class Daemon:
         slot_token = ""
         if args and (args[0].isdigit() or args[0].startswith("@")):
             slot_token = args.pop(0)
-        elif profile is not None and int(profile.get("slot") or 0):
-            slot_token = str(profile["slot"])
-        if profile is not None:
-            extra = [str(part) for part in (profile.get("args") or [])]
-            args = [*extra, *args]
+        elif profile.slot:
+            slot_token = str(profile.slot)
+        args = [*profile.args, *args]
+        if profile.alias and "-n" not in args and "--name" not in args:
+            args = ["-n", profile.alias, *args]
 
         tag = self.new_tag()
         line = [str(bin_dir() / shim_name())]
         if slot_token:
             line.append(slot_token)
-        line += ["-t", "telegram", "--tg-chat", str(incoming.chat_id)]
-        if incoming.thread_id:
-            line += ["--tg-thread", str(incoming.thread_id)]
-        line += args
+        line += ["-t", "telegram", *args]
         env = dict(os.environ)
         env["CCAS_TELEGRAM_FEED"] = "1"
         env["CCAS_TELEGRAM_TAG"] = tag
+        env["CCAS_TELEGRAM_PROFILE"] = profile.name
         env["CCAS_TELEGRAM_DAEMON_PORT"] = str(self.port)
 
         try:
@@ -583,22 +681,27 @@ class Daemon:
         except OSError as exc:
             self._say(incoming, t("tg.launch_failed", error=exc))
             return
-        log.write(f"daemon: launched {line[1:]} in {cwd} as {tag}")
-        self._say(incoming, t("daemon.launching", cwd=_plain(str(cwd)), name=options.name or "—"))
+        log.write(f"daemon: launched {line[1:]} in {cwd} as {tag} for {profile.name}")
+        if not quiet:
+            self._say(
+                incoming,
+                t("daemon.launching", cwd=_plain(str(cwd)), name=profile.alias or DEFAULT_PROFILE),
+            )
 
-    def _profile(self, name: str) -> dict[str, Any] | None:
-        if not name:
-            return None
-        sessions = Config.load().telegram.get("sessions") or {}
-        profile = sessions.get(name) if isinstance(sessions, dict) else None
-        return profile if isinstance(profile, dict) else None
+    def profiles(self) -> dict[str, Profile]:
+        """Read from disk every time: `ccas profile set` must take effect in
+        a daemon that has been running for days."""
+        return profiles_module.load(Config.load())
 
-    def _launch_dir(self, explicit: str, profile: dict[str, Any] | None, incoming: telegram.Incoming) -> Path | None:
+    def _users(self) -> tuple[int, ...]:
+        return profiles_module.global_users(Config.load())
+
+    def _launch_dir(self, explicit: str, profile: Profile | None, incoming: telegram.Incoming) -> Path | None:
         roots = self.config.telegram.get("roots") or []
         if explicit:
             return resolve_dir(explicit, self.chat_dir(incoming), roots=roots)
-        if profile is not None and str(profile.get("cwd") or ""):
-            found = resolve_dir(str(profile["cwd"]), Path.home(), roots=roots)
+        if profile is not None and profile.cwd:
+            found = resolve_dir(profile.cwd, Path.home(), roots=roots)
             if found is not None:
                 return found
         return self.chat_dir(incoming)
@@ -704,13 +807,16 @@ def status_text(config: Config) -> list[str]:
     if record is None:
         lines.append(t("daemon.status_down"))
     else:
-        lines.append(t("daemon.status_up", pid=record.get("pid"), port=record.get("port"), bot=record.get("botId"), chat=record.get("chat")))
+        lines.append(t("daemon.status_up", pid=record.get("pid"), port=record.get("port"), bot=record.get("botId")))
         try:
             payload = daemonlink.status(int(record.get("port") or 0))
             routes = payload.get("routes") or []
             lines.append(t("daemon.status_routes", count=len(routes), updates=payload.get("updates", 0)))
             for route in routes:
-                lines.append(f"  {route.get('alias') or '-':<12} chat {route.get('chat')} slot {route.get('slot')} pid {route.get('pid')} {route.get('cwd')}")
+                lines.append(
+                    f"  {route.get('profile') or '-':<12} chat {route.get('chat') or '*'} "
+                    f"slot {route.get('slot')} pid {route.get('pid')} {route.get('cwd')}"
+                )
         except daemonlink.LinkError:
             lines.append(t("daemon.status_unreachable"))
     holder = poller_module.read_holder(telegram.bot_id(str(config.telegram.get("token") or "")))

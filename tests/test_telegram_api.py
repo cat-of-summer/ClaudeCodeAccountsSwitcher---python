@@ -154,3 +154,27 @@ class Rendering(unittest.TestCase):
 
     def test_strip_html(self) -> None:
         self.assertEqual(telegram.strip_html("<b>a</b> &amp; <pre>b</pre>"), "a & b")
+
+
+class Backlog(unittest.TestCase):
+    def setUp(self) -> None:
+        self.api = FakeApi()
+        self.bot = telegram.Bot(TOKEN, api_root=self.api.root)
+
+    def tearDown(self) -> None:
+        self.api.close()
+
+    def test_skip_pending_starts_after_the_backlog(self) -> None:
+        self.api.updates = [
+            {"update_id": 5, "message": {"message_id": 1, "chat": {"id": -5}, "from": {"id": 7}, "text": "/claude"}},
+            {"update_id": 6, "message": {"message_id": 2, "chat": {"id": -5}, "from": {"id": 7}, "text": "/claude"}},
+        ]
+        state = telegram.PollState()
+        self.assertTrue(telegram.skip_pending(self.bot, state))
+        self.assertEqual(state.offset, 7)
+        self.assertEqual(telegram.poll_once(self.bot, state, timeout=0), [])
+
+    def test_an_empty_queue_is_not_a_backlog(self) -> None:
+        state = telegram.PollState()
+        self.assertFalse(telegram.skip_pending(self.bot, state))
+        self.assertEqual(state.offset, 0)

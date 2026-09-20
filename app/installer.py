@@ -399,3 +399,17 @@ def refresh_claude_path(config: Config) -> bool:
     config.save()
     log.write(f"real claude path refreshed to {found}")
     return True
+
+
+def pending_upgrade() -> list[Path]:
+    """Binaries waiting for their running copy to be closed.
+
+    A shim that is in use cannot be overwritten on Windows, so `install`
+    leaves the new build beside it as `.new` and the next `ccas` swaps it in.
+    Until then the old shim runs, and a feature added in the new build is
+    simply absent -- silently, which is what makes this worth reporting.
+    """
+    directory = bin_dir()
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob(f"*{PENDING_SUFFIX}"))

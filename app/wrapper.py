@@ -358,8 +358,9 @@ def _taskkill(pid: int, *, force: bool) -> None:
     )
 
 
-def settings_file() -> Path:
-    return sessions_dir() / f"{os.getpid()}.settings.json"
+def settings_file(key: str = "") -> Path:
+    name = f"{os.getpid()}-{key}" if key else str(os.getpid())
+    return sessions_dir() / f"{name}.settings.json"
 
 
 def wants_hook_bus(config: Config, args: list[str]) -> bool:
@@ -375,19 +376,19 @@ def wants_hook_bus(config: Config, args: list[str]) -> bool:
     return not hookbus.hooks_disabled_by(args)
 
 
-def open_hook_bus(config: Config, slot: int) -> hookbus.HookBus:
+def open_hook_bus(config: Config, slot: int, *, key: str = "") -> hookbus.HookBus:
     bus = hookbus.HookBus(hookbus.parse_handlers(config.hooks), slot=slot)
     bus.start()
-    update_session(port=bus.port)
+    update_session(port=bus.port, key=key)
     return bus
 
 
-def close_hook_bus(bus: hookbus.HookBus | None) -> None:
+def close_hook_bus(bus: hookbus.HookBus | None, *, key: str = "") -> None:
     if bus is None:
         return
     bus.stop()
     with contextlib.suppress(OSError):
-        settings_file().unlink()
+        settings_file(key).unlink()
 
 
 def launch(
@@ -443,7 +444,7 @@ def launch(
 
 
 @contextlib.contextmanager
-def slot_session(config: Config, slot_number: int, **record: Any) -> Iterator[bool]:
+def slot_session(config: Config, slot_number: int, *, key: str = "", **record: Any) -> Iterator[bool]:
     """The per-slot bookkeeping around one claude, whoever drives it.
 
     Yields whether this is a fresh login. `record` goes into the session
@@ -486,12 +487,12 @@ def slot_session(config: Config, slot_number: int, **record: Any) -> Iterator[bo
     if copy_mode:
         acquire_lock(slot_number)
 
-    register_session(slot_number, **record)
+    register_session(slot_number, key=key, **record)
     try:
         yield state["fresh_login"]
     finally:
         try:
-            unregister_session()
+            unregister_session(key)
 
             def _bookkeep(fresh: Accounts) -> None:
                 slot = fresh.ensure(slot_number)
@@ -1003,20 +1004,11 @@ def main(argv: list[str] | None = None) -> int:
     config = Config.load()
     accounts = Accounts.load()
 
-    if config.telegram.get("daemon"):
-        # Imported only when wanted: the transport modules are a cost every
-        # plain `claude` launch need not pay.
-        from app import daemon
-
-        daemon.ensure_running(config)
-
     try:
         slot_number, rest, explicit = resolve_slot(args, accounts)
     except WrapperError as exc:
         sys.stderr.write(f"{exc}\n")
         return 2
-
-    del explicit
 
     if adopt_existing_login(config):
         accounts = Accounts.load()
@@ -1028,10 +1020,12 @@ def main(argv: list[str] | None = None) -> int:
 
     options, rest = split_launch_options(rest)
     if options.wants_transport:
+        # Imported only when wanted: the transport modules are a cost every
+        # plain `claude` launch need not pay.
         from app import transport
 
         try:
-            return transport.run(config, slot_number, rest, options)
+            return transport.run(config, slot_number, rest, options, slot_explicit=explicit)
         except (WrapperError, transport.TransportError) as exc:
             sys.stderr.write(f"{exc}\n")
             return 2

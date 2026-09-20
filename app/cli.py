@@ -452,55 +452,101 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_session(args: argparse.Namespace) -> int:
-    """Named session profiles: a name bound to a chat, a directory, a slot."""
+def _profile_flag(raw: str | None, current: bool, key: str) -> bool:
+    """An on/off flag that keeps its value when the option is not given."""
+    if raw is None:
+        return current
+    return settings.to_bool(raw, key=key)
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    """Profiles: what the transport listens to, where it runs, who may talk.
+
+    `set` edits as well as creates, so it is also how the permanent
+    `default` profile is configured.
+    """
     _require_installed()
-    from app.transport.routing import valid_alias
+    from app import daemon
+    from app.transport import profiles as profiles_module
+    from app.transport.routing import tokenize, valid_alias
 
-    action = getattr(args, "session_action", None) or "list"
+    action = getattr(args, "profile_action", None) or "list"
     config = Config.load()
-    profiles = dict(config.telegram.get("sessions") or {})
+    known = profiles_module.load(config)
 
-    if action == "add":
+    if action == "set":
         name = args.name.strip()
-        if not valid_alias(name):
-            raise SystemExit(t("session.bad_name", name=name))
-        cwd = Path(args.cwd).expanduser()
-        if not cwd.is_dir():
-            raise SystemExit(t("config.bad_dir", path=cwd))
-        from app.transport.routing import tokenize
+        if name != profiles_module.DEFAULT_PROFILE and not valid_alias(name):
+            raise SystemExit(t("profile.bad_name", name=name))
 
-        profile = {
-            "chat": int(args.chat) if args.chat is not None else int(config.telegram.get("chat") or 0),
-            "thread": int(args.thread or 0),
-            "cwd": str(cwd),
-            "slot": int(args.slot or 0),
-            "args": tokenize(getattr(args, "claude_args", None) or ""),
-        }
-        profiles[name] = profile
-        config.telegram = {**config.telegram, "sessions": profiles}
-        config.save()
-        print(t("session.saved", name=name, cwd=cwd, chat=profile["chat"]))
+        current = known.get(name) or profiles_module.Profile(name=name)
+        cwd = current.cwd
+        if args.cwd is not None:
+            candidate = Path(args.cwd).expanduser()
+            if not candidate.is_dir():
+                raise SystemExit(t("config.bad_dir", path=candidate))
+            cwd = str(candidate)
+
+        chats = current.chats
+        if args.chat is not None:
+            parsed = [profiles_module.parse_chat(entry) for entry in args.chat]
+            bad = [entry for entry, ref in zip(args.chat, parsed) if ref is None]
+            if bad:
+                raise SystemExit(t("profile.bad_chat", chat=", ".join(bad)))
+            chats = tuple(ref for ref in parsed if ref is not None)
+
+        users = current.users
+        if args.users is not None:
+            if not all(part.strip().lstrip("-").isdigit() for part in args.users):
+                raise SystemExit(t("profile.bad_user", user=", ".join(args.users)))
+            users = tuple(int(part) for part in args.users)
+
+        try:
+            profile = profiles_module.Profile(
+                name=name,
+                chats=chats,
+                cwd=cwd,
+                slot=int(args.slot) if args.slot is not None else current.slot,
+                daemon=_profile_flag(args.daemon, current.daemon, "daemon"),
+                multi=_profile_flag(args.multi, current.multi, "multi"),
+                users=users,
+                args=tuple(tokenize(args.claude_args)) if args.claude_args is not None else current.args,
+            )
+        except settings.SettingError as exc:
+            raise SystemExit(str(exc)) from exc
+        profiles_module.save(profile)
+        daemon.reconcile_autostart(Config.load())
+        print(t("profile.saved", name=name))
+        print(f"  {profiles_module.describe(profile)}")
         return 0
 
     if action == "remove":
         name = args.name.strip()
-        if name not in profiles:
-            raise SystemExit(t("session.no_such", name=name))
-        profiles.pop(name)
-        config.telegram = {**config.telegram, "sessions": profiles}
-        config.save()
-        print(t("session.removed", name=name))
+        if name not in known:
+            raise SystemExit(t("profile.no_such", name=name, names=", ".join(sorted(known))))
+        profiles_module.remove(name)
+        daemon.reconcile_autostart(Config.load())
+        print(
+            t("profile.reset", name=name)
+            if name == profiles_module.DEFAULT_PROFILE
+            else t("profile.removed", name=name)
+        )
         return 0
 
-    if not profiles:
-        print(t("session.none"))
+    if action == "show":
+        name = args.name.strip()
+        profile = known.get(name)
+        if profile is None:
+            raise SystemExit(t("profile.no_such", name=name, names=", ".join(sorted(known))))
+        print(f"{name}  {profiles_module.describe(profile)}")
+        print(t("profile.runs_in", path=profile.resolve_cwd(config)))
         return 0
-    width = max(len(name) for name in profiles)
-    for name, profile in sorted(profiles.items()):
-        extra = " ".join(str(part) for part in (profile.get("args") or []))
-        slot = profile.get("slot") or "-"
-        print(f"{name:<{width}}  chat {profile.get('chat')}  slot {slot}  {profile.get('cwd')}  {extra}".rstrip())
+
+    width = max(len(name) for name in known)
+    for name, profile in sorted(known.items()):
+        print(f"{name:<{width}}  {profiles_module.describe(profile)}")
+    print()
+    print(t("profile.hint"))
     return 0
 
 
@@ -545,6 +591,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     report(OK, t("doctor.version", installed=config.version, binary=__version__))
     if config.version != __version__:
         report(WARN, t("doctor.version_mismatch"))
+
+    waiting = installer.pending_upgrade()
+    if waiting:
+        report(WARN, t("doctor.upgrade_pending", names=", ".join(path.name for path in waiting)))
+        problems += 1
 
     entry_present = installer.path_entry_present()
     if entry_present:
@@ -604,22 +655,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
 
     from app import daemon
+    from app.transport import profiles as profiles_module
     from core import telegram
     from system import autostart
 
     if daemon.configured(config):
         token = str(config.telegram.get("token") or "")
-        report(OK, t("doctor.telegram_configured", bot=telegram.bot_id(token), chat=config.telegram.get("chat")))
+        known = profiles_module.load(config)
+        watched = sorted(name for name, profile in known.items() if profile.daemon)
+        report(OK, t("doctor.telegram_configured", bot=telegram.bot_id(token), profiles=len(known)))
+        for name in sorted(known):
+            report(OK, f"  {name}  {profiles_module.describe(known[name])}")
+
         record = daemon.read_daemon()
-        if config.telegram.get("daemon"):
-            if record is not None:
-                report(OK, t("doctor.daemon_running", pid=record.get("pid")))
+        if watched:
+            if record is None:
+                report(WARN, t("doctor.daemon_not_running", profiles=", ".join(watched)))
+                problems += 1
             else:
-                report(WARN, t("doctor.daemon_not_running"))
+                report(OK, t("doctor.daemon_running", pid=record.get("pid"), profiles=", ".join(watched)))
             if not autostart.is_registered():
                 report(WARN, t("doctor.autostart_missing"))
         elif record is not None:
-            report(OK, t("doctor.daemon_running", pid=record.get("pid")))
+            report(OK, t("doctor.daemon_running", pid=record.get("pid"), profiles="—"))
         else:
             report(OK, t("doctor.daemon_off"))
     else:
@@ -769,19 +827,23 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_run = daemon_sub.add_parser("run", help=t("cli.help.daemon_run"))
     daemon_run.add_argument("--hidden", action="store_true", help=t("cli.help.daemon_hidden"))
 
-    session_parser = subparsers.add_parser("session", help=t("cli.help.session"))
-    session_parser.set_defaults(func=cmd_session)
-    session_sub = session_parser.add_subparsers(dest="session_action")
-    session_sub.add_parser("list", help=t("cli.help.session_list"))
-    session_add = session_sub.add_parser("add", help=t("cli.help.session_add"))
-    session_add.add_argument("name")
-    session_add.add_argument("--cwd", required=True, help=t("cli.help.session_cwd"))
-    session_add.add_argument("--chat", type=int, help=t("cli.help.session_chat"))
-    session_add.add_argument("--thread", type=int, help=t("cli.help.session_thread"))
-    session_add.add_argument("--slot", type=int, help=t("cli.help.session_slot"))
-    session_add.add_argument("--args", dest="claude_args", help=t("cli.help.session_args"))
-    session_remove = session_sub.add_parser("remove", help=t("cli.help.session_remove"))
-    session_remove.add_argument("name")
+    profile_parser = subparsers.add_parser("profile", help=t("cli.help.profile"))
+    profile_parser.set_defaults(func=cmd_profile)
+    profile_sub = profile_parser.add_subparsers(dest="profile_action")
+    profile_sub.add_parser("list", help=t("cli.help.profile_list"))
+    profile_show = profile_sub.add_parser("show", help=t("cli.help.profile_show"))
+    profile_show.add_argument("name")
+    profile_set = profile_sub.add_parser("set", help=t("cli.help.profile_set"))
+    profile_set.add_argument("name")
+    profile_set.add_argument("--cwd", help=t("cli.help.profile_cwd"))
+    profile_set.add_argument("--chat", action="append", help=t("cli.help.profile_chat"))
+    profile_set.add_argument("--slot", type=int, help=t("cli.help.profile_slot"))
+    profile_set.add_argument("--daemon", help=t("cli.help.profile_daemon"))
+    profile_set.add_argument("--multi", help=t("cli.help.profile_multi"))
+    profile_set.add_argument("--users", nargs="*", help=t("cli.help.profile_users"))
+    profile_set.add_argument("--args", dest="claude_args", help=t("cli.help.profile_args"))
+    profile_remove = profile_sub.add_parser("remove", help=t("cli.help.profile_remove"))
+    profile_remove.add_argument("name")
 
     telegram_parser = subparsers.add_parser("telegram", help=t("cli.help.telegram"))
     telegram_parser.set_defaults(func=cmd_telegram)

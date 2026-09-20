@@ -40,25 +40,37 @@ DEFAULT_AUTO_SWITCH: dict[str, Any] = {
 AUTO_SWITCH_STRATEGIES = ("limits", "order", "notify")
 
 # The bot token carries the bot id (the part before the colon), so there is
-# no separate field for it. `sessions` are named profiles: a name that
-# `/claude -n <name>` in that chat resolves to a directory, a slot and the
-# extra arguments to launch with.
+# no separate field for it. Everything about *what* is listened to lives in
+# the profiles, not here: which chats, which directory, whether the daemon may
+# raise it on its own.
 DEFAULT_TELEGRAM: dict[str, Any] = {
     "token": "",
-    "chat": 0,
-    "thread": 0,
     "users": [],
     "prefix": "",
     "workdir": "",
     "roots": [],
-    "daemon": False,
     "console": True,
     "verbosity": "tools",
     "promptTimeoutMinutes": 0,
-    "sessions": {},
+    "maxSessions": 8,
+    "profiles": {},
 }
 
 TELEGRAM_VERBOSITIES = ("text", "tools", "all")
+
+# The profile every unaliased message belongs to. It always exists, even when
+# the config file has never heard of it.
+DEFAULT_PROFILE = "default"
+
+DEFAULT_TELEGRAM_PROFILE: dict[str, Any] = {
+    "chats": [],
+    "cwd": "",
+    "slot": 0,
+    "daemon": False,
+    "multi": False,
+    "users": [],
+    "args": [],
+}
 
 
 def home() -> Path:
@@ -322,6 +334,35 @@ class Config:
         )
 
 
+def _telegram_to_profiles(raw: dict[str, Any]) -> dict[str, Any]:
+    """Schema 4 -> 5: one listened chat and one daemon switch become profiles."""
+    moved = dict(raw)
+    profiles = dict(moved.pop("sessions", None) or moved.get("profiles") or {})
+    default = {**DEFAULT_TELEGRAM_PROFILE, **(profiles.get(DEFAULT_PROFILE) or {})}
+
+    chat = int(moved.pop("chat", 0) or 0)
+    thread = int(moved.pop("thread", 0) or 0)
+    if chat and not default["chats"]:
+        default["chats"] = [f"{chat}:{thread}" if thread else chat]
+    if moved.pop("daemon", False):
+        default["daemon"] = True
+
+    for name, profile in list(profiles.items()):
+        if name == DEFAULT_PROFILE or not isinstance(profile, dict):
+            continue
+        merged = {**DEFAULT_TELEGRAM_PROFILE, **profile}
+        # A named profile used to carry one chat and one thread of its own.
+        old_chat = int(merged.pop("chat", 0) or 0)
+        old_thread = int(merged.pop("thread", 0) or 0)
+        if old_chat and not merged["chats"]:
+            merged["chats"] = [f"{old_chat}:{old_thread}" if old_thread else old_chat]
+        profiles[name] = merged
+
+    profiles[DEFAULT_PROFILE] = default
+    moved["profiles"] = profiles
+    return {key: value for key, value in moved.items() if key in DEFAULT_TELEGRAM}
+
+
 def is_installed() -> bool:
     return config_path().exists()
 
@@ -349,6 +390,11 @@ def migrate_config() -> bool:
     Schema 4 adds the hook bus, external hook handlers and the Telegram
     transport; `load()` already fills their defaults, so the migration only
     has to write them out and stamp the version.
+
+    Schema 5 moves what is listened to into the profiles: the single
+    `telegram.chat`/`thread` becomes the default profile's chat list and
+    `telegram.daemon` becomes that profile's own flag, so a config written
+    before profiles existed keeps behaving the way it did.
     """
     if not is_installed():
         return False
@@ -363,6 +409,9 @@ def migrate_config() -> bool:
         merged = dict(config.auto_switch)
         merged["resumePrompt"] = default_resume_prompt()
         config.auto_switch = merged
+
+    if config.schema < 5:
+        config.telegram = _telegram_to_profiles(config.telegram)
 
     config.schema = SCHEMA_VERSION
     config.save()

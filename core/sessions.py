@@ -15,31 +15,39 @@ def sessions_dir() -> Path:
     return app_dir() / "sessions"
 
 
-def session_file() -> Path:
-    return sessions_dir() / f"{os.getpid()}.json"
+def session_file(key: str = "") -> Path:
+    """One file per running claude, not per process.
+
+    The Telegram transport drives several claude sessions from one process --
+    one per person it is talking to -- and each needs its own record, or the
+    second would overwrite the first and `busy_slots()` would lose a slot
+    that is very much in use.
+    """
+    name = f"{os.getpid()}-{key}" if key else str(os.getpid())
+    return sessions_dir() / f"{name}.json"
 
 
-def register_session(slot: int, **extra: Any) -> None:
+def register_session(slot: int, *, key: str = "", **extra: Any) -> None:
     write_json_atomic(
-        session_file(),
+        session_file(key),
         {"pid": os.getpid(), "slot": slot, "at": time.time(), **extra},
         harden=False,
     )
 
 
-def update_session(**fields: Any) -> None:
-    """Add to this process's record: the hook-bus port, the transport, the
+def update_session(*, key: str = "", **fields: Any) -> None:
+    """Add to this claude's record: the hook-bus port, the transport, the
     session id -- facts that are only known once claude is on its way."""
-    raw = read_json(session_file())
+    raw = read_json(session_file(key))
     if not isinstance(raw, dict):
         return
     raw.update(fields)
-    write_json_atomic(session_file(), raw, harden=False)
+    write_json_atomic(session_file(key), raw, harden=False)
 
 
-def unregister_session() -> None:
+def unregister_session(key: str = "") -> None:
     with contextlib.suppress(OSError):
-        session_file().unlink()
+        session_file(key).unlink()
 
 
 def other_live_sessions() -> list[dict[str, Any]]:
@@ -55,7 +63,7 @@ def other_live_sessions() -> list[dict[str, Any]]:
 
     mine = os.getpid()
     live: list[dict[str, Any]] = []
-    for entry in directory.glob("*.json"):
+    for entry in sorted(directory.glob("*.json")):
         raw = read_json(entry)
         if not isinstance(raw, dict):
             continue

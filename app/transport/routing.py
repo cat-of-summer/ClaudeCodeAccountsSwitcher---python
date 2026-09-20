@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
+
+from core.store import DEFAULT_PROFILE
 
 TRANSPORTS = ("telegram",)
 CLAUDE_COMMAND = "/claude"
@@ -167,3 +170,60 @@ def parse_claude_command(body: str) -> ClaudeCommand | None:
     _, _, tail = line.partition(" ")
     options, rest = split_launch_options(tokenize(tail))
     return ClaudeCommand(options, rest)
+
+
+@dataclass(frozen=True)
+class Routed:
+    """Which profile a chat line belongs to, and what is left of the line."""
+
+    profile: str
+    body: str
+    addressed: bool = False
+
+
+def route(
+    text: str,
+    *,
+    prefix: str,
+    profiles: dict[str, Any],
+    chat: int,
+    thread: int = 0,
+) -> Routed | None:
+    """Whose line this is, or None when it is nobody's.
+
+    The order is the one a person would guess: a name at the front wins; a
+    chat named by exactly one profile belongs to that profile; otherwise the
+    default profile takes it, but only where it is allowed to work. A named
+    profile that listed no chats is reachable by its name alone -- it has not
+    claimed anything, so plain talk in a shared chat is not silently its.
+    """
+    line = text.strip()
+    if prefix and line.startswith(prefix):
+        line = line[len(prefix) :].strip()
+        prefixed = True
+    else:
+        prefixed = False
+
+    head, _, tail = line.partition(" ")
+    if head and head in profiles and head != DEFAULT_PROFILE:
+        return Routed(head, tail.strip(), addressed=True)
+
+    if prefix and not prefixed and not line.startswith("/"):
+        return None
+
+    owners = [
+        name
+        for name, profile in profiles.items()
+        if profile.claims(chat, thread)
+    ]
+    if len(owners) == 1:
+        return Routed(owners[0], line)
+    if owners:
+        # Several profiles named the same chat: only an explicit alias can
+        # tell them apart, so a plain line has no owner.
+        return None
+
+    fallback = profiles.get(DEFAULT_PROFILE)
+    if fallback is not None and fallback.open_to(chat, thread):
+        return Routed(DEFAULT_PROFILE, line)
+    return None

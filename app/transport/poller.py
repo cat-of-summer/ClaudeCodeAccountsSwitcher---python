@@ -85,12 +85,14 @@ class Poller(threading.Thread):
         *,
         on_busy: Callable[[str], None] | None = None,
         timeout: int = telegram.POLL_TIMEOUT_SECONDS,
+        skip_backlog: bool = True,
     ) -> None:
         super().__init__(daemon=True, name="telegram-poller")
         self.bot = bot
         self.deliver = deliver
         self.on_busy = on_busy
         self.timeout = timeout
+        self.skip_backlog = skip_backlog
         self.state = telegram.PollState()
         self._stop = threading.Event()
         self.busy_reason = ""
@@ -99,6 +101,14 @@ class Poller(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
+        if self.skip_backlog:
+            try:
+                telegram.skip_pending(self.bot, self.state)
+            except telegram.TokenBusy as exc:
+                self.busy_reason = exc.description
+                if self.on_busy is not None:
+                    self.on_busy(exc.description)
+                return
         while not self._stop.is_set():
             try:
                 incoming = telegram.poll_once(self.bot, self.state, timeout=self.timeout)

@@ -137,15 +137,6 @@ def _set_workdir(config: Config, value: Any) -> None:
     _set_tg("workdir")(config, text)
 
 
-def _set_daemon(config: Config, value: Any) -> None:
-    """The setting and the OS autostart entry move together."""
-    _set_tg("daemon")(config, bool(value))
-    from system import autostart
-
-    if value:
-        autostart.register()
-    else:
-        autostart.unregister()
 
 
 SETTINGS: tuple[Setting, ...] = (
@@ -209,12 +200,17 @@ SETTINGS: tuple[Setting, ...] = (
         lambda config, value: setattr(config, "hooks_bus", bool(value)),
     ),
     Setting("telegram-token", "text", _tg("token"), _set_token, editable_in_screen=False, secret=True),
-    Setting("telegram-chat", "int", _tg("chat"), _set_tg("chat"), editable_in_screen=False),
-    Setting("telegram-thread", "int", _tg("thread"), _set_tg("thread"), editable_in_screen=False),
     Setting("telegram-prefix", "text", _tg("prefix"), _set_tg("prefix"), editable_in_screen=False),
     Setting("telegram-workdir", "dir", _tg("workdir"), _set_workdir, editable_in_screen=False),
-    Setting("telegram-daemon", "bool", _tg("daemon"), _set_daemon),
     Setting("telegram-console", "bool", _tg("console"), _set_tg("console")),
+    Setting(
+        "telegram-max-sessions",
+        "int",
+        _tg("maxSessions"),
+        _set_tg("maxSessions"),
+        minimum=1,
+        maximum=64,
+    ),
     Setting(
         "telegram-verbosity",
         "choice",
@@ -259,13 +255,18 @@ def find(key: str) -> Setting:
     return setting
 
 
-def parse_bool(setting: Setting, raw: str) -> bool:
+def to_bool(raw: str, *, key: str) -> bool:
+    """on/off, yes/no and their translations; `key` only names the error."""
     probe = raw.strip().lower()
     if probe in BOOL_TRUE or probe in i18n.answers("common.yes_answers"):
         return True
     if probe in BOOL_FALSE or probe in i18n.answers("common.no_answers"):
         return False
-    raise SettingError(t("config.bad_value", key=setting.key, value=raw))
+    raise SettingError(t("config.bad_value", key=key, value=raw))
+
+
+def parse_bool(setting: Setting, raw: str) -> bool:
+    return to_bool(raw, key=setting.key)
 
 
 def parse(setting: Setting, raw: str) -> Any:
@@ -333,6 +334,7 @@ def as_lines(config: Config) -> list[tuple[str, str]]:
 
 __all__ = [
     "SETTINGS",
+    "to_bool",
     "Setting",
     "SettingError",
     "apply",

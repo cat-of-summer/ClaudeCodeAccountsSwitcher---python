@@ -4,7 +4,6 @@ import os
 import unittest
 from unittest import mock
 
-from core import settings
 from core.store import Config
 from system import autostart
 from tests.base import TempHome
@@ -48,14 +47,28 @@ class PosixAutostart(TempHome):
             self.assertFalse(unit.exists())
             self.assertIn(["systemctl", "--user", "disable", "--now", "ccas-daemon.service"], calls)
 
-    def test_the_setting_and_the_entry_move_together(self) -> None:
-        Config().save()
-        with mock.patch.object(autostart, "register", return_value=True) as register, \
-             mock.patch.object(autostart, "unregister", return_value=True) as unregister:
-            setting = settings.find("telegram-daemon")
-            config = settings.apply(setting, settings.parse(setting, "on"))
-            self.assertTrue(config.telegram["daemon"])
+    def test_the_profiles_and_the_entry_move_together(self) -> None:
+        """There is no switch of its own: a daemon-raised profile is the
+        whole reason for the autostart entry."""
+        from app import daemon
+        from app.transport import profiles as profiles_module
+        from app.transport.profiles import Profile
+
+        config = Config()
+        # Without a token the daemon cannot run at all, so there would be
+        # nothing to register.
+        config.telegram = {**config.telegram, "token": "123456:ABCDEFghijklmnopqrstuvwxyz0123456789"}
+        config.save()
+        with (
+            mock.patch.object(daemon, "ensure_running", return_value=False),
+            mock.patch.object(autostart, "register", return_value=True) as register,
+            mock.patch.object(autostart, "unregister", return_value=True) as unregister,
+            mock.patch.object(autostart, "is_registered", side_effect=[False, True]),
+        ):
+            profiles_module.save(Profile(name="rikroot", daemon=True))
+            self.assertTrue(daemon.reconcile_autostart(Config.load()))
             register.assert_called_once()
-            settings.apply(setting, settings.parse(setting, "off"))
+
+            profiles_module.save(Profile(name="rikroot"))
+            self.assertFalse(daemon.reconcile_autostart(Config.load()))
             unregister.assert_called_once()
-            self.assertFalse(Config.load().telegram["daemon"])

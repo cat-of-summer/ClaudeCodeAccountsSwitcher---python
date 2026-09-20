@@ -1,15 +1,14 @@
-"""One claude session living in one Telegram chat.
+"""One claude, talking to one person in one chat.
 
-The session owns a headless claude (`Driver`), renders what it does into the
-chat and into the console window it runs in, and feeds it what the chat and
-the console type. Questions and permission prompts go through `Prompter`.
-Updates arrive from whoever polls the bot -- the session's own poller when it
-is alone, the daemon otherwise -- via `deliver()`, so the two cases look the
-same from in here.
+A conversation owns a headless claude (`Driver`), renders what it does into
+its chat and into the console window, and feeds it what that person types.
+Questions and permission prompts go through `Prompter`. Who a message
+belongs to is settled before it gets here -- the transport routes by profile
+and by `(chat, thread, user)`, and simply calls `deliver()`.
 
-A few lines are the session's own, not claude's: `/stop`, `/kill`, `/status`,
-`/usage`, `/cd`, `/pwd`, `/switch`, `/save`, `/help`, and `!cmd`, which the
-TUI would have run in its bash mode. Everything else is a prompt.
+A few lines are the conversation's own, not claude's: `/stop`, `/kill`,
+`/status`, `/usage`, `/cd`, `/pwd`, `/switch`, `/save`, `/help`, and `!cmd`,
+which the TUI would have run in its bash mode. Everything else is a prompt.
 """
 
 from __future__ import annotations
@@ -18,19 +17,18 @@ import contextlib
 import os
 import queue
 import subprocess
-import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from app import autoswitch, wrapper
-from app.transport import daemonlink
-from app.transport import poller as poller_module
+from app.transport import profiles as profiles_module
 from app.transport.driver import Driver, DriverError, Event
+from app.transport.profiles import Profile
 from app.transport.prompter import Outcome, Prompt, Prompter
-from app.transport.routing import address
 from core import hookbus, log, telegram
 from core.sessions import update_session
 from core.store import Accounts, Config, TELEGRAM_VERBOSITIES, update_accounts
@@ -42,10 +40,6 @@ TICK_SECONDS = 1.0
 SHELL_TIMEOUT_SECONDS = 120.0
 OUTPUT_PREVIEW_LIMIT = 3000
 TOOL_RESULT_PREVIEW = 400
-FEED_WAIT_SECONDS = 25
-FEED_RETRY_SECONDS = 2.0
-FEED_FAILURES_BEFORE_TAKEOVER = 3
-LOCK_REFRESH_SECONDS = 60.0
 # A second Ctrl-C this soon after the first ends the session instead of
 # interrupting the turn again.
 DOUBLE_INTERRUPT_SECONDS = 3.0
@@ -64,51 +58,54 @@ class Relaunch:
     slot: int | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class ChatTarget:
+    """Where a conversation writes: one chat, one topic, one person.
+
+    `user` is 0 when the profile shares a session between everyone in the
+    chat; it is only ever used to tell conversations apart, never to decide
+    whether a message is allowed -- that is settled before `deliver()`.
+    """
+
     bot: telegram.Bot
     chat: int
     thread: int = 0
-    users: list[int] = field(default_factory=list)
-    prefix: str = ""
+    user: int = 0
 
-    def accepts(self, incoming: telegram.Incoming) -> bool:
-        if incoming.chat_id != self.chat:
-            return False
-        if self.thread and incoming.thread_id != self.thread:
-            return False
-        if self.users and incoming.user_id not in self.users:
-            return False
-        return True
+    @property
+    def key(self) -> tuple[int, int, int]:
+        return (self.chat, self.thread, self.user)
 
 
-class Session:
+class Conversation:
     def __init__(
         self,
         config: Config,
         *,
         slot: int,
         target: ChatTarget,
+        profile: Profile,
         cwd: Path,
         args: list[str],
-        alias: str = "",
         session_id: str = "",
         resume: bool = False,
-        own_poller: bool = True,
         tag: str = "s",
+        on_console: Callable[[str], None] | None = None,
+        on_finished: Callable[["Conversation"], None] | None = None,
     ) -> None:
         self.config = config
         self.slot = slot
         self.target = target
+        self.profile = profile
         self.cwd = cwd
         self.args = list(args)
-        self.alias = alias
         self.session_id = session_id
         self.resume = resume
-        self.own_poller = own_poller
-        # Prefixed to every button this session sends, so that the daemon can
-        # hand the press back to the right session when several share a chat.
+        # Prefixed to every button this conversation sends, so that a press
+        # comes back to the claude that asked and not to its neighbour.
         self.tag = tag
+        self._on_console = on_console
+        self._on_finished = on_finished
 
         self.verbosity = str(config.telegram.get("verbosity") or "tools")
         if self.verbosity not in TELEGRAM_VERBOSITIES:
@@ -119,52 +116,46 @@ class Session:
         self.driver: Driver | None = None
         self.prompter: Prompter | None = None
         self.bus: hookbus.HookBus | None = None
-        self.poller: poller_module.Poller | None = None
         self._inbox: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._prompt_messages: dict[str, int] = {}
         self._relaunch: Relaunch | None = None
         self._closing = False
         self._last_typing = 0.0
         self._last_interrupt = 0.0
-        self._last_lock_refresh = 0.0
+        self._reply_to = 0
         self.exit_code = 0
+        self.started_at = time.time()
         self.tried: set[int] = set()
-        self._feed_port = 0
-        self._feed_stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def alias(self) -> str:
+        return self.profile.alias
+
+    @property
+    def key(self) -> tuple[int, int, int]:
+        return self.target.key
 
     # -- entry -------------------------------------------------------------
 
+    def start(self) -> None:
+        """Run the conversation on its own thread; one process holds many."""
+        self._thread = threading.Thread(target=self.run, daemon=True, name=f"conv-{self.tag}")
+        self._thread.start()
+
     def run(self) -> int:
-        """Drive the session until claude ends it or the chat asks it to."""
-        if self.own_poller:
-            bot_id = self.target.bot.id
-            holder = poller_module.read_holder(bot_id)
-            if holder is not None and not poller_module.acquire(bot_id):
-                port = int(holder.get("port") or 0)
-                if not port:
-                    self._console(t("tg.token_held_locally", pid=holder.get("pid")))
-                    return 2
-                # A daemon has the token: let it feed us instead of fighting.
-                self.own_poller = False
-                self._feed_port = port
-            else:
-                poller_module.acquire(bot_id)
-                self._start_poller()
-        if not self.own_poller:
-            self._start_feed()
-
-        if sys.stdin and sys.stdin.isatty():
-            threading.Thread(target=self._console_loop, daemon=True).start()
-
+        """Drive this claude until it ends or the chat asks it to stop."""
         try:
             while True:
                 with wrapper.slot_session(
                     self.config,
                     self.slot,
+                    key=self.tag,
                     transport="telegram",
+                    profile=self.profile.name,
                     chat=self.target.chat,
                     thread=self.target.thread,
-                    alias=self.alias,
+                    user=self.target.user,
                     cwd=str(self.cwd),
                 ) as fresh_login:
                     if fresh_login:
@@ -179,78 +170,26 @@ class Session:
                     self.slot = relaunch.slot
                 self.resume = True
         finally:
-            self._feed_stop.set()
-            if self._feed_port:
-                daemonlink.unregister(self._feed_port, os.getpid())
-            if self.poller is not None:
-                self.poller.stop()
-                poller_module.release(self.target.bot.id)
+            self._closing = True
+            if self._on_finished is not None:
+                with contextlib.suppress(Exception):
+                    self._on_finished(self)
 
-    def _start_poller(self) -> None:
-        self.poller = poller_module.Poller(self.target.bot, self.deliver, on_busy=self._on_busy)
-        self.poller.start()
+    def close(self) -> None:
+        """Ask the conversation to wind down; the thread does the rest."""
+        self._closing = True
+        self._inbox.put(("wake", None))
 
-    # -- fed by the daemon -------------------------------------------------
-
-    def _route_record(self) -> dict[str, Any]:
-        return {
-            "pid": os.getpid(),
-            "tag": self.tag,
-            "chat": self.target.chat,
-            "thread": self.target.thread,
-            "alias": self.alias,
-            "cwd": str(self.cwd),
-            "slot": self.slot,
-        }
-
-    def _start_feed(self) -> None:
-        if not self._feed_port:
-            env_port = os.environ.get("CCAS_TELEGRAM_DAEMON_PORT") or ""
-            record = daemonlink.read_daemon()
-            self._feed_port = int(env_port) if env_port.isdigit() else int((record or {}).get("port") or 0)
-        threading.Thread(target=self._feed_loop, daemon=True, name="daemon-feed").start()
-
-    def _feed_loop(self) -> None:
-        """Long-poll the daemon for this route's updates.
-
-        When the daemon goes away the session tries to take the token over
-        and poll on its own: the chat keeps working, only the daemon's own
-        commands are gone until it is back.
-        """
-        failures = 0
-        registered = False
-        while not self._feed_stop.is_set():
-            try:
-                if not registered:
-                    tag = daemonlink.register(self._feed_port, self._route_record())
-                    if tag:
-                        self.tag = tag
-                    registered = True
-                for raw in daemonlink.poll(self._feed_port, os.getpid(), wait=FEED_WAIT_SECONDS):
-                    with contextlib.suppress(TypeError):
-                        self.deliver(telegram.Incoming(**raw))
-                failures = 0
-            except daemonlink.LinkError as exc:
-                failures += 1
-                registered = False
-                if failures >= FEED_FAILURES_BEFORE_TAKEOVER and daemonlink.read_daemon() is None:
-                    if poller_module.acquire(self.target.bot.id):
-                        log.write(f"transport: daemon gone ({exc}); polling the bot myself")
-                        self.own_poller = True
-                        self._feed_port = 0
-                        self._start_poller()
-                        return
-                self._feed_stop.wait(FEED_RETRY_SECONDS)
-                record = daemonlink.read_daemon()
-                if record is not None:
-                    self._feed_port = int(record.get("port") or self._feed_port)
+    def join(self, timeout: float = 10.0) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
 
     def _run_on_slot(self) -> Relaunch | None:
         self.tried.add(self.slot)
         self._relaunch = None
         self.bus = None
         if wrapper.wants_hook_bus(self.config, self.args):
-            self.bus = wrapper.open_hook_bus(self.config, self.slot)
+            self.bus = wrapper.open_hook_bus(self.config, self.slot, key=self.tag)
             self.bus.subscribe(self._on_hook)
 
         driver = Driver(
@@ -263,6 +202,7 @@ class Session:
             resume=self.resume,
             listener=lambda event: self._inbox.put(("event", (driver, event))),
             bus=self.bus,
+            settings_key=self.tag,
         )
         self.driver = driver
         self.prompter = Prompter(driver, timeout_seconds=self.prompt_timeout)
@@ -274,11 +214,7 @@ class Session:
             self.exit_code = 2
             return None
         self.session_id = driver.session_id
-        update_session(session_id=self.session_id, cwd=str(self.cwd), slot=self.slot)
-        if self._feed_port and self.resume:
-            # The daemon shows cwd and slot in /sessions; keep it current.
-            with contextlib.suppress(daemonlink.LinkError):
-                daemonlink.register(self._feed_port, self._route_record())
+        update_session(session_id=self.session_id, cwd=str(self.cwd), slot=self.slot, key=self.tag)
 
         if not self.resume:
             self._say(self._banner())
@@ -289,7 +225,7 @@ class Session:
             self._loop()
         finally:
             driver.close()
-            wrapper.close_hook_bus(self.bus)
+            wrapper.close_hook_bus(self.bus, key=self.tag)
             self.bus = None
         return self._relaunch
 
@@ -323,9 +259,6 @@ class Session:
                 self._on_incoming(item)
             elif kind == "line":
                 self._on_line(item, source="console")
-            elif kind == "busy":
-                self._say(t("tg.token_busy", reason=item))
-                self._closing = True
             if self._relaunch is not None or self._closing:
                 return
 
@@ -336,18 +269,16 @@ class Session:
             self.target.bot.typing(self.target.chat, thread_id=self.target.thread)
         for outcome in self.prompter.tick():
             self._apply(outcome)
-        if self.poller is not None and time.time() - self._last_lock_refresh > LOCK_REFRESH_SECONDS:
-            self._last_lock_refresh = time.time()
-            poller_module.refresh(self.target.bot.id)
 
     # -- inputs ------------------------------------------------------------
 
     def deliver(self, incoming: telegram.Incoming) -> None:
-        """An update from whoever polls the bot."""
+        """A message the transport has already decided is ours."""
         self._inbox.put(("incoming", incoming))
 
-    def _on_busy(self, reason: str) -> None:
-        self._inbox.put(("busy", reason))
+    def type_line(self, text: str) -> None:
+        """A line typed in the console window of the process."""
+        self._inbox.put(("line", text))
 
     def _on_hook(self, event: hookbus.HookEvent) -> dict[str, Any] | None:
         if event.name == "StopFailure" and event.payload.get("error") == "rate_limit":
@@ -358,19 +289,7 @@ class Session:
             self._inbox.put(("event", (self.driver, wall)))
         return None
 
-    def _console_loop(self) -> None:
-        while not self._closing:
-            try:
-                line = sys.stdin.readline()
-            except (OSError, ValueError):
-                return
-            if not line:
-                return
-            self._inbox.put(("line", line.rstrip("\r\n")))
-
     def _on_incoming(self, incoming: telegram.Incoming) -> None:
-        if not self.target.accepts(incoming):
-            return
         assert self.prompter is not None
         if incoming.is_callback:
             data = incoming.callback_data
@@ -386,23 +305,14 @@ class Session:
             self.target.bot.answer_callback(incoming.callback_id, outcome.ack)
             self._apply(outcome)
             return
-        parsed = address(incoming.text, prefix=self.target.prefix, aliases=[self.alias] if self.alias else [])
-        if parsed is None:
-            return
-        if self.alias and parsed.alias != self.alias and not parsed.body.startswith("/claude"):
-            # Addressed to nobody in particular: only a nameless session
-            # takes those, and this one has a name.
-            return
-        if parsed.body.startswith("/claude"):
-            return  # the daemon's business, not ours
-        self._on_line(parsed.body, source="telegram", user=incoming.username or str(incoming.user_id))
+        # Answering the message that triggered the turn is what tells people
+        # apart when several of them share a chat.
+        self._reply_to = incoming.message_id
+        self._on_line(incoming.text, source="telegram", user=incoming.username or str(incoming.user_id))
 
     def _on_line(self, text: str, *, source: str, user: str = "") -> None:
         assert self.driver is not None and self.prompter is not None
         line = text.strip()
-        if source == "console" and self.alias and line.startswith(self.alias + " "):
-            line = line[len(self.alias) :].strip()
-
         if not line:
             if source == "telegram":
                 self._say(self._status())
@@ -556,22 +466,21 @@ class Session:
         return election.target
 
     def _save_profile(self) -> None:
-        if not self.alias:
-            self._say(t("tg.save_needs_name"))
-            return
-        profile = {
-            "chat": self.target.chat,
-            "thread": self.target.thread,
-            "cwd": str(self.cwd),
-            "slot": self.slot,
-            "args": list(self.args),
-        }
-        config = Config.load()
-        sessions = dict(config.telegram.get("sessions") or {})
-        sessions[self.alias] = profile
-        config.telegram = {**config.telegram, "sessions": sessions}
-        config.save()
-        self._say(t("tg.saved", name=self.alias, cwd=self.cwd, slot=self.slot))
+        """Pin what this conversation is doing to its profile."""
+        chats = tuple({*self.profile.chats, (self.target.chat, self.target.thread)})
+        saved = profiles_module.Profile(
+            name=self.profile.name,
+            chats=chats,
+            cwd=str(self.cwd),
+            slot=self.slot,
+            daemon=self.profile.daemon,
+            multi=self.profile.multi,
+            users=self.profile.users,
+            args=self.profile.args,
+        )
+        profiles_module.save(saved)
+        self.profile = saved
+        self._say(t("tg.saved", name=saved.name, cwd=self.cwd, slot=self.slot))
 
     # -- events from claude -----------------------------------------------
 
@@ -667,9 +576,14 @@ class Session:
 
     def _say(self, html_text: str, *, markup: dict[str, Any] | None = None, plain: str | None = None) -> int:
         self._console(plain if plain is not None else telegram.strip_html(html_text))
+        reply_to, self._reply_to = self._reply_to, 0
         try:
             return self.target.bot.send_message(
-                self.target.chat, html_text, thread_id=self.target.thread, reply_markup=markup
+                self.target.chat,
+                html_text,
+                thread_id=self.target.thread,
+                reply_markup=markup,
+                reply_to=reply_to,
             )
         except (telegram.TelegramError, telegram.Unreachable) as exc:
             log.write(f"telegram: send failed: {exc}")
@@ -677,11 +591,8 @@ class Session:
             return 0
 
     def _console(self, text: str) -> None:
-        if sys.stdout is None:
-            return  # spawned without a window: nothing to mirror into
-        with contextlib.suppress(OSError, ValueError):
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
+        if self._on_console is not None:
+            self._on_console(text)
 
     def _banner(self) -> str:
         label = Accounts.load().ensure(self.slot).label
@@ -690,7 +601,7 @@ class Session:
             slot=self.slot,
             label=_plain(label),
             cwd=_plain(str(self.cwd)),
-            alias=self.alias or "—",
+            alias=self.profile.name,
             session=self.session_id[:8],
         )
 
@@ -701,13 +612,13 @@ class Session:
             state = t("tg.state_waiting")
         return t(
             "tg.status",
-            alias=self.alias or "—",
+            alias=self.profile.name,
             slot=self.slot,
             cwd=_plain(str(self.cwd)),
             session=self.session_id,
             model=self.driver.model or "?",
             state=state,
-            uptime=int(time.time() - self.driver.started_at) // 60,
+            uptime=int(time.time() - self.started_at) // 60,
         )
 
     def _usage(self) -> str:
@@ -750,4 +661,4 @@ def resolve_dir(raw: str, base: Path, *, roots: list[Any]) -> Path | None:
     return candidate
 
 
-__all__ = ["ChatTarget", "Session", "resolve_dir"]
+__all__ = ["ChatTarget", "Conversation", "Relaunch", "resolve_dir"]

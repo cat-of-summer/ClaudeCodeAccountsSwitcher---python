@@ -61,6 +61,7 @@ class Driver:
         resume: bool = False,
         listener: Listener,
         bus: hookbus.HookBus | None = None,
+        settings_key: str = "",
     ) -> None:
         self.config = config
         self.slot = slot
@@ -71,6 +72,7 @@ class Driver:
         self.resume = resume
         self.listener = listener
         self.bus = bus
+        self.settings_key = settings_key
 
         self.process: subprocess.Popen[bytes] | None = None
         self.model = ""
@@ -109,7 +111,7 @@ class Driver:
                 head += ["--name", self.name]
         args = list(self.args)
         if self.bus is not None:
-            args = hookbus.prepare_args(self.bus, args, wrapper.settings_file())
+            args = hookbus.prepare_args(self.bus, args, wrapper.settings_file(self.settings_key))
         return [*head, *wrapper.merge_default_args(self.config.default_args, args)]
 
     def start(self) -> None:

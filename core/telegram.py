@@ -332,6 +332,28 @@ class PollState:
     updates: int = field(default=0)
 
 
+def skip_pending(bot: Bot, state: PollState) -> bool:
+    """Mark everything queued before now as read; True when there was a backlog.
+
+    Nobody was listening while those piled up, and replaying a day of
+    `/claude` lines the moment the daemon comes up would open a window per
+    line. `offset=-1` is Telegram's way of asking for just the last update.
+    """
+    try:
+        last = bot.call("getUpdates", {"offset": -1, "timeout": 0}, timeout=REQUEST_TIMEOUT_SECONDS)
+    except TokenBusy:
+        raise
+    except (TelegramError, Unreachable) as exc:
+        log.write(f"telegram: could not skip the backlog ({exc}); starting from it")
+        return False
+    entries = [entry for entry in (last or []) if isinstance(entry, dict)]
+    if not entries:
+        return False
+    state.offset = int(entries[-1].get("update_id") or 0) + 1
+    log.write("telegram: backlog skipped, listening from now")
+    return True
+
+
 def poll_once(bot: Bot, state: PollState, *, timeout: int = POLL_TIMEOUT_SECONDS) -> list[Incoming]:
     """One getUpdates round with the offset and backoff bookkeeping done.
 

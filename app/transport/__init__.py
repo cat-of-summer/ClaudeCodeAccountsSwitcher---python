@@ -1,9 +1,9 @@
-"""`claude -t telegram ...`: a session that lives in a chat.
+"""`claude -t telegram ...`: a profile, running in a chat.
 
 The wrapper strips ccas's own flags off the command line and lands here with
-the slot already chosen. What is left to decide is which bot and chat the
-session belongs to (the flags win over config.json), which directory it runs
-in, and whether it polls the bot itself or lets the daemon feed it.
+the slot already chosen. What is left to decide is which profile this is
+(`-n name`, else `default`), where it runs and which chats it serves -- the
+profile answers all three, and the flags override it for this one launch.
 """
 
 from __future__ import annotations
@@ -11,7 +11,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from app.transport.routing import LaunchOptions, TRANSPORTS
+from app.transport import profiles as profiles_module
+from app.transport.profiles import DEFAULT_PROFILE, Profile
+from app.transport.routing import TRANSPORTS, LaunchOptions
 from core import telegram
 from core.store import Config
 from ui.i18n import t
@@ -21,56 +23,75 @@ class TransportError(Exception):
     pass
 
 
-def resolve_target(config: Config, options: LaunchOptions) -> "ChatTarget":
-    from app.transport.session import ChatTarget
+def resolve_profile(config: Config, options: LaunchOptions) -> Profile:
+    known = profiles_module.load(config)
+    name = options.name or os.environ.get("CCAS_TELEGRAM_PROFILE") or DEFAULT_PROFILE
+    profile = known.get(name)
+    if profile is None:
+        raise TransportError(
+            t("tg.no_profile", name=name, names=", ".join(sorted(known)))
+        )
+    return profile
 
-    settings = config.telegram
-    token = options.token or str(settings.get("token") or "")
+
+def resolve_bot(config: Config, options: LaunchOptions) -> telegram.Bot:
+    token = options.token or str(config.telegram.get("token") or "")
     if not telegram.looks_like_token(token):
         raise TransportError(t("tg.no_token"))
-    chat = options.chat or int(settings.get("chat") or 0)
-    if not chat:
-        raise TransportError(t("tg.no_chat"))
-    thread = options.thread or int(settings.get("thread") or 0)
-    users = [int(user) for user in (settings.get("users") or []) if str(user).strip().lstrip("-").isdigit()]
-    return ChatTarget(
-        bot=telegram.Bot(token),
-        chat=chat,
-        thread=thread,
-        users=users,
-        prefix=str(settings.get("prefix") or ""),
-    )
+    return telegram.Bot(token)
 
 
-def resolve_cwd(config: Config, options: LaunchOptions) -> Path:
-    from app.transport.session import resolve_dir
+def resolve_cwd(config: Config, profile: Profile, options: LaunchOptions) -> Path:
+    from app.transport.conversation import resolve_dir
 
     if options.cwd:
         target = resolve_dir(options.cwd, Path.cwd(), roots=config.telegram.get("roots") or [])
         if target is None:
             raise TransportError(t("tg.cd_bad", path=options.cwd))
         return target
-    return Path.cwd()
+    return profile.resolve_cwd(config)
 
 
-def run(config: Config, slot: int, args: list[str], options: LaunchOptions) -> int:
+def run(
+    config: Config,
+    slot: int,
+    args: list[str],
+    options: LaunchOptions,
+    *,
+    slot_explicit: bool = False,
+) -> int:
     if options.transport not in TRANSPORTS:
-        raise TransportError(t("tg.unknown_transport", transport=options.transport, known=", ".join(TRANSPORTS)))
+        raise TransportError(
+            t("tg.unknown_transport", transport=options.transport, known=", ".join(TRANSPORTS))
+        )
 
-    from app.transport.session import Session
+    from app.transport.transport import Transport
 
-    target = resolve_target(config, options)
-    cwd = resolve_cwd(config, options)
-    # The daemon, when it spawned us, says so: it polls, we only listen.
-    fed_by_daemon = bool(os.environ.get("CCAS_TELEGRAM_FEED"))
-    session = Session(
+    profile = resolve_profile(config, options)
+    bot = resolve_bot(config, options)
+    cwd = resolve_cwd(config, profile, options)
+    if options.chat and not profile.open_to(options.chat, options.thread):
+        raise TransportError(
+            t(
+                "daemon.profile_elsewhere",
+                name=profile.name,
+                chats=", ".join(profiles_module.format_chat(ref) for ref in profile.chats),
+            )
+        )
+
+    # A slot typed on the command line beats the profile; the profile beats
+    # whatever the wrapper would have resumed by default.
+    chosen = slot if slot_explicit else (profile.slot or slot)
+
+    transport = Transport(
         config,
-        slot=slot,
-        target=target,
+        profile,
+        bot=bot,
+        slot=chosen,
         cwd=cwd,
         args=args,
-        alias=options.name,
-        own_poller=not fed_by_daemon,
+        chat=options.chat,
+        thread=options.thread,
         tag=os.environ.get("CCAS_TELEGRAM_TAG") or "s",
     )
-    return session.run()
+    return transport.run()
