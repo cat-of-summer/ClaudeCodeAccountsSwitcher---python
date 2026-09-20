@@ -93,12 +93,10 @@ class ConversationsPerPerson(TransportBase):
 
         self.assertEqual(len(transport.conversations), 2)
         self.assertEqual(sorted(transport.conversations), [(CHAT, 0, 7), (CHAT, 0, 8)])
-        self.wait_for(
-            lambda: all(
-                c.driver is not None and c.driver.session_id
-                for c in transport.conversations.values()
-            )
-        )
+        # The conversation takes its id from a claude that actually started,
+        # so waiting on the same field the assertion reads turns a failed
+        # launch into a timeout here instead of a puzzling count below.
+        self.wait_for(lambda: all(c.session_id for c in transport.conversations.values()))
         sessions = {c.session_id for c in transport.conversations.values()}
         self.assertEqual(len(sessions), 2)
 
