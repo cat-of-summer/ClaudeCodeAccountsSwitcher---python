@@ -21,6 +21,7 @@
 - [test_pathenv.py](test_pathenv.py.md)
 - [test_profiles.py](test_profiles.py.md)
 - [test_prompter.py](test_prompter.py.md)
+- [test_reinstall.py](test_reinstall.py.md)
 - [test_settings.py](test_settings.py.md)
 - [test_store.py](test_store.py.md)
 - [test_supervise.py](test_supervise.py.md)
