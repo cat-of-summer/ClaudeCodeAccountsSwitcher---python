@@ -610,6 +610,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if waiting:
         report(WARN, t("doctor.upgrade_pending", names=", ".join(path.name for path in waiting)))
         problems += 1
+        holding = installer.blocking_processes()
+        if holding:
+            report(WARN, t("doctor.upgrade_blocked", who=", ".join(f"[{p.pid}] {p.name}" for p in holding)))
 
     entry_present = installer.path_entry_present()
     if entry_present:

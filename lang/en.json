@@ -375,5 +375,12 @@
   "tg.elicit_need_number": "a number is expected",
   "tg.elicit_accepted": "allowed",
   "tg.elicit_declined": "refused",
-  "tg.elicit_cancelled": "cancelled"
+  "tg.elicit_cancelled": "cancelled",
+  "install.blocking_header": "⚠️  Running processes are holding the files this upgrade replaces and will be closed:",
+  "install.blocking_line": "   [{pid}] {name}",
+  "install.blocking_confirm": "Close them and carry on?",
+  "install.blocking_closed": "Closed: {count}",
+  "install.blocking_left": "Left running — the new build lands beside the old one as *.new and is applied the next time ccas starts.",
+  "install.blocking_survived": "Could not close: {pids}. The new build will be applied the next time ccas starts.",
+  "doctor.upgrade_blocked": "held by {who} — `ccas install` closes them after asking"
 }

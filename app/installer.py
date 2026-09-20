@@ -30,7 +30,7 @@ from core.store import (
     write_json_atomic,
 )
 from core.version import SCHEMA_VERSION, __version__
-from system import secure
+from system import procs, secure
 from ui import i18n
 from ui.i18n import t
 
@@ -317,6 +317,9 @@ def install(
     )
     config.save()
 
+    # Anything still running out of the shim directory would keep the new
+    # binaries from landing, and the old ones would go on running.
+    free_shims(ask=ask, reporter=reporter)
     install_shims()
     ensure_path_entry()
 
@@ -405,6 +408,45 @@ def refresh_claude_path(config: Config) -> bool:
     config.save()
     log.write(f"real claude path refreshed to {found}")
     return True
+
+
+def blocking_processes() -> list[procs.Process]:
+    """Running copies of our own binaries that an upgrade cannot overwrite.
+
+    Every window with a Telegram session in it, the daemon, and any claude
+    started through the shim holds `claude`/`ccas` open. The installer's own
+    process is not in the list: it cannot free its own file, which is what
+    the `.new` hand-off is for.
+    """
+    return procs.using(bin_dir())
+
+
+def free_shims(
+    *,
+    ask: Callable[[str, bool], bool] | None = None,
+    reporter: Callable[[str], None] = print,
+) -> list[procs.Process]:
+    """Warn about what holds the binaries and close it. Returns what is left.
+
+    With no `ask` (an unattended `--yes` install) the warning is printed and
+    the processes are closed without a question.
+    """
+    blocking = blocking_processes()
+    if not blocking:
+        return []
+    reporter(t("install.blocking_header"))
+    for process in blocking:
+        reporter(t("install.blocking_line", pid=process.pid, name=process.name))
+    if ask is not None and not ask(t("install.blocking_confirm"), True):
+        reporter(t("install.blocking_left"))
+        return blocking
+    survivors = [process for process in blocking if not procs.kill(process.pid)]
+    log.write(f"install: closed {len(blocking) - len(survivors)} of {len(blocking)} blocking processes")
+    if survivors:
+        reporter(t("install.blocking_survived", pids=", ".join(str(p.pid) for p in survivors)))
+    else:
+        reporter(t("install.blocking_closed", count=len(blocking)))
+    return survivors
 
 
 def pending_upgrade() -> list[Path]:

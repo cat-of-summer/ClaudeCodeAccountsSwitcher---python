@@ -375,5 +375,12 @@
   "tg.elicit_need_number": "нужно число",
   "tg.elicit_accepted": "разрешено",
   "tg.elicit_declined": "отказано",
-  "tg.elicit_cancelled": "отменено"
+  "tg.elicit_cancelled": "отменено",
+  "install.blocking_header": "⚠️  Файлы, которые обновляются, держат запущенные процессы — они будут закрыты:",
+  "install.blocking_line": "   [{pid}] {name}",
+  "install.blocking_confirm": "Закрыть их и продолжить?",
+  "install.blocking_closed": "Закрыто процессов: {count}",
+  "install.blocking_left": "Оставлены работать — новая сборка ляжет рядом как *.new и применится при следующем запуске ccas.",
+  "install.blocking_survived": "Не удалось закрыть: {pids}. Новая сборка применится при следующем запуске ccas.",
+  "doctor.upgrade_blocked": "держат {who} — `ccas install` закроет их, спросив перед этим"
 }

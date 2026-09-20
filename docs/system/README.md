@@ -8,6 +8,7 @@
 - [console.py](console.py.md)
 - [pathenv_posix.py](pathenv_posix.py.md)
 - [pathenv_win.py](pathenv_win.py.md)
+- [procs.py](procs.py.md)
 - [secure.py](secure.py.md)
 - [shell.py](shell.py.md)
 

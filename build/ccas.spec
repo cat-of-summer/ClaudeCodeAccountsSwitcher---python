@@ -76,6 +76,7 @@ HIDDEN = [
     "system.autostart",
     "system.childjob",
     "system.console",
+    "system.procs",
     "system.secure",
     "system.shell",
     "ui.i18n",
