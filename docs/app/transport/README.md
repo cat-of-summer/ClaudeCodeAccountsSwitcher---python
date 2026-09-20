@@ -3,12 +3,14 @@
 
 ## Файлы
 
+- [conversation.py](conversation.py.md)
 - [daemonlink.py](daemonlink.py.md)
 - [driver.py](driver.py.md)
 - [poller.py](poller.py.md)
+- [profiles.py](profiles.py.md)
 - [prompter.py](prompter.py.md)
 - [routing.py](routing.py.md)
-- [session.py](session.py.md)
+- [transport.py](transport.py.md)
 
 <!-- DOCGEN:END -->
 
