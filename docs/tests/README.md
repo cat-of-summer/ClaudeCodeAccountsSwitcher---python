@@ -23,6 +23,7 @@
 - [test_prompter.py](test_prompter.py.md)
 - [test_reinstall.py](test_reinstall.py.md)
 - [test_settings.py](test_settings.py.md)
+- [test_shell.py](test_shell.py.md)
 - [test_store.py](test_store.py.md)
 - [test_supervise.py](test_supervise.py.md)
 - [test_telegram_api.py](test_telegram_api.py.md)
