@@ -64,7 +64,7 @@
   "autoswitch.waiting_title": "жду слот {slot}, {minutes} мин",
   "autoswitch.wait_cancelled": "ожидание отменено — продолжить вручную, когда слот освободится",
   "autoswitch.wait_too_long": "ближайший откроется слот {slot} ({label}) в {opens}, через {minutes} мин — дольше лимита ожидания {limit} мин, остаюсь",
-  "autoswitch.default_resume_prompt": "Проверь запущенные процессы, перезапусти что отключилось, продолжай.",
+  "autoswitch.default_resume_prompt": "Если запускал процессы, проверь их статус, при необходимости перезапусти их и агентов, продолжай работу.",
 
   "cli.no_slots_hint": "Слотов пока нет. Запусти `claude` и войди — слот создастся сам.",
   "cli.no_slots": "Слотов пока нет.",
