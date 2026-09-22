@@ -2,8 +2,9 @@
 
 The wrapper strips ccas's own flags off the command line and lands here with
 the slot already chosen. What is left to decide is which profile this is
-(`-n name`, else `default`), where it runs and which chats it serves -- the
-profile answers all three, and the flags override it for this one launch.
+(`-P id`, else `-n alias` when only one profile carries it, else the only
+profile there is), where it runs and which chats it serves -- the profile
+answers all three, and the flags override it for this one launch.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import os
 from pathlib import Path
 
 from app.transport import profiles as profiles_module
-from app.transport.profiles import DEFAULT_PROFILE, Profile
+from app.transport.profiles import Profile
 from app.transport.routing import TRANSPORTS, LaunchOptions
 from core import telegram
 from core.store import Config
@@ -23,15 +24,30 @@ class TransportError(Exception):
     pass
 
 
+def _listing(profiles: dict[int, Profile]) -> str:
+    return ", ".join(profile.label for profile in profiles.values()) or "—"
+
+
 def resolve_profile(config: Config, options: LaunchOptions) -> Profile:
     known = profiles_module.load(config)
-    name = options.name or os.environ.get("CCAS_TELEGRAM_PROFILE") or DEFAULT_PROFILE
-    profile = known.get(name)
-    if profile is None:
+    number = options.profile or int(os.environ.get("CCAS_TELEGRAM_PROFILE") or 0)
+    if number:
+        profile = known.get(number)
+        if profile is None:
+            raise TransportError(t("tg.no_profile", name=number, names=_listing(known)))
+        return profile
+    if options.name:
+        named = profiles_module.by_alias(known, options.name)
+        if len(named) == 1:
+            return named[0]
+        if not named:
+            raise TransportError(t("tg.no_profile", name=options.name, names=_listing(known)))
         raise TransportError(
-            t("tg.no_profile", name=name, names=", ".join(sorted(known)))
+            t("tg.profile_ambiguous", alias=options.name, ids=", ".join(str(p.id) for p in named))
         )
-    return profile
+    if len(known) == 1:
+        return next(iter(known.values()))
+    raise TransportError(t("tg.pick_profile", names=_listing(known)))
 
 
 def resolve_bot(config: Config, options: LaunchOptions) -> telegram.Bot:
@@ -49,7 +65,7 @@ def resolve_cwd(config: Config, profile: Profile, options: LaunchOptions) -> Pat
         if target is None:
             raise TransportError(t("tg.cd_bad", path=options.cwd))
         return target
-    return profile.resolve_cwd(config)
+    return profile.resolve_cwd()
 
 
 def run(
@@ -74,7 +90,7 @@ def run(
         raise TransportError(
             t(
                 "daemon.profile_elsewhere",
-                name=profile.name,
+                name=profile.label,
                 chats=", ".join(profiles_module.format_chat(ref) for ref in profile.chats),
             )
         )
@@ -89,7 +105,9 @@ def run(
         bot=bot,
         slot=chosen,
         cwd=cwd,
-        args=args,
+        # The profile's own arguments and this launch's, merged here and
+        # nowhere else; `defaultArgs` joins them when claude is started.
+        args=[*profile.args, *args],
         chat=options.chat,
         thread=options.thread,
         tag=os.environ.get("CCAS_TELEGRAM_TAG") or "s",

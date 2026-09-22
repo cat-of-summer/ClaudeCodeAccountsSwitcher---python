@@ -11,6 +11,7 @@ finds out.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import html
 import json
 import re
@@ -81,10 +82,17 @@ class Incoming:
     callback_id: str = ""
     callback_data: str = ""
     username: str = ""
+    # `/rik! ...`: the person wants the agent to drop what it is doing and
+    # read this now. Set by routing once the alias has been peeled off.
+    urgent: bool = False
 
     @property
     def is_callback(self) -> bool:
         return bool(self.callback_id)
+
+    def with_text(self, text: str, *, urgent: bool | None = None) -> "Incoming":
+        """The same update with the alias peeled off the line."""
+        return dataclasses.replace(self, text=text, urgent=self.urgent if urgent is None else urgent)
 
 
 def parse_update(update: dict[str, Any]) -> Incoming | None:

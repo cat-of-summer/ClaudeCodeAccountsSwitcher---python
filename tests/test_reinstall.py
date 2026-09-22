@@ -43,29 +43,29 @@ class ReinstallKeepsWhatWasConfigured(TempHome):
         self._install()
 
         config = Config.load()
-        config.telegram = {**config.telegram, "token": TOKEN, "prefix": "cc:"}
+        config.telegram = {**config.telegram, "token": TOKEN, "roots": ["/srv"]}
         config.hooks = [{"event": "Stop", "command": "say done"}]
         config.hooks_bus = False
         config.save()
-        profiles_module.save(
-            Profile(name="rik", chats=((-5595440781, 0),), cwd=str(self.home), tech=True)
+        rik = profiles_module.add(
+            Profile(alias="rik", chats=((-5595440781, 0),), cwd=str(self.home), debug=True)
         )
 
         after = self._install()
         self.assertEqual(after.telegram["token"], TOKEN)
-        self.assertEqual(after.telegram["prefix"], "cc:")
+        self.assertEqual(after.telegram["roots"], ["/srv"])
         self.assertEqual(after.hooks, [{"event": "Stop", "command": "say done"}])
         self.assertFalse(after.hooks_bus)
 
-        rik = profiles_module.load(after)["rik"]
+        rik = profiles_module.load(after)[rik.id]
         self.assertEqual(rik.chats, ((-5595440781, 0),))
         self.assertEqual(rik.cwd, str(self.home))
-        self.assertTrue(rik.tech)
+        self.assertTrue(rik.debug)
 
     def test_a_first_install_starts_from_the_defaults(self) -> None:
         config = self._install()
         self.assertEqual(config.telegram["token"], "")
-        self.assertEqual(list(profiles_module.load(config)), ["default"])
+        self.assertEqual(profiles_module.load(config), {})
 
 
 class InstallClosesWhatBlocksIt(TempHome):

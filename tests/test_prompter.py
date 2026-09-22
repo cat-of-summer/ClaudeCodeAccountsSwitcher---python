@@ -114,9 +114,9 @@ class Questions(TempHome):
 
     def test_cancel_forgets_the_request(self) -> None:
         prompt = self.prompter.on_ask(ask("r6", [COLOUR]))
-        self.assertEqual(self.prompter.on_cancel("r6"), prompt.key)
+        self.assertEqual(self.prompter.on_cancel("r6"), (prompt.key, "question"))
         self.assertEqual(self.prompter.open, [])
-        self.assertEqual(self.prompter.on_cancel("r6"), "")
+        self.assertEqual(self.prompter.on_cancel("r6"), ("", ""))
 
 
 class Permissions(TempHome):
@@ -216,6 +216,36 @@ class LeavingPlanMode(TempHome):
         self.prompter.on_ask(plan("p5"))
         self.assertTrue(self.prompter.on_text("1").consumed)
         self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "acceptEdits")  # type: ignore[index]
+
+    def test_a_session_that_may_bypass_goes_back_to_it(self) -> None:
+        prompter = Prompter(self.driver, bypass_available=True)  # type: ignore[arg-type]
+        prompt = prompter.on_ask(plan("p6"))
+        self.assertIn("bypass", prompt.rows[0][0].label)
+        outcome = prompter.on_callback(prompt.rows[0][0].data)
+        self.assertEqual(outcome.mode, "bypassPermissions")
+        self.assertEqual(outcome.kind, "plan")
+        self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "bypassPermissions")  # type: ignore[index]
+        prompter.on_ask(plan("p7"))
+        prompter.on_text("1")
+        self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "bypassPermissions")  # type: ignore[index]
+
+    def test_a_bypass_button_pressed_where_it_is_not_available_accepts_edits(self) -> None:
+        self.prompter.on_ask(plan("p8"))
+        self.prompter.on_callback("a:1:0:b")
+        self.assertEqual(self.driver.responses[-1][1]["updatedPermissions"][0]["mode"], "acceptEdits")  # type: ignore[index]
+
+    def test_every_answer_says_what_kind_of_prompt_it_closed(self) -> None:
+        prompt = self.prompter.on_ask(permission("k1", "Bash", {"command": "ls"}))
+        self.assertEqual(self.prompter.kind_of(permission("k1", "Bash", {"command": "ls"})), "permission")
+        self.assertEqual(self.prompter.on_callback(prompt.rows[0][0].data).kind, "permission")
+        prompt = self.prompter.on_ask(plan("k2"))
+        self.assertEqual(self.prompter.on_callback(prompt.rows[1][0].data).kind, "plan")
+
+    def test_allow_answers_without_a_prompt(self) -> None:
+        self.prompter.allow(permission("k3", "Bash", {"command": "ls"}))
+        self.assertEqual(self.prompter.open, [])
+        self.assertEqual(self.driver.responses[-1][0], "k3")
+        self.assertEqual(self.driver.responses[-1][1]["behavior"], "allow")  # type: ignore[index]
 
 
 def elicitation(request_id: str, **fields: Any) -> Event:

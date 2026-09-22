@@ -24,10 +24,19 @@ from ui.i18n import t
 
 ASK_TOOL = "AskUserQuestion"
 # Leaving plan mode is a tool call the host approves, and approving it is
-# also where the next mode is chosen -- the same two choices the TUI offers.
+# also where the next mode is chosen -- the same choices the TUI offers. A
+# session started with permissions bypassed goes back to that; one that was
+# not cannot (claude refuses the mode unless it was enabled at launch) and
+# gets acceptEdits instead.
 PLAN_TOOL = "ExitPlanMode"
-PLAN_CHOICES = {"e": "acceptEdits", "m": "manual"}
+PLAN_CHOICES = {"b": "bypassPermissions", "e": "acceptEdits", "m": "manual"}
 CUSTOM_ANSWER = "__custom__"
+# What a prompt is, for the session to decide what becomes of its message
+# once answered.
+KIND_PERMISSION = "permission"
+KIND_QUESTION = "question"
+KIND_PLAN = "plan"
+KIND_ELICIT = "elicit"
 INPUT_PREVIEW_LIMIT = 600
 PLAN_PREVIEW_LIMIT = 3000
 DONE_MARK = "✅"
@@ -58,6 +67,7 @@ class Outcome:
     mode: str = ""  # the permission mode this answer switched claude into
     consumed: bool = False
     close_prompt: str = ""  # key of the prompt whose keyboard is done
+    kind: str = ""  # what that prompt was (KIND_*)
     summary: str = ""  # a line to show in place of the keyboard
     next_prompt: Prompt | None = None
     finished_request: str = ""
@@ -94,14 +104,25 @@ class _Pending:
     def is_elicit(self) -> bool:
         return self.elicit is not None
 
+    @property
+    def kind(self) -> str:
+        if self.is_elicit:
+            return KIND_ELICIT
+        if self.is_question:
+            return KIND_QUESTION
+        if self.is_plan:
+            return KIND_PLAN
+        return KIND_PERMISSION
+
     def key(self) -> str:
         return f"{self.number}:{self.index}"
 
 
 class Prompter:
-    def __init__(self, driver: Driver, *, timeout_seconds: float = 0.0) -> None:
+    def __init__(self, driver: Driver, *, timeout_seconds: float = 0.0, bypass_available: bool = False) -> None:
         self.driver = driver
         self.timeout = timeout_seconds
+        self.bypass_available = bypass_available
         self._pending: dict[str, _Pending] = {}
         self._by_number: dict[int, _Pending] = {}
         self._counter = 0
@@ -126,6 +147,28 @@ class Prompter:
         return None
 
     # -- arrivals ----------------------------------------------------------
+
+    @staticmethod
+    def kind_of(event: Event) -> str:
+        """What a `can_use_tool` request is, before anything is made of it."""
+        name = str(event.data.get("tool_name") or "")
+        if name == ASK_TOOL:
+            return KIND_QUESTION
+        if name == PLAN_TOOL:
+            return KIND_PLAN
+        return KIND_PERMISSION
+
+    def allow(self, event: Event) -> None:
+        """Answer a permission request yes without showing it to anyone.
+
+        Plan mode in a headless claude turns every edit and command into a
+        request, where the TUI with bypass enabled would simply run it; the
+        session uses this to give the chat the same experience.
+        """
+        self.driver.respond(
+            str(event.data.get("request_id") or ""),
+            result={"behavior": "allow", "updatedInput": dict(event.data.get("input") or {})},
+        )
 
     def on_ask(self, event: Event) -> Prompt:
         data = event.data
@@ -166,12 +209,13 @@ class Prompter:
         self._by_number[pending.number] = pending
         return self._elicit_prompt(pending)
 
-    def on_cancel(self, request_id: str) -> str:
+    def on_cancel(self, request_id: str) -> tuple[str, str]:
+        """The key and kind of the prompt claude withdrew; empty if none."""
         pending = self._pending.pop(request_id, None)
         if pending is None:
-            return ""
+            return "", ""
         self._by_number.pop(pending.number, None)
-        return pending.key()
+        return pending.key(), pending.kind
 
     def tick(self) -> list[Outcome]:
         """Expire requests nobody answered; returns what to show for each."""
@@ -191,7 +235,7 @@ class Prompter:
                     result={"behavior": "deny", "message": t("tg.prompt_timed_out_reason")},
                 )
             outcomes.append(
-                Outcome(close_prompt=pending.key(), summary=t("tg.prompt_timed_out"), finished_request=pending.request_id)
+                Outcome(close_prompt=pending.key(), kind=pending.kind, summary=t("tg.prompt_timed_out"), finished_request=pending.request_id)
             )
         return outcomes
 
@@ -233,7 +277,7 @@ class Prompter:
                 return self._choose(pending, "t")
             return Outcome()
         if pending.is_plan:
-            mapping = {"1": "e", "2": "m", "3": "n", "n": "n", "no": "n"}
+            mapping = {"1": self.plan_go_option(), "2": "m", "3": "n", "n": "n", "no": "n"}
         else:
             mapping = {"1": "y", "y": "y", "yes": "y", "2": "s", "3": "n", "n": "n", "no": "n"}
         if probe in mapping:
@@ -292,14 +336,20 @@ class Prompter:
         lines = [f"📋 <b>{_esc(t('tg.plan_ready'))}</b>"]
         if plan:
             lines.append(_esc(plan[:PLAN_PREVIEW_LIMIT]))
+        go = self.plan_go_option()
         rows = [
             [
-                Choice(t("tg.plan_go"), f"a:{pending.number}:0:e"),
+                Choice(t("tg.plan_go_bypass") if go == "b" else t("tg.plan_go"), f"a:{pending.number}:0:{go}"),
                 Choice(t("tg.plan_ask"), f"a:{pending.number}:0:m"),
             ],
             [Choice(t("tg.plan_revise"), f"a:{pending.number}:0:n")],
         ]
         return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+
+    def plan_go_option(self) -> str:
+        """What "carry on" after a plan means: back to bypass when the session
+        may be in it, otherwise accepting edits."""
+        return "b" if self.bypass_available else "e"
 
     def _permission_prompt(self, pending: _Pending) -> Prompt:
         lines = [f"🔐 <b>{_esc(pending.tool_name)}</b>", f"<pre>{_esc(describe_input(pending.tool_name, pending.tool_input))}</pre>"]
@@ -417,14 +467,14 @@ class Prompter:
         pending.index += 1
         pending.awaiting_text = False
         if pending.index < len(pending.fields):
-            return Outcome(consumed=True, close_prompt=key, summary=summary, next_prompt=self._elicit_prompt(pending))
+            return Outcome(consumed=True, close_prompt=key, kind=pending.kind, summary=summary, next_prompt=self._elicit_prompt(pending))
         outcome = self._settle_elicit(pending, {"action": "accept", "content": pending.content}, summary)
-        return Outcome(consumed=True, close_prompt=key, summary=summary, finished_request=outcome.finished_request)
+        return Outcome(consumed=True, close_prompt=key, kind=pending.kind, summary=summary, finished_request=outcome.finished_request)
 
     def _settle_elicit(self, pending: _Pending, result: dict[str, Any], summary: str) -> Outcome:
         self._finish(pending)
         self.driver.respond(pending.request_id, result=result)
-        return Outcome(consumed=True, close_prompt=pending.key(), summary=summary, finished_request=pending.request_id)
+        return Outcome(consumed=True, close_prompt=pending.key(), kind=pending.kind, summary=summary, finished_request=pending.request_id)
 
     def _choose(self, pending: _Pending, option: str) -> Outcome:
         if pending.is_elicit:
@@ -454,7 +504,7 @@ class Prompter:
                 pending.selected.discard(index)
             else:
                 pending.selected.add(index)
-            return Outcome(ack=t("tg.prompt_toggled"), consumed=True, next_prompt=self._question_prompt(pending), close_prompt=pending.key())
+            return Outcome(ack=t("tg.prompt_toggled"), consumed=True, next_prompt=self._question_prompt(pending), close_prompt=pending.key(), kind=pending.kind)
         return self._answer(pending, str(options[index].get("label") or ""))
 
     def _answer(self, pending: _Pending, answer: str) -> Outcome:
@@ -467,16 +517,18 @@ class Prompter:
         pending.index += 1
         pending.selected = set()
         if pending.index < len(pending.questions):
-            return Outcome(consumed=True, close_prompt=f"{pending.number}:{pending.index - 1}", summary=summary, next_prompt=self._question_prompt(pending))
+            return Outcome(consumed=True, close_prompt=f"{pending.number}:{pending.index - 1}", kind=pending.kind, summary=summary, next_prompt=self._question_prompt(pending))
         self._finish(pending)
         self.driver.respond(
             pending.request_id,
             result={"behavior": "allow", "updatedInput": {**pending.tool_input, "answers": pending.answers}},
         )
-        return Outcome(consumed=True, close_prompt=f"{pending.number}:{pending.index - 1}", summary=summary, finished_request=pending.request_id)
+        return Outcome(consumed=True, close_prompt=f"{pending.number}:{pending.index - 1}", kind=pending.kind, summary=summary, finished_request=pending.request_id)
 
     def _decide_permission(self, pending: _Pending, option: str) -> Outcome:
         if pending.is_plan and option in PLAN_CHOICES:
+            if option == "b" and not self.bypass_available:
+                option = "e"  # claude would refuse the mode; the nearest one that runs
             mode = PLAN_CHOICES[option]
             result = {
                 "behavior": "allow",
@@ -493,6 +545,7 @@ class Prompter:
             return Outcome(
                 consumed=True,
                 close_prompt=pending.key(),
+                kind=pending.kind,
                 summary=f"{DONE_MARK} {_esc(t('tg.plan_accepted', mode=mode))}",
                 finished_request=pending.request_id,
                 mode=mode,
@@ -511,7 +564,7 @@ class Prompter:
             return Outcome()
         self._finish(pending)
         self.driver.respond(pending.request_id, result=result)
-        return Outcome(consumed=True, close_prompt=pending.key(), summary=summary, finished_request=pending.request_id)
+        return Outcome(consumed=True, close_prompt=pending.key(), kind=pending.kind, summary=summary, finished_request=pending.request_id)
 
 
 def describe_input(tool_name: str, tool_input: dict[str, Any]) -> str:

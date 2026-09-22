@@ -127,18 +127,6 @@ def _set_token(config: Config, value: Any) -> None:
     _set_tg("token")(config, token)
 
 
-def _set_workdir(config: Config, value: Any) -> None:
-    text = str(value or "").strip()
-    if text:
-        candidate = Path(text).expanduser()
-        if not candidate.is_dir():
-            raise SettingError(t("config.bad_dir", path=candidate))
-        text = str(candidate)
-    _set_tg("workdir")(config, text)
-
-
-
-
 SETTINGS: tuple[Setting, ...] = (
     Setting("skip-permissions", "bool", _get_skip, _set_skip),
     Setting("auto-switch", "bool", _auto("enabled"), _set_auto("enabled")),
@@ -200,8 +188,6 @@ SETTINGS: tuple[Setting, ...] = (
         lambda config, value: setattr(config, "hooks_bus", bool(value)),
     ),
     Setting("telegram-token", "text", _tg("token"), _set_token, editable_in_screen=False, secret=True),
-    Setting("telegram-prefix", "text", _tg("prefix"), _set_tg("prefix"), editable_in_screen=False),
-    Setting("telegram-workdir", "dir", _tg("workdir"), _set_workdir, editable_in_screen=False),
     Setting("telegram-console", "bool", _tg("console"), _set_tg("console")),
     Setting(
         "telegram-max-sessions",

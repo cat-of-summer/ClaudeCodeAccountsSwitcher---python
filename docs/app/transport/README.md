@@ -23,7 +23,7 @@ Telegram-транспорт: сессия claude, живущая в чате.
 - [conversation.py](conversation.py.md) — один claude и один собеседник
 - [driver.py](driver.py.md) — headless claude по stream-json, control-протокол SDK
 - [prompter.py](prompter.py.md) — вопросы и разрешения как кнопки
-- [routing.py](routing.py.md) — кому строка: разбор `/claude`, префикса и имён профилей
+- [routing.py](routing.py.md) — кому строка: адрес `/алиас`, разбор `/claude` и команд сессии
 - [poller.py](poller.py.md) — поллер токена и его лок
 - [../../system/childjob.py](../../system/childjob.py.md) — дети, умирающие вместе с окном
 - [daemonlink.py](daemonlink.py.md) — как сессия и CLI говорят с демоном

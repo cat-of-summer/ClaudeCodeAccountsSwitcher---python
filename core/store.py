@@ -42,25 +42,23 @@ AUTO_SWITCH_STRATEGIES = ("limits", "order", "notify")
 # The bot token carries the bot id (the part before the colon), so there is
 # no separate field for it. Everything about *what* is listened to lives in
 # the profiles, not here: which chats, which directory, whether the daemon may
-# raise it on its own.
+# raise it on its own. `profiles` is keyed by a numeric id (as a string, the
+# way JSON keys are); the alias a chat says is a field, and may repeat.
 DEFAULT_TELEGRAM: dict[str, Any] = {
     "token": "",
     "users": [],
-    "prefix": "",
-    "workdir": "",
     "roots": [],
     "console": True,
     "promptTimeoutMinutes": 0,
     "maxSessions": 8,
-    "idleHours": 6,
+    # An hour of silence with nothing running is the end of a conversation:
+    # the next message starts a fresh one anyway.
+    "idleHours": 1,
     "profiles": {},
 }
 
-# The profile every unaliased message belongs to. It always exists, even when
-# the config file has never heard of it.
-DEFAULT_PROFILE = "default"
-
 DEFAULT_TELEGRAM_PROFILE: dict[str, Any] = {
+    "alias": "",
     "chats": [],
     "cwd": "",
     "slot": 0,
@@ -70,7 +68,7 @@ DEFAULT_TELEGRAM_PROFILE: dict[str, Any] = {
     # call -- the console window has those. Likewise a turn is one message
     # that gets rewritten, since the last thing said is the part worth
     # reading; `expanded` brings back the stream of messages.
-    "tech": False,
+    "debug": False,
     "expanded": False,
     # Empty means "whatever claude would start in": its own
     # permissions.defaultMode, or bypass when ccas passes the skip flag.
@@ -341,11 +339,19 @@ class Config:
         )
 
 
+# The schema-5/6 profile that heard every unaddressed line; schema 7 has no
+# such thing, and what was configured under it becomes a profile with this
+# alias.
+LEGACY_DEFAULT_PROFILE = "default"
+# The idle limit schema 6 shipped with; a config still holding it never chose it.
+LEGACY_IDLE_HOURS = 6
+
+
 def _telegram_to_profiles(raw: dict[str, Any]) -> dict[str, Any]:
     """Schema 4 -> 5: one listened chat and one daemon switch become profiles."""
     moved = dict(raw)
     profiles = dict(moved.pop("sessions", None) or moved.get("profiles") or {})
-    default = {**DEFAULT_TELEGRAM_PROFILE, **(profiles.get(DEFAULT_PROFILE) or {})}
+    default = {**DEFAULT_TELEGRAM_PROFILE, **(profiles.get(LEGACY_DEFAULT_PROFILE) or {})}
 
     chat = int(moved.pop("chat", 0) or 0)
     thread = int(moved.pop("thread", 0) or 0)
@@ -355,7 +361,7 @@ def _telegram_to_profiles(raw: dict[str, Any]) -> dict[str, Any]:
         default["daemon"] = True
 
     for name, profile in list(profiles.items()):
-        if name == DEFAULT_PROFILE or not isinstance(profile, dict):
+        if name == LEGACY_DEFAULT_PROFILE or not isinstance(profile, dict):
             continue
         merged = {**DEFAULT_TELEGRAM_PROFILE, **profile}
         # A named profile used to carry one chat and one thread of its own.
@@ -365,7 +371,45 @@ def _telegram_to_profiles(raw: dict[str, Any]) -> dict[str, Any]:
             merged["chats"] = [f"{old_chat}:{old_thread}" if old_thread else old_chat]
         profiles[name] = merged
 
-    profiles[DEFAULT_PROFILE] = default
+    profiles[LEGACY_DEFAULT_PROFILE] = default
+    moved["profiles"] = profiles
+    return {key: value for key, value in moved.items() if key in DEFAULT_TELEGRAM}
+
+
+def _profiles_to_ids(raw: dict[str, Any]) -> dict[str, Any]:
+    """Schema 6 -> 7: profiles get numeric ids, the old key becomes the alias.
+
+    `default` had no alias and heard every unaddressed line; now every line
+    is addressed, so it survives only when something was configured under
+    it -- then as an ordinary profile with the alias `default`, which is
+    still reachable (`/default ...`) and renamable. `tech` is `debug` now,
+    the `prefix` and `workdir` settings are gone (addressing is `/alias`,
+    the directory is the profile's), and the idle limit that shipped as six
+    hours is one.
+    """
+    moved = dict(raw)
+    moved.pop("prefix", None)
+    moved.pop("workdir", None)
+    if moved.get("idleHours") == LEGACY_IDLE_HOURS:
+        moved["idleHours"] = DEFAULT_TELEGRAM["idleHours"]
+
+    stored = moved.get("profiles")
+    old = stored if isinstance(stored, dict) else {}
+    profiles: dict[str, Any] = {}
+    next_id = 1
+    for name, profile in old.items():
+        if not isinstance(profile, dict):
+            continue
+        entry = dict(profile)
+        entry["debug"] = bool(entry.pop("tech", entry.get("debug", False)))
+        if not entry.get("alias"):
+            entry["alias"] = str(name)
+        if str(name) == LEGACY_DEFAULT_PROFILE:
+            probe = {**DEFAULT_TELEGRAM_PROFILE, **entry, "alias": ""}
+            if probe == {**DEFAULT_TELEGRAM_PROFILE, "alias": ""}:
+                continue  # never configured: nothing to keep
+        profiles[str(next_id)] = {**DEFAULT_TELEGRAM_PROFILE, **entry}
+        next_id += 1
     moved["profiles"] = profiles
     return {key: value for key, value in moved.items() if key in DEFAULT_TELEGRAM}
 
@@ -445,6 +489,11 @@ def migrate_config() -> bool:
 
     Schema 6 drops `telegram.verbosity`: how much a chat sees is now the
     profile's `tech` flag, and it starts off for everyone.
+
+    Schema 7 keys profiles by a numeric id and makes the old key the alias,
+    drops the unaddressed `default` profile (kept as an ordinary one when it
+    was configured), renames `tech` to `debug`, removes `telegram.prefix` and
+    `telegram.workdir`, and turns the six-hour idle limit into one hour.
     """
     if not is_installed():
         return False
@@ -466,6 +515,8 @@ def migrate_config() -> bool:
         config.telegram = {
             key: value for key, value in config.telegram.items() if key != "verbosity"
         }
+    if config.schema < 7:
+        config.telegram = _profiles_to_ids(config.telegram)
 
     config.schema = SCHEMA_VERSION
     config.save()

@@ -34,6 +34,7 @@ from core.store import (
     ensure_slot_dir,
     identity_file,
     is_installed,
+    migrate_config,
     read_json,
     update_accounts,
     write_json_atomic,
@@ -1001,6 +1002,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(t("error.not_installed_wrapper") + "\n")
         return 2
 
+    # The daemon raises transports through this entry point, and a config
+    # written by an older build must not reach them unmigrated; this is one
+    # file read when there is nothing to do.
+    migrate_config()
     config = Config.load()
     accounts = Accounts.load()
 

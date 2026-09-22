@@ -109,19 +109,19 @@ class ConversationBase(TempHome):
         self.driver = FakeDriver()
         self.console: list[str] = []
 
-    def make(self, name: str = "default", user: int = 7, **fields: Any) -> Conversation:
+    def make(self, alias: str = "bot", user: int = 7, **fields: Any) -> Conversation:
         target = ChatTarget(bot=self.bot, chat=-100, user=user)  # type: ignore[arg-type]
         conversation = Conversation(
             Config.load(),
             slot=1,
             target=target,
-            profile=Profile(name=name, **fields),
+            profile=Profile(id=fields.pop("id", 1), alias=alias, **fields),
             cwd=self.home,
             args=[],
             on_console=self.console.append,
         )
         conversation.driver = self.driver  # type: ignore[assignment]
-        conversation.prompter = Prompter(self.driver)  # type: ignore[arg-type]
+        conversation.prompter = Prompter(self.driver, bypass_available=conversation.bypass_available)  # type: ignore[arg-type]
         conversation.session_id = self.driver.session_id
         return conversation
 
@@ -182,8 +182,12 @@ class ChatConversation(ConversationBase):
         conversation._on_incoming(press(blue))
         self.assertEqual(self.driver.responses[-1][0], "req_1")
         self.assertEqual(self.driver.responses[-1][1]["updatedInput"]["answers"], {"Colour?": "Blue"})  # type: ignore[index]
-        self.assertEqual(self.bot.cleared, [len(self.bot.sent) - 1])
-        self.assertIn("Blue", self.bot.texts()[-1])
+        # The answer is written under the question, in the same message.
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(self.bot.edits[-1]["id"], asked["id"])
+        self.assertTrue(asked["text"].startswith("❓"))
+        self.assertIn("\n\n✅ Colour? — <b>Blue</b>", asked["text"])
+        self.assertEqual(self.bot.deleted_messages, [])
 
     def test_a_typed_custom_answer_is_not_sent_as_a_prompt(self) -> None:
         conversation = self.make()
@@ -212,8 +216,8 @@ class ChatConversation(ConversationBase):
         self.assertEqual(self.bot.texts()[-1], "<b>bold</b> answer")  # nothing new reached the chat
         self.assertTrue(any("git status" in line for line in self.console))
 
-    def test_tech_turns_the_tool_log_back_on(self) -> None:
-        conversation = self.make(expanded=True, tech=True)
+    def test_debug_turns_the_tool_log_back_on(self) -> None:
+        conversation = self.make(expanded=True, debug=True)
         conversation._on_event(Event("tool_use", {"name": "Bash", "input": {"command": "git status"}}))
         self.assertIn("git status", self.bot.texts()[-1])
         conversation._on_event(Event("tool_result", {"id": "x", "content": "clean"}))
@@ -264,26 +268,54 @@ class CollapsedTurn(ConversationBase):
 
 
 class Modes(ConversationBase):
-    def test_the_mode_is_announced_when_it_changes(self) -> None:
+    def test_a_change_claude_made_is_announced_only_in_debug(self) -> None:
         conversation = self.make()
         conversation._on_event(Event("init", {"permission_mode": "plan", "model": "m"}))
         self.assertEqual(conversation.mode, "plan")
         self.assertEqual(self.bot.sent, [])  # the first report only corrects the console
 
         conversation._on_event(Event("init", {"permission_mode": "acceptEdits", "model": "m"}))
+        self.assertEqual(conversation.mode, "acceptEdits")
+        self.assertEqual(self.bot.sent, [])  # a chat without debug hears only what it asked for
+        self.assertIn("acceptEdits", self.console[-1])
+
+        loud = self.make(debug=True)
+        loud._on_event(Event("init", {"permission_mode": "plan", "model": "m"}))
+        loud._on_event(Event("init", {"permission_mode": "acceptEdits", "model": "m"}))
         self.assertEqual(self.bot.texts()[-1], "🔵 acceptEdits")
+
+    def test_a_subagents_mode_is_not_the_sessions(self) -> None:
+        from core.hookbus import HookEvent
+
+        conversation = self.make(debug=True)
+        conversation._on_event(Event("init", {"permission_mode": "plan", "model": "m"}))
+        conversation._on_hook(HookEvent("PreToolUse", {"permission_mode": "dontAsk", "agent_id": "a1"}))
+        self.assertTrue(conversation._inbox.empty())
+        conversation._on_hook(HookEvent("PreToolUse", {"permission_mode": "acceptEdits"}))
+        self.assertEqual(conversation._inbox.get_nowait(), ("mode", "acceptEdits"))
 
     def test_the_skip_flag_is_bypass_and_says_so(self) -> None:
         self.assertEqual(self.make().mode, "bypassPermissions")
 
-    def test_commands_switch_it(self) -> None:
+    def test_commands_switch_it_and_say_so(self) -> None:
         conversation = self.make()
         conversation._on_incoming(incoming("/plan"))
         self.assertEqual(self.driver.mode, "plan")
         self.assertEqual(conversation.mode, "plan")
+        self.assertEqual(self.bot.texts()[-1], "🟡 Mode chosen: <b>plan</b>")
         conversation._on_incoming(incoming("/bypass"))
         self.assertEqual(self.driver.mode, "bypassPermissions")
         self.assertIn("bypassPermissions", self.bot.texts()[-1])
+        # claude confirming the switch through a hook is not news.
+        conversation._note_mode("bypassPermissions")
+        self.assertEqual(len(self.bot.sent), 2)
+
+    def test_a_mode_switch_with_a_prompt_says_it_is_starting(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/plan Давай сделаем"))
+        self.assertEqual(self.driver.mode, "plan")
+        self.assertEqual(self.bot.texts()[-1], "🟡 Mode chosen: <b>plan</b>, starting work…")
+        self.assertEqual(self.driver.sent, ["Давай сделаем"])
 
     def test_the_starting_mode_comes_from_the_settings(self) -> None:
         # Without the skip flag, which is a bypass of its own and wins.
@@ -307,9 +339,11 @@ class Modes(ConversationBase):
         assert conversation._relaunch is not None
         self.assertEqual(conversation._relaunch.cwd, project.resolve())
 
+        # As if the relaunch had happened.
+        conversation._relaunch = None
         conversation.cwd = project
         conversation._on_incoming(incoming("/save"))
-        saved = Config.load().telegram["profiles"]["rikroot"]
+        saved = Config.load().telegram["profiles"]["1"]
         self.assertEqual(saved["chats"], [-100])
         self.assertEqual((saved["cwd"], saved["slot"]), (str(project), 1))
 
@@ -440,3 +474,213 @@ class WorkStaysAtTheBottom(ConversationBase):
         conversation._on_event(Event("ask", {"request_id": "q2", "tool_name": "AskUserQuestion", "input": {"questions": [question]}, "suggestions": []}))
         conversation._on_incoming(press(self.bot.sent[-1]["markup"]["inline_keyboard"][0][0]["callback_data"]))
         self.assertEqual(self.bot.deleted_messages, [])
+
+
+class SeveralCommandsInOneLine(ConversationBase):
+    """`/clear /plan Давай…` is three things done in order, not one prompt."""
+
+    def test_clear_then_mode_then_prompt_ride_the_relaunch(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/clear /plan Давай сделаем"))
+        relaunch = conversation._relaunch
+        assert relaunch is not None
+        self.assertTrue(relaunch.fresh)
+        self.assertEqual(relaunch.mode, "plan")
+        self.assertEqual(relaunch.prompt, "Давай сделаем")
+        # Nothing reached the claude that is about to go.
+        self.assertEqual(self.driver.sent, [])
+        self.assertEqual(self.driver.mode, "")
+        self.assertIn("🧹", self.bot.texts()[-2])
+        self.assertEqual(self.bot.texts()[-1], "🟡 Mode chosen: <b>plan</b>, starting work…")
+
+    def test_commands_alone_end_with_the_last_one(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/clear /plan "))
+        relaunch = conversation._relaunch
+        assert relaunch is not None
+        self.assertEqual((relaunch.fresh, relaunch.mode, relaunch.prompt), (True, "plan", ""))
+        self.assertEqual(self.bot.texts()[-1], "🟡 Mode chosen: <b>plan</b>")
+
+    def test_cd_and_clear_make_one_relaunch(self) -> None:
+        conversation = self.make()
+        project = self.home / "proj"
+        project.mkdir()
+        conversation._on_incoming(incoming("/clear /cd proj /status"))
+        relaunch = conversation._relaunch
+        assert relaunch is not None
+        self.assertTrue(relaunch.fresh)
+        self.assertEqual(relaunch.cwd, project.resolve())
+        self.assertEqual(relaunch.after, ["/status"])
+
+    def test_without_a_relaunch_the_commands_simply_run_in_order(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/plan /model opus fix it"))
+        self.assertEqual(self.driver.mode, "plan")
+        self.assertEqual(self.driver.model, "opus")
+        self.assertEqual(self.driver.sent, ["fix it"])
+        self.assertIsNone(conversation._relaunch)
+
+    def test_the_relaunch_starts_claude_in_the_mode_and_feeds_the_rest(self) -> None:
+        conversation = self.make()
+        conversation._start_mode = "plan"
+        conversation._opening_lines = ["/status"]
+        conversation._opening_prompt = "go"
+        started: list[Any] = []
+
+        class Started:
+            session_id = "abc"
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                started.append(kwargs["args"])
+
+            def start(self) -> None:
+                return
+
+            def close(self) -> None:
+                return
+
+            def send_user(self, text: str) -> None:
+                started.append(text)
+
+        with mock.patch("app.transport.conversation.Driver", Started), \
+             mock.patch("app.transport.conversation.wrapper.wants_hook_bus", return_value=False), \
+             mock.patch("app.transport.conversation.wrapper.close_hook_bus"), \
+             mock.patch("app.transport.conversation.update_session"), \
+             mock.patch.object(conversation, "_loop", side_effect=lambda: None), \
+             mock.patch.object(conversation, "_on_line") as on_line:
+            conversation._run_on_slot()
+        self.assertEqual(started[0][:2], ["--permission-mode", "plan"])
+        self.assertEqual(started[1], "go")
+        on_line.assert_called_once_with("/status", source="relaunch")
+        self.assertEqual(conversation._start_mode, "")
+
+
+class InterruptingWithABang(ConversationBase):
+    def test_an_urgent_line_stops_the_turn_first(self) -> None:
+        conversation = self.make()
+        self.driver.turn_active = True
+        conversation._on_incoming(telegram.Incoming(update_id=1, chat_id=-100, thread_id=0, user_id=7, text="stop, wrong file", message_id=5, urgent=True))
+        self.assertEqual(self.driver.interrupts, 1)
+        self.assertEqual(self.driver.sent, ["stop, wrong file"])
+        self.assertEqual(self.bot.sent, [])  # the interruption is not announced outside debug
+
+    def test_nothing_to_interrupt_means_nothing_happens(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(telegram.Incoming(update_id=1, chat_id=-100, thread_id=0, user_id=7, text="hello", message_id=5, urgent=True))
+        self.assertEqual(self.driver.interrupts, 0)
+        self.assertEqual(self.driver.sent, ["hello"])
+
+
+class OtherPeoplesButtons(ConversationBase):
+    def test_a_press_from_someone_else_is_refused(self) -> None:
+        conversation = self.make(user=7)
+        conversation._on_event(Event("ask", {"request_id": "req_9", "tool_name": "Bash", "input": {"command": "ls"}, "suggestions": []}))
+        allow = self.bot.sent[-1]["markup"]["inline_keyboard"][0][0]["callback_data"]
+        stranger = telegram.Incoming(update_id=2, chat_id=-100, thread_id=0, user_id=8, text="", message_id=6, callback_id="cb", callback_data=allow)
+        conversation._on_incoming(stranger)
+        self.assertEqual(self.driver.responses, [])
+        self.assertIn("somebody else", self.bot.answered[-1][1])
+        conversation._on_incoming(press(allow))
+        self.assertEqual(self.driver.responses[-1][1]["behavior"], "allow")  # type: ignore[index]
+
+    def test_a_shared_session_takes_anyones_press(self) -> None:
+        conversation = self.make(user=0, multi=True)
+        conversation._on_event(Event("ask", {"request_id": "req_9", "tool_name": "Bash", "input": {"command": "ls"}, "suggestions": []}))
+        allow = self.bot.sent[-1]["markup"]["inline_keyboard"][0][0]["callback_data"]
+        conversation._on_incoming(telegram.Incoming(update_id=2, chat_id=-100, thread_id=0, user_id=8, text="", message_id=6, callback_id="cb", callback_data=allow))
+        self.assertEqual(self.driver.responses[-1][1]["behavior"], "allow")  # type: ignore[index]
+
+
+class WhatBecomesOfAnAnsweredPrompt(ConversationBase):
+    def _ask_permission(self, conversation: Conversation) -> dict[str, Any]:
+        conversation._on_event(Event("ask", {"request_id": "p1", "tool_name": "Edit", "input": {"file_path": "a.py", "new_string": "x"}, "suggestions": []}))
+        return self.bot.sent[-1]
+
+    def test_a_permission_is_taken_down_and_the_work_stays_put(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("do it"))
+        conversation._on_event(Event("text", {"text": "half way"}))
+        conversation._flush_live()
+        live = self.bot.sent[-1]["id"]
+
+        asked = self._ask_permission(conversation)
+        conversation._on_incoming(press(asked["markup"]["inline_keyboard"][0][0]["callback_data"]))
+        self.assertEqual(self.driver.responses[-1][1]["behavior"], "allow")  # type: ignore[index]
+        self.assertEqual(self.bot.deleted_messages, [asked["id"]])
+        self.assertEqual(self.bot.sent[-1]["id"], asked["id"])  # nothing new was sent
+        self.assertNotIn(live, self.bot.deleted_messages)  # and the working message was not moved
+        self.assertEqual(conversation._live_id, live)
+
+    def test_in_debug_the_permission_stays_with_its_answer(self) -> None:
+        conversation = self.make(debug=True)
+        asked = self._ask_permission(conversation)
+        conversation._on_incoming(press(asked["markup"]["inline_keyboard"][1][0]["callback_data"]))
+        self.assertEqual(self.bot.deleted_messages, [])
+        self.assertIn("\n\n⛔ Edit", asked["text"])
+
+    def test_an_mcp_request_is_taken_down_too(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("elicit", {"request_id": "e1", "server": "registry", "message": "ok?", "mode": "form", "schema": {}}))
+        asked = self.bot.sent[-1]
+        conversation._on_incoming(press(asked["markup"]["inline_keyboard"][0][0]["callback_data"]))
+        self.assertEqual(self.bot.deleted_messages, [asked["id"]])
+
+    def test_a_multi_select_toggle_redraws_the_keyboard_in_place(self) -> None:
+        conversation = self.make()
+        question = {"question": "Which?", "options": [{"label": "A"}, {"label": "B"}], "multiSelect": True}
+        conversation._on_event(Event("ask", {"request_id": "q3", "tool_name": "AskUserQuestion", "input": {"questions": [question]}, "suggestions": []}))
+        asked = self.bot.sent[-1]
+        conversation._on_incoming(press(asked["markup"]["inline_keyboard"][0][0]["callback_data"]))
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(self.bot.cleared, [asked["id"]])  # the fake records every markup edit here
+        self.assertEqual(self.bot.edits, [])
+
+    def test_a_withdrawn_permission_disappears_with_the_request(self) -> None:
+        conversation = self.make()
+        asked = self._ask_permission(conversation)
+        conversation._on_event(Event("cancel", {"request_id": "p1"}))
+        self.assertEqual(self.bot.deleted_messages, [asked["id"]])
+
+
+class PlanModeWithBypass(ConversationBase):
+    def test_tool_permissions_are_granted_without_asking(self) -> None:
+        conversation = self.make()
+        self.assertTrue(conversation.bypass_available)
+        conversation._on_incoming(incoming("/plan"))
+        conversation._on_event(Event("ask", {"request_id": "p2", "tool_name": "Bash", "input": {"command": "ls"}, "suggestions": []}))
+        self.assertEqual(self.driver.responses[-1], ("p2", {"behavior": "allow", "updatedInput": {"command": "ls"}}))
+        self.assertEqual(self.bot.sent[-1]["markup"], None)  # no buttons went out
+        self.assertTrue(any("🔓" in line for line in self.console))
+
+    def test_questions_and_the_plan_itself_still_reach_the_person(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/plan"))
+        question = {"question": "Colour?", "options": [{"label": "Red"}], "multiSelect": False}
+        conversation._on_event(Event("ask", {"request_id": "q4", "tool_name": "AskUserQuestion", "input": {"questions": [question]}, "suggestions": []}))
+        conversation._on_event(Event("ask", {"request_id": "x1", "tool_name": "ExitPlanMode", "input": {"plan": "do things"}, "suggestions": []}))
+        self.assertEqual(self.driver.responses, [])
+        self.assertEqual(len([m for m in self.bot.sent if m["markup"]]), 2)
+
+    def test_without_bypass_plan_mode_asks_as_claude_does(self) -> None:
+        config = Config.load()
+        config.default_args = []
+        config.save()
+        conversation = self.make()
+        self.assertFalse(conversation.bypass_available)
+        conversation._on_incoming(incoming("/plan"))
+        conversation._on_event(Event("ask", {"request_id": "p3", "tool_name": "Bash", "input": {"command": "ls"}, "suggestions": []}))
+        self.assertEqual(self.driver.responses, [])
+        self.assertIsNotNone(self.bot.sent[-1]["markup"])
+
+    def test_approving_the_plan_goes_back_to_bypass(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/plan"))
+        conversation._on_event(Event("ask", {"request_id": "x2", "tool_name": "ExitPlanMode", "input": {"plan": "do things"}, "suggestions": []}))
+        asked = self.bot.sent[-1]
+        go = asked["markup"]["inline_keyboard"][0][0]
+        self.assertIn("bypass", go["text"])
+        conversation._on_incoming(press(go["callback_data"]))
+        result = self.driver.responses[-1][1]
+        self.assertEqual(result["updatedPermissions"][0]["mode"], "bypassPermissions")  # type: ignore[index]
+        self.assertEqual(conversation.mode, "bypassPermissions")
+        self.assertIn("bypassPermissions", asked["text"])  # the plan stays, the decision under it

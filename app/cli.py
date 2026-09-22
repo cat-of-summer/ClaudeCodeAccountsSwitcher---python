@@ -460,11 +460,29 @@ def _profile_flag(raw: str | None, current: bool, key: str) -> bool:
     return settings.to_bool(raw, key=key)
 
 
+def _pick_profile(known: dict[int, Any], token: str) -> Any:
+    """`<id|alias>` on the command line, or a SystemExit saying why not."""
+    from app.transport import profiles as profiles_module
+
+    found = profiles_module.pick(known, token)
+    if isinstance(found, list):
+        if found:
+            raise SystemExit(
+                t("profile.ambiguous", alias=token, ids=", ".join(str(p.id) for p in found))
+            )
+        raise SystemExit(t("profile.no_such", name=token, names=_profile_names(known)))
+    return found
+
+
+def _profile_names(known: dict[int, Any]) -> str:
+    return ", ".join(profile.label for profile in known.values()) or "—"
+
+
 def cmd_profile(args: argparse.Namespace) -> int:
     """Profiles: what the transport listens to, where it runs, who may talk.
 
-    `set` edits as well as creates, so it is also how the permanent
-    `default` profile is configured.
+    `add` creates one and prints the id it got; `set` edits by id or, when
+    it is unique, by alias.
     """
     _require_installed()
     from app import daemon
@@ -475,12 +493,16 @@ def cmd_profile(args: argparse.Namespace) -> int:
     config = Config.load()
     known = profiles_module.load(config)
 
-    if action == "set":
-        name = args.name.strip()
-        if name != profiles_module.DEFAULT_PROFILE and not valid_alias(name):
-            raise SystemExit(t("profile.bad_name", name=name))
+    if action in {"add", "set"}:
+        if action == "add":
+            alias = args.alias.strip()
+            current = profiles_module.Profile()
+        else:
+            current = _pick_profile(known, args.name)
+            alias = args.alias.strip() if args.alias is not None else current.alias
+        if not valid_alias(alias):
+            raise SystemExit(t("profile.bad_name", name=alias))
 
-        current = known.get(name) or profiles_module.Profile(name=name)
         cwd = current.cwd
         if args.cwd is not None:
             candidate = Path(args.cwd).expanduser()
@@ -514,13 +536,14 @@ def cmd_profile(args: argparse.Namespace) -> int:
 
         try:
             profile = profiles_module.Profile(
-                name=name,
+                id=current.id,
+                alias=alias,
                 chats=chats,
                 cwd=cwd,
                 slot=int(args.slot) if args.slot is not None else current.slot,
                 daemon=_profile_flag(args.daemon, current.daemon, "daemon"),
                 multi=_profile_flag(args.multi, current.multi, "multi"),
-                tech=_profile_flag(args.tech, current.tech, "tech"),
+                debug=_profile_flag(args.debug, current.debug, "debug"),
                 expanded=_profile_flag(args.expanded, current.expanded, "expanded"),
                 mode=mode,
                 users=users,
@@ -528,61 +551,65 @@ def cmd_profile(args: argparse.Namespace) -> int:
             )
         except settings.SettingError as exc:
             raise SystemExit(str(exc)) from exc
-        profiles_module.save(profile)
+        if action == "add":
+            profile = profiles_module.add(profile)
+            print(t("profile.added", name=profile.label, id=profile.id))
+        else:
+            profiles_module.save(profile)
+            print(t("profile.saved", name=profile.label))
         daemon.reconcile_autostart(Config.load())
-        print(t("profile.saved", name=name))
         print(f"  {profiles_module.describe(profile)}")
         return 0
 
     if action == "remove":
-        name = args.name.strip()
-        if name not in known:
-            raise SystemExit(t("profile.no_such", name=name, names=", ".join(sorted(known))))
-        profiles_module.remove(name)
+        profile = _pick_profile(known, args.name)
+        profiles_module.remove(profile.id)
         daemon.reconcile_autostart(Config.load())
-        print(
-            t("profile.reset", name=name)
-            if name == profiles_module.DEFAULT_PROFILE
-            else t("profile.removed", name=name)
-        )
+        print(t("profile.removed", name=profile.label))
         return 0
 
     if action == "show":
-        name = args.name.strip()
-        profile = known.get(name)
-        if profile is None:
-            raise SystemExit(t("profile.no_such", name=name, names=", ".join(sorted(known))))
-        print(f"{name}  {profiles_module.describe(profile)}")
-        print(t("profile.runs_in", path=profile.resolve_cwd(config)))
+        profile = _pick_profile(known, args.name)
+        print(f"{profile.id:<4} {profile.alias:<12}  {profiles_module.describe(profile)}")
+        print(t("profile.runs_in", path=profile.resolve_cwd()))
         return 0
 
-    width = max(len(name) for name in known)
-    for name, profile in sorted(known.items()):
-        print(f"{name:<{width}}  {profiles_module.describe(profile)}")
+    if not known:
+        print(t("profile.none"))
+    width = max((len(profile.alias) for profile in known.values()), default=0)
+    for number, profile in known.items():
+        print(f"{number:<4} {profile.alias:<{width}}  {profiles_module.describe(profile)}")
     print()
     print(t("profile.hint"))
     return 0
 
 
 def cmd_telegram(args: argparse.Namespace) -> int:
-    """`ccas telegram test`: prove the token and the chat before going live."""
+    """`ccas telegram test`: prove the token and the profiles' chats before going live."""
     _require_installed()
+    from app.transport import profiles as profiles_module
     from core import telegram
 
     config = Config.load()
     token = str(config.telegram.get("token") or "")
-    chat = int(config.telegram.get("chat") or 0)
     if not telegram.looks_like_token(token):
         raise SystemExit(t("tg.no_token"))
     bot = telegram.Bot(token)
     try:
         me = bot.get_me()
         print(t("telegram.test_bot", username=me.get("username") or "?", id=me.get("id")))
-        if chat:
-            bot.send_message(chat, t("telegram.test_message"), thread_id=int(config.telegram.get("thread") or 0))
-            print(t("telegram.test_sent", chat=chat))
-        else:
-            print(t("tg.no_chat"))
+        # One message per chat some profile names, so the person sees which
+        # of them the bot can actually reach.
+        seen: set[tuple[int, int]] = set()
+        for profile in profiles_module.load(config).values():
+            for chat, thread in profile.chats:
+                if (chat, thread) in seen:
+                    continue
+                seen.add((chat, thread))
+                bot.send_message(chat, t("telegram.test_message"), thread_id=thread)
+                print(t("telegram.test_sent", chat=profiles_module.format_chat((chat, thread))))
+        if not seen:
+            print(t("telegram.test_no_chats"))
     except (telegram.TelegramError, telegram.Unreachable) as exc:
         raise SystemExit(t("telegram.test_failed", error=exc)) from exc
     return 0
@@ -679,10 +706,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if daemon.configured(config):
         token = str(config.telegram.get("token") or "")
         known = profiles_module.load(config)
-        watched = sorted(name for name, profile in known.items() if profile.daemon)
+        watched = [profile.label for profile in known.values() if profile.daemon]
         report(OK, t("doctor.telegram_configured", bot=telegram.bot_id(token), profiles=len(known)))
-        for name in sorted(known):
-            report(OK, f"  {name}  {profiles_module.describe(known[name])}")
+        for profile in known.values():
+            report(OK, f"  {profile.label}  {profiles_module.describe(profile)}")
 
         record = daemon.read_daemon()
         if watched:
@@ -849,21 +876,25 @@ def build_parser() -> argparse.ArgumentParser:
     profile_sub = profile_parser.add_subparsers(dest="profile_action")
     profile_sub.add_parser("list", help=t("cli.help.profile_list"))
     profile_show = profile_sub.add_parser("show", help=t("cli.help.profile_show"))
-    profile_show.add_argument("name")
+    profile_show.add_argument("name", metavar="id|alias")
+    profile_add = profile_sub.add_parser("add", help=t("cli.help.profile_add"))
+    profile_add.add_argument("alias")
     profile_set = profile_sub.add_parser("set", help=t("cli.help.profile_set"))
-    profile_set.add_argument("name")
-    profile_set.add_argument("--cwd", help=t("cli.help.profile_cwd"))
-    profile_set.add_argument("--chat", action="append", help=t("cli.help.profile_chat"))
-    profile_set.add_argument("--slot", type=int, help=t("cli.help.profile_slot"))
-    profile_set.add_argument("--daemon", help=t("cli.help.profile_daemon"))
-    profile_set.add_argument("--multi", help=t("cli.help.profile_multi"))
-    profile_set.add_argument("--tech", help=t("cli.help.profile_tech"))
-    profile_set.add_argument("--expanded", help=t("cli.help.profile_expanded"))
-    profile_set.add_argument("--mode", help=t("cli.help.profile_mode"))
-    profile_set.add_argument("--users", nargs="*", help=t("cli.help.profile_users"))
-    profile_set.add_argument("--args", dest="claude_args", help=t("cli.help.profile_args"))
+    profile_set.add_argument("name", metavar="id|alias")
+    profile_set.add_argument("--alias", help=t("cli.help.profile_alias"))
+    for editor in (profile_add, profile_set):
+        editor.add_argument("--cwd", help=t("cli.help.profile_cwd"))
+        editor.add_argument("--chat", action="append", help=t("cli.help.profile_chat"))
+        editor.add_argument("--slot", type=int, help=t("cli.help.profile_slot"))
+        editor.add_argument("--daemon", help=t("cli.help.profile_daemon"))
+        editor.add_argument("--multi", help=t("cli.help.profile_multi"))
+        editor.add_argument("--debug", help=t("cli.help.profile_debug"))
+        editor.add_argument("--expanded", help=t("cli.help.profile_expanded"))
+        editor.add_argument("--mode", help=t("cli.help.profile_mode"))
+        editor.add_argument("--users", nargs="*", help=t("cli.help.profile_users"))
+        editor.add_argument("--args", dest="claude_args", help=t("cli.help.profile_args"))
     profile_remove = profile_sub.add_parser("remove", help=t("cli.help.profile_remove"))
-    profile_remove.add_argument("name")
+    profile_remove.add_argument("name", metavar="id|alias")
 
     telegram_parser = subparsers.add_parser("telegram", help=t("cli.help.telegram"))
     telegram_parser.set_defaults(func=cmd_telegram)
@@ -970,8 +1001,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv[1:])
 
     if is_installed() and getattr(args, "command", None) != "daemon":
+        from app.transport import profiles as profiles_module
+
         config = Config.load()
-        if config.telegram.get("daemon"):
+        if profiles_module.daemon_wanted(config):
             from app import daemon
 
             daemon.ensure_running(config)

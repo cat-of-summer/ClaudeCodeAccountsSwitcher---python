@@ -65,10 +65,10 @@ class PosixAutostart(TempHome):
             mock.patch.object(autostart, "unregister", return_value=True) as unregister,
             mock.patch.object(autostart, "is_registered", side_effect=[False, True]),
         ):
-            profiles_module.save(Profile(name="rikroot", daemon=True))
+            profiles_module.save(Profile(id=1, alias="rikroot", daemon=True))
             self.assertTrue(daemon.reconcile_autostart(Config.load()))
             register.assert_called_once()
 
-            profiles_module.save(Profile(name="rikroot"))
+            profiles_module.save(Profile(id=1, alias="rikroot"))
             self.assertFalse(daemon.reconcile_autostart(Config.load()))
             unregister.assert_called_once()

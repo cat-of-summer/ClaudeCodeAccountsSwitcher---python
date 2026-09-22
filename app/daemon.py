@@ -32,13 +32,12 @@ from urllib.parse import parse_qs, urlsplit
 from app.transport import daemonlink
 from app.transport import poller as poller_module
 from app.transport import profiles as profiles_module
-from app.transport.profiles import DEFAULT_PROFILE, Profile
+from app.transport.profiles import Profile
 from app.transport.routing import (
     CLAUDE_COMMAND,
     ClaudeCommand,
     parse_claude_command,
     route as route_line,
-    valid_alias,
 )
 from app.transport.conversation import resolve_dir
 from core import claudecfg, log, telegram
@@ -141,7 +140,7 @@ class Route:
     chat: int
     thread: int
     alias: str
-    profile: str = DEFAULT_PROFILE
+    profile: int = 0
     cwd: str = ""
     slot: int = 0
     seen_at: float = field(default_factory=time.time)
@@ -167,6 +166,10 @@ class Route:
             return False
         return not self.thread or self.thread == thread
 
+    @property
+    def label(self) -> str:
+        return f"{self.alias}#{self.profile}" if self.alias else f"#{self.profile}"
+
     def describe(self) -> dict[str, Any]:
         return {
             "pid": self.pid,
@@ -175,6 +178,7 @@ class Route:
             "thread": self.thread,
             "alias": self.alias,
             "profile": self.profile,
+            "label": self.label,
             "cwd": self.cwd,
             "slot": self.slot,
         }
@@ -185,10 +189,9 @@ class Daemon:
         self.config = config
         settings = config.telegram
         self.bot = telegram.Bot(str(settings.get("token") or ""))
-        self.prefix = str(settings.get("prefix") or "")
         self.routes: dict[int, Route] = {}
         # Lines that arrived while a profile's window was still coming up.
-        self._pending: dict[str, list[telegram.Incoming]] = {}
+        self._pending: dict[int, list[telegram.Incoming]] = {}
         self._routes_lock = threading.Lock()
         self._stop = threading.Event()
         self._server: ThreadingHTTPServer | None = None
@@ -220,7 +223,7 @@ class Daemon:
             {"pid": os.getpid(), "port": self.port, "botId": self.bot.id, "at": time.time()},
             harden=False,
         )
-        watched = [name for name, profile in self.profiles().items() if profile.daemon]
+        watched = [profile.label for profile in self.profiles().values() if profile.daemon]
         log.write(f"daemon: up, bot {self.bot.id}, port {self.port}, watching {watched or '-'}")
         _say_local(
             t("daemon.listening", bot=self.bot.id, port=self.port, profiles=", ".join(watched) or "—")
@@ -342,13 +345,13 @@ class Daemon:
             chat=int(body.get("chat") or 0),
             thread=int(body.get("thread") or 0),
             alias=str(body.get("alias") or ""),
-            profile=str(body.get("profile") or "") or DEFAULT_PROFILE,
+            profile=int(body.get("profile") or 0),
             cwd=str(body.get("cwd") or ""),
             slot=int(body.get("slot") or 0),
         )
         with self._routes_lock:
             self.routes[pid] = route
-        log.write(f"daemon: route {tag} pid={pid} profile={route.profile} chat={route.chat or '*'}")
+        log.write(f"daemon: route {tag} pid={pid} profile={route.label} chat={route.chat or '*'}")
         for queued in self._pending.pop(route.profile, []):
             route.push(queued)
         return route
@@ -418,48 +421,57 @@ class Daemon:
         known = self.profiles()
         routed = route_line(
             incoming.text,
-            prefix=self.prefix,
             profiles=known,
             chat=incoming.chat_id,
             thread=incoming.thread_id,
         )
         if routed is None:
+            # Not for any agent. The daemon's own commands (`/claude`,
+            # `/projects`, ...) are the one thing left it could be, and
+            # only where some profile works at all.
+            line = incoming.text.strip()
+            if line.startswith("/") and self._serves_chat(incoming) and self._allowed(incoming):
+                self._own_command(line, incoming)
+            return
+        if routed.ambiguous:
+            if self._allowed(incoming):
+                self._say(
+                    incoming,
+                    t("daemon.ambiguous", names=", ".join(known[n].label for n in routed.ambiguous if n in known)),
+                )
             return
         profile = known[routed.profile]
-        if not profile.open_to(incoming.chat_id, incoming.thread_id):
-            # Named from a chat this profile does not work in: saying the
-            # name somewhere else must not reach it.
-            return
         if not profile.allows(incoming.user_id, self._users()):
             return
 
         command = parse_claude_command(routed.body)
         if command is not None:
-            # Checked before the running transport is handed the line: to a
-            # conversation `/claude ...` is just text, and the one thing it
-            # certainly means is "start something".
-            # An explicit request from someone allowed here is honoured even
-            # when the profile is not one the daemon may raise on its own.
+            # `/rik /claude ...` -- an explicit request from someone allowed
+            # here is honoured even when the profile is not one the daemon
+            # may raise on its own.
             self._launch(command, incoming, profile)
             return
 
         for existing in here:
-            if existing.profile == profile.name:
+            if existing.profile == profile.id:
                 existing.push(incoming)
                 return
 
-        if routed.body.startswith("/") and self._own_command(routed.body, incoming):
-            return
-
         if profile.daemon:
-            self._pending.setdefault(profile.name, []).append(incoming)
+            self._pending.setdefault(profile.id, []).append(incoming)
             bare = parse_claude_command(CLAUDE_COMMAND)
             assert bare is not None
             self._launch(bare, incoming, profile, quiet=True)
             return
 
-        if routed.addressed or routed.body.startswith("/"):
-            self._say(incoming, t("daemon.not_running", name=profile.alias or DEFAULT_PROFILE))
+        self._say(incoming, t("daemon.not_running", name=profile.command, id=profile.id))
+
+    def _serves_chat(self, incoming: telegram.Incoming) -> bool:
+        return any(p.open_to(incoming.chat_id, incoming.thread_id) for p in self.profiles().values())
+
+    def _allowed(self, incoming: telegram.Incoming) -> bool:
+        users = self._users()
+        return not users or incoming.user_id in users
 
     def _say(self, incoming: telegram.Incoming, text: str, *, markup: dict[str, Any] | None = None) -> None:
         with contextlib.suppress(telegram.TelegramError, telegram.Unreachable):
@@ -471,8 +483,13 @@ class Daemon:
         head, _, tail = body.partition(" ")
         head = head.lower().split("@", 1)[0]
         tail = tail.strip()
+        if head == CLAUDE_COMMAND:
+            command = parse_claude_command(body)
+            assert command is not None
+            self._launch(command, incoming)
+            return True
         if head in {"/help", "/start"}:
-            self._say(incoming, t("daemon.help", prefix=self.prefix or "—"))
+            self._say(incoming, t("daemon.help", aliases=self._aliases_text(incoming)))
             return True
         if head == "/pwd":
             self._say(incoming, f"<code>{_plain(str(self.chat_dir(incoming)))}</code>")
@@ -578,10 +595,17 @@ class Daemon:
         lines = []
         for route in here:
             lines.append(
-                f"• <b>{_plain(route.profile)}</b> · slot {route.slot} · "
+                f"• <b>{_plain(route.label)}</b> · slot {route.slot} · "
                 f"<code>{_plain(route.cwd)}</code> · pid {route.pid}"
             )
         return "\n".join(lines)
+
+    def _aliases_text(self, incoming: telegram.Incoming) -> str:
+        """The profiles this chat can call, for `/help`."""
+        open_here = [
+            p for p in self.profiles().values() if p.open_to(incoming.chat_id, incoming.thread_id)
+        ]
+        return ", ".join(f"{p.command} ({p.label})" for p in open_here) or "—"
 
     # -- per-chat directory -----------------------------------------------
 
@@ -593,9 +617,6 @@ class Daemon:
         stored = raw.get(self._chat_key(incoming)) if isinstance(raw, dict) else None
         if isinstance(stored, str) and stored and Path(stored).is_dir():
             return Path(stored)
-        default = str(self.config.telegram.get("workdir") or "")
-        if default and Path(default).is_dir():
-            return Path(default)
         return Path.home()
 
     def set_chat_dir(self, incoming: telegram.Incoming, path: Path) -> None:
@@ -617,34 +638,24 @@ class Daemon:
         options, args = command.options, list(command.args)
         known = self.profiles()
 
-        if options.name:
-            if not valid_alias(options.name):
-                self._say(incoming, t("daemon.bad_alias", name=options.name))
+        if args and (args[0] in _subcommands() or set(args) & ONE_SHOT_FLAGS):
+            # `claude mcp list`, `claude -p ...`: no profile involved, the
+            # command runs and its output is posted.
+            if self._allowed(incoming):
+                self._one_shot(args, incoming)
+            return
+
+        if profile is None:
+            profile = self._pick_profile(options, known, incoming)
+            if profile is None:
                 return
-            wanted = known.get(options.name)
-            if wanted is None:
-                self._say(
-                    incoming,
-                    t("daemon.no_profile", name=options.name, names=", ".join(sorted(known))),
-                )
-                return
-            profile = wanted
-        elif profile is None:
-            routed = route_line(
-                CLAUDE_COMMAND,
-                prefix="",
-                profiles=known,
-                chat=incoming.chat_id,
-                thread=incoming.thread_id,
-            )
-            profile = known[routed.profile] if routed is not None else known[DEFAULT_PROFILE]
 
         if not profile.open_to(incoming.chat_id, incoming.thread_id):
             self._say(
                 incoming,
                 t(
                     "daemon.profile_elsewhere",
-                    name=profile.name,
+                    name=profile.label,
                     chats=", ".join(profiles_module.format_chat(ref) for ref in profile.chats),
                 ),
             )
@@ -652,13 +663,9 @@ class Daemon:
         if not profile.allows(incoming.user_id, self._users()):
             return
 
-        if args and (args[0] in _subcommands() or set(args) & ONE_SHOT_FLAGS):
-            self._one_shot(args, incoming)
-            return
-
         here = self._routes_in(incoming.chat_id, incoming.thread_id)
-        if any(existing.profile == profile.name for existing in here):
-            self._say(incoming, t("daemon.already_up", name=profile.alias or DEFAULT_PROFILE))
+        if any(existing.profile == profile.id for existing in here):
+            self._say(incoming, t("daemon.already_up", name=profile.label))
             return
 
         cwd = self._launch_dir(options.cwd, profile, incoming)
@@ -671,19 +678,18 @@ class Daemon:
             slot_token = args.pop(0)
         elif profile.slot:
             slot_token = str(profile.slot)
-        args = [*profile.args, *args]
-        if profile.alias and "-n" not in args and "--name" not in args:
-            args = ["-n", profile.alias, *args]
 
         tag = self.new_tag()
         line = [str(bin_dir() / shim_name())]
         if slot_token:
             line.append(slot_token)
-        line += ["-t", "telegram", *args]
+        # The profile's own arguments are not repeated here: the transport
+        # merges them with what was typed, once, when it resolves `-P`.
+        line += ["-t", "telegram", "-P", str(profile.id), *args]
         env = dict(os.environ)
         env["CCAS_TELEGRAM_FEED"] = "1"
         env["CCAS_TELEGRAM_TAG"] = tag
-        env["CCAS_TELEGRAM_PROFILE"] = profile.name
+        env["CCAS_TELEGRAM_PROFILE"] = str(profile.id)
         env["CCAS_TELEGRAM_DAEMON_PORT"] = str(self.port)
 
         try:
@@ -691,14 +697,46 @@ class Daemon:
         except OSError as exc:
             self._say(incoming, t("tg.launch_failed", error=exc))
             return
-        log.write(f"daemon: launched {line[1:]} in {cwd} as {tag} for {profile.name}")
+        log.write(f"daemon: launched {line[1:]} in {cwd} as {tag} for {profile.label}")
         if not quiet:
             self._say(
                 incoming,
-                t("daemon.launching", cwd=_plain(str(cwd)), name=profile.alias or DEFAULT_PROFILE),
+                t("daemon.launching", cwd=_plain(str(cwd)), name=profile.label),
             )
 
-    def profiles(self) -> dict[str, Profile]:
+    def _pick_profile(
+        self, options: Any, known: dict[int, Profile], incoming: telegram.Incoming
+    ) -> Profile | None:
+        """Which profile a bare `/claude` means here, or say why none does.
+
+        `-P id` names one outright; `-n alias` names it among the profiles
+        that work in this chat. Without either, the one profile that claims
+        the chat, else the one profile open to it -- and when that is not
+        one, the chat is told what it can choose from.
+        """
+        open_here = [p for p in known.values() if p.open_to(incoming.chat_id, incoming.thread_id)]
+        if options.profile:
+            found = known.get(options.profile)
+            if found is None:
+                self._say(incoming, t("daemon.no_profile", name=options.profile, names=_labels(known.values())))
+            return found
+        if options.name:
+            named = [p for p in open_here if p.answers_to(options.name)]
+            if len(named) == 1:
+                return named[0]
+            if not named:
+                self._say(incoming, t("daemon.no_profile", name=options.name, names=_labels(open_here)))
+            else:
+                self._say(incoming, t("daemon.ambiguous", names=_labels(named)))
+            return None
+        claiming = [p for p in open_here if p.claims(incoming.chat_id, incoming.thread_id)]
+        candidates = claiming or open_here
+        if len(candidates) == 1:
+            return candidates[0]
+        self._say(incoming, t("daemon.pick_profile", names=_labels(candidates)))
+        return None
+
+    def profiles(self) -> dict[int, Profile]:
         """Read from disk every time: `ccas profile set` must take effect in
         a daemon that has been running for days."""
         return profiles_module.load(Config.load())
@@ -742,6 +780,10 @@ def _subcommands() -> frozenset[str]:
 
 def _plain(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _labels(profiles: Any) -> str:
+    return ", ".join(f"{p.command} ({p.label})" for p in profiles) or "—"
 
 
 def _say_local(text: str, *, error: bool = False) -> None:
@@ -824,7 +866,7 @@ def status_text(config: Config) -> list[str]:
             lines.append(t("daemon.status_routes", count=len(routes), updates=payload.get("updates", 0)))
             for route in routes:
                 lines.append(
-                    f"  {route.get('profile') or '-':<12} chat {route.get('chat') or '*'} "
+                    f"  {route.get('label') or route.get('profile') or '-':<12} chat {route.get('chat') or '*'} "
                     f"slot {route.get('slot')} pid {route.get('pid')} {route.get('cwd')}"
                 )
         except daemonlink.LinkError:

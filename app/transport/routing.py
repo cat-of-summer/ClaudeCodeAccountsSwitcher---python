@@ -10,12 +10,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.store import DEFAULT_PROFILE
-
 TRANSPORTS = ("telegram",)
 CLAUDE_COMMAND = "/claude"
 
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9_][\w.-]{0,31}$")
+# `/rik`, `/rik!`, `/rik@bot`, `/rik!@bot` -- the alias, an optional bang
+# meaning "drop what you are doing", and the bot suffix Telegram adds when
+# a command is picked from its menu in a group.
+_ADDRESS_RE = re.compile(r"^/([A-Za-z0-9_][\w.-]{0,31})(!?)(?:@\w+)?$")
 
 
 @dataclass
@@ -28,6 +30,7 @@ class LaunchOptions:
     thread: int = 0
     cwd: str = ""
     name: str = ""
+    profile: int = 0
 
     @property
     def wants_transport(self) -> bool:
@@ -46,7 +49,8 @@ def split_launch_options(args: list[str]) -> tuple[LaunchOptions, list[str]]:
     """Take ccas flags out of `args`; the rest is claude's.
 
     `-n/--name` is read but left in place: claude wants it too, it is the
-    session's display name, and ccas merely reuses it as the chat alias.
+    session's display name, and ccas merely reuses it to find the profile
+    when `-P` does not say which.
     """
     options = LaunchOptions()
     rest: list[str] = []
@@ -72,6 +76,10 @@ def split_launch_options(args: list[str]) -> tuple[LaunchOptions, list[str]]:
             continue
         if name == "-C":
             options.cwd, index = _value(args, index, inline)
+            continue
+        if name in {"-P", "--profile"}:
+            value, index = _value(args, index, inline)
+            options.profile = _int(value)
             continue
         if name in {"-n", "--name"}:
             value, next_index = _value(args, index, inline)
@@ -129,31 +137,26 @@ def tokenize(text: str) -> list[str]:
 
 
 @dataclass(frozen=True)
-class Addressed:
-    """A chat line after the prefix and alias have been peeled off."""
+class Address:
+    """A chat line after the `/alias` at its front has been peeled off."""
 
     alias: str
     body: str
+    urgent: bool = False
 
 
-def address(text: str, *, prefix: str, aliases: list[str]) -> Addressed | None:
-    """None when the line is not for us: the prefix is required and missing.
+def parse_address(text: str) -> Address | None:
+    """`/rik text` -> who is called and what is said; None for anything else.
 
-    With a prefix set, slash commands and lines that open with a known alias
-    still work without it -- both are unambiguous. A known alias as the
-    first word routes to that session; the alias alone is a ping.
+    `/rik!` is the same call with the bang meaning: interrupt whatever the
+    agent is doing and take this now.
     """
     line = text.strip()
-    if prefix and line.startswith(prefix):
-        line = line[len(prefix) :].strip()
-    head, _, tail = line.partition(" ")
-    if head and head in aliases:
-        return Addressed(head, tail.strip())
-    if prefix and not text.strip().startswith(prefix) and not line.startswith("/"):
+    head, _, tail = re.split(r"(\s)", line, maxsplit=1) if re.search(r"\s", line) else (line, "", "")
+    match = _ADDRESS_RE.match(head)
+    if match is None:
         return None
-    if not line:
-        return Addressed("", "")
-    return Addressed("", line)
+    return Address(match.group(1), tail.strip(), urgent=bool(match.group(2)))
 
 
 @dataclass(frozen=True)
@@ -174,56 +177,113 @@ def parse_claude_command(body: str) -> ClaudeCommand | None:
 
 @dataclass(frozen=True)
 class Routed:
-    """Which profile a chat line belongs to, and what is left of the line."""
+    """Which profile a chat line belongs to, and what is left of the line.
 
-    profile: str
+    `profile` is 0 with `ambiguous` filled when several profiles answer to
+    the alias in this chat -- the line is for one of them, and nobody here
+    can say which.
+    """
+
+    profile: int
     body: str
-    addressed: bool = False
+    urgent: bool = False
+    ambiguous: tuple[int, ...] = ()
 
 
 def route(
     text: str,
     *,
-    prefix: str,
-    profiles: dict[str, Any],
+    profiles: dict[int, Any],
     chat: int,
     thread: int = 0,
 ) -> Routed | None:
     """Whose line this is, or None when it is nobody's.
 
-    A name at the front wins, and for a named profile it is the *only* way
-    in: a profile with an alias hears nothing that does not say its name.
-    That is what makes a conversation endable -- stop saying the name and the
-    agent stops answering.
-
-    What is left over belongs to `default`, the profile without a name, but
-    not in a chat some named profile has claimed: a chat dedicated to one
-    agent stays quiet rather than answering the people talking in it.
+    Every line for an agent opens with its alias, and that is the *only* way
+    in: a profile hears nothing that does not say its name. That is what
+    makes a conversation endable -- stop saying the name and the agent stops
+    answering. A line that names no known alias is not for a profile at all;
+    the daemon may still read it as one of its own commands.
     """
-    line = text.strip()
-    if prefix and line.startswith(prefix):
-        line = line[len(prefix) :].strip()
-        prefixed = True
-    else:
-        prefixed = False
+    from app.transport import profiles as profiles_module
 
-    head, _, tail = line.partition(" ")
-    if head and head in profiles and head != DEFAULT_PROFILE:
-        return Routed(head, tail.strip(), addressed=True)
-
-    if prefix and not prefixed and not line.startswith("/"):
+    address = parse_address(text)
+    if address is None:
         return None
-
-    fallback = profiles.get(DEFAULT_PROFILE)
-    if fallback is None:
+    found = profiles_module.candidates(profiles, address.alias, chat, thread)
+    if not found:
         return None
-    if fallback.claims(chat, thread):
-        return Routed(DEFAULT_PROFILE, line)
+    if len(found) > 1:
+        return Routed(0, address.body, address.urgent, ambiguous=tuple(p.id for p in found))
+    return Routed(found[0].id, address.body, address.urgent)
 
-    claimed = any(
-        name != DEFAULT_PROFILE and profile.claims(chat, thread)
-        for name, profile in profiles.items()
-    )
-    if claimed or not fallback.open_to(chat, thread):
-        return None
-    return Routed(DEFAULT_PROFILE, line)
+
+# -- the session's own commands, several to a line ---------------------------
+
+# What a conversation handles itself rather than passing to claude. A line
+# may carry several in a row -- `/clear /plan Давай…` -- and they are run
+# in order; the first word that is none of these starts the prompt.
+NO_ARG_COMMANDS = frozenset(
+    {
+        "/stop", "/kill", "/exit", "/quit", "/clear", "/new", "/status", "/help", "/usage",
+        "/pwd", "/save", "/plan", "/bypass", "/auto", "/edits", "/ask",
+    }
+)
+ONE_ARG_COMMANDS = frozenset({"/cd", "/switch", "/model", "/mode"})
+
+
+def _next_word(text: str, start: int) -> tuple[str, int]:
+    """The token at `start` (quotes honoured, kept out of the value) and
+    where the text continues after it."""
+    index = start
+    quote = ""
+    parts: list[str] = []
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                parts.append(char)
+        elif char in {'"', "'"}:
+            quote = char
+        elif char.isspace():
+            break
+        else:
+            parts.append(char)
+        index += 1
+    return "".join(parts), index
+
+
+def split_commands(body: str) -> tuple[list[tuple[str, str]], str]:
+    """Own commands at the front of a line, and whatever follows them.
+
+    `/clear /plan Давай сделаем` -> [("/clear", ""), ("/plan", "")], "Давай
+    сделаем". A one-argument command takes the next word, quoted if it has
+    spaces. The remainder is returned as typed -- newlines and all -- since
+    it is the prompt.
+    """
+    commands: list[tuple[str, str]] = []
+    index = 0
+    text = body
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text) or text[index] != "/":
+            break
+        word, after = _next_word(text, index)
+        head = word.lower().split("@", 1)[0]
+        if head in NO_ARG_COMMANDS:
+            commands.append((head, ""))
+            index = after
+            continue
+        if head in ONE_ARG_COMMANDS:
+            arg_start = after
+            while arg_start < len(text) and text[arg_start].isspace():
+                arg_start += 1
+            argument, after = _next_word(text, arg_start)
+            commands.append((head, argument))
+            index = after
+            continue
+        break
+    return commands, text[index:].strip()

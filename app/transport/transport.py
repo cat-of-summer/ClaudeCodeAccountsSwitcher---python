@@ -32,6 +32,7 @@ from app.transport import profiles as profiles_module
 from app.transport import conversation as conversation_module
 from app.transport.conversation import ChatTarget, Conversation
 from app.transport.profiles import Profile
+from app.transport.routing import parse_address
 from core import log, telegram
 from core.store import Config
 from system import childjob, console
@@ -43,7 +44,7 @@ FEED_FAILURES_BEFORE_TAKEOVER = 3
 LOCK_REFRESH_SECONDS = 60.0
 TICK_SECONDS = 1.0
 DEFAULT_MAX_SESSIONS = 8
-DEFAULT_IDLE_HOURS = 6.0
+DEFAULT_IDLE_HOURS = 1.0
 # Separates this transport's tag from the conversation's within it: "t1.2".
 CONVERSATION_SEPARATOR = "."
 
@@ -73,7 +74,6 @@ class Transport:
         self.chat = chat
         self.thread = thread
         self.tag = tag or "s"
-        self.prefix = str(config.telegram.get("prefix") or "")
 
         limit = config.telegram.get("maxSessions")
         self.max_sessions = int(limit) if isinstance(limit, (int, float)) and limit else DEFAULT_MAX_SESSIONS
@@ -109,7 +109,7 @@ class Transport:
         self._console(
             t(
                 "tg.transport_ready",
-                profile=self.profile.name,
+                profile=self.profile.label,
                 chats=self._chats_text(),
                 cwd=self.cwd,
             )
@@ -173,7 +173,7 @@ class Transport:
         return {
             "pid": os.getpid(),
             "tag": self.tag,
-            "profile": self.profile.name,
+            "profile": self.profile.id,
             "alias": self.profile.alias,
             "chat": self.chat,
             "thread": self.thread,
@@ -262,7 +262,7 @@ class Transport:
             stale = [c for c in self.conversations.values() if now - c.last_seen > self.idle_seconds]
         for conversation in stale:
             log.write(f"transport: conversation {conversation.tag} idle, closing")
-            conversation.close()
+            conversation.close(reason=t("tg.idle_closed", hours=_hours_text(self.idle_seconds)))
         if stale:
             return
 
@@ -308,8 +308,8 @@ class Transport:
 
         key = self._key(incoming)
 
-        body = self._strip(incoming.text)
-        if body is None:
+        stripped = self._strip(incoming)
+        if stripped is None:
             return
 
         conversation = self._find(key)
@@ -317,27 +317,19 @@ class Transport:
             conversation = self._open(incoming, key)
             if conversation is None:
                 return
-        conversation.deliver(_retext(incoming, body))
+        conversation.deliver(stripped)
 
-    def _strip(self, text: str) -> str | None:
-        """Take the prefix and our own name off a line, or refuse it.
+    def _strip(self, incoming: telegram.Incoming) -> telegram.Incoming | None:
+        """Take our own name off a line, or refuse it.
 
-        A named profile answers only what says its name -- every time, not
-        just the first. The daemon applies the same rule; doing it here too
-        is what keeps a transport polling on its own behaving alike.
+        A profile answers only what says its name -- every time, not just
+        the first. The daemon applies the same rule; doing it here too is
+        what keeps a transport polling on its own behaving alike.
         """
-        line = text.strip()
-        prefixed = False
-        if self.prefix and line.startswith(self.prefix):
-            line = line[len(self.prefix) :].strip()
-            prefixed = True
-
-        head, _, tail = line.partition(" ")
-        if self.profile.alias:
-            return tail.strip() if head == self.profile.alias else None
-        if self.prefix and not prefixed and not line.startswith("/"):
+        address = parse_address(incoming.text)
+        if address is None or not self.profile.answers_to(address.alias):
             return None
-        return line
+        return incoming.with_text(address.body, urgent=address.urgent)
 
     def _find(self, key: tuple[int, int, int]) -> Conversation | None:
         with self._lock:
@@ -375,7 +367,7 @@ class Transport:
             )
             self.conversations[key] = conversation
         log.write(
-            f"transport: conversation {tag} for {self.profile.name} "
+            f"transport: conversation {tag} for {self.profile.label} "
             f"chat={incoming.chat_id} user={key[2] or '*'}"
         )
         conversation.start()
@@ -420,12 +412,12 @@ class Transport:
         if not chat:
             return  # nothing to greet: the profile has no chat of its own yet
         thread = self.thread or next((ref[1] for ref in self.profile.chats), 0)
-        mode = self.profile.resolve_mode(self.config, self.cwd)
+        mode = self.profile.resolve_mode(self.config, self.cwd, self.args)
         text = t(
             "tg.greeting",
             mark=conversation_module.mode_mark(mode),
             mode=mode or "default",
-            alias=self.profile.alias or t("tg.greeting_no_alias"),
+            alias=self.profile.command,
             modes="  ".join(conversation_module.MODE_COMMANDS),
         )
         self._console(telegram.strip_html(text))
@@ -440,21 +432,9 @@ class Transport:
         return "*"
 
 
-def _retext(incoming: telegram.Incoming, body: str) -> telegram.Incoming:
-    """The same update with the prefix and alias peeled off."""
-    if body == incoming.text:
-        return incoming
-    return telegram.Incoming(
-        update_id=incoming.update_id,
-        chat_id=incoming.chat_id,
-        thread_id=incoming.thread_id,
-        user_id=incoming.user_id,
-        text=body,
-        message_id=incoming.message_id,
-        callback_id=incoming.callback_id,
-        callback_data=incoming.callback_data,
-        username=incoming.username,
-    )
+def _hours_text(seconds: float) -> str:
+    hours = seconds / 3600.0
+    return str(int(hours)) if hours == int(hours) else f"{hours:g}"
 
 
 def _wait_for_holder(bot_id: int, timeout: float = 10.0) -> dict[str, Any] | None:
