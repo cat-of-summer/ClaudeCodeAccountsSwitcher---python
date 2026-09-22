@@ -5,13 +5,29 @@ from unittest import mock
 from pathlib import Path
 from typing import Any
 
-from app.transport.conversation import ChatTarget, Conversation, resolve_dir
+from app import autoswitch
+from app.transport.conversation import ChatTarget, Conversation, mode_mark, resolve_dir
 from app.transport.driver import Event
 from app.transport.profiles import Profile
 from app.transport.prompter import Prompter
 from core import telegram
 from core.store import Config
 from tests.base import TempHome
+
+
+def mark(conversation: Conversation) -> str:
+    """Every answer opens with the mark of the mode it was written in."""
+    return f"{mode_mark(conversation.mode)} "
+
+
+def free(slot: int) -> autoswitch.Election:
+    """An election that says `slot` can take work right now."""
+    return autoswitch.Election(slot, "limits")
+
+
+def opens_at(slot: int, moment: float) -> autoswitch.Election:
+    """An election that says `slot` is the first to come back, at `moment`."""
+    return autoswitch.Election(slot, "waiting", available_at=moment)
 
 
 class FakeBot:
@@ -208,12 +224,12 @@ class ChatConversation(ConversationBase):
     def test_a_chat_hears_answers_and_nothing_technical(self) -> None:
         conversation = self.make(expanded=True)
         conversation._on_event(Event("text", {"text": "**bold** answer"}))
-        self.assertEqual(self.bot.texts()[-1], "<b>bold</b> answer")
+        self.assertEqual(self.bot.texts()[-1], mark(conversation) + "<b>bold</b> answer")
 
         conversation._on_event(Event("tool_use", {"name": "Bash", "input": {"command": "git status"}}))
         conversation._on_event(Event("tool_result", {"id": "x", "content": "clean"}))
         conversation._on_event(Event("result", {"subtype": "success", "duration_ms": 1000, "cost": 0.1}))
-        self.assertEqual(self.bot.texts()[-1], "<b>bold</b> answer")  # nothing new reached the chat
+        self.assertEqual(self.bot.texts()[-1], mark(conversation) + "<b>bold</b> answer")  # nothing new reached the chat
         self.assertTrue(any("git status" in line for line in self.console))
 
     def test_debug_turns_the_tool_log_back_on(self) -> None:
@@ -238,7 +254,7 @@ class CollapsedTurn(ConversationBase):
         conversation._on_event(Event("text", {"text": "done, here is the review"}))
         conversation._flush_live()
         self.assertEqual(len(self.bot.sent), 1)  # still one message in the chat
-        self.assertEqual(self.bot.sent[0]["text"], "done, here is the review")
+        self.assertEqual(self.bot.sent[0]["text"], mark(conversation) + "done, here is the review")
         self.assertEqual(self.bot.edits[-1]["id"], first)
 
     def test_a_deleted_message_is_replaced_not_lost(self) -> None:
@@ -251,7 +267,7 @@ class CollapsedTurn(ConversationBase):
         conversation._on_event(Event("text", {"text": "second"}))
         conversation._flush_live()
         self.assertEqual(len(self.bot.sent), 2)
-        self.assertEqual(self.bot.sent[-1]["text"], "second")
+        self.assertEqual(self.bot.sent[-1]["text"], mark(conversation) + "second")
 
     def test_a_new_turn_takes_the_buttons_off_the_old_message(self) -> None:
         conversation = self.make()
@@ -385,7 +401,7 @@ class SwitchingSlots(ConversationBase):
         conversation = self.make()
         conversation.config = Config.load()
 
-        with mock.patch.object(conversation, "_elect", return_value=2):
+        with mock.patch.object(conversation, "_elect", return_value=free(2)):
             conversation._on_event(Event("rate_limit", {"status": "rejected", "window": "five_hour"}))
         limit_message = self.bot.sent[-1]
         self.assertIsNotNone(limit_message["markup"])
@@ -402,12 +418,87 @@ class SwitchingSlots(ConversationBase):
         self.assertEqual(conversation._relaunch.prompt, "carry on")
 
 
+class WaitingOutALimit(ConversationBase):
+    """Nobody is free: the session parks on the slot that opens first."""
+
+    def _parked(self, slot: int = 2, seconds: float = 1800.0) -> Conversation:
+        conversation = self.make()
+        conversation.config = Config.load()
+        with mock.patch.object(
+            conversation, "_elect", return_value=opens_at(slot, time.time() + seconds)
+        ):
+            conversation._on_event(Event("rate_limit", {"status": "rejected", "window": "five_hour"}))
+        return conversation
+
+    def test_the_relaunch_is_scheduled_and_the_loop_stays_put(self) -> None:
+        conversation = self._parked()
+        assert conversation._relaunch is not None
+        self.assertEqual(conversation._relaunch.slot, 2)
+        self.assertTrue(conversation._relaunch.pending())
+        # Not due yet: claude stays up and the chat keeps working.
+        self.assertFalse(conversation._due())
+        self.assertIn("⏳", self.bot.texts()[-1])
+
+    def test_waiting_for_a_reset_is_not_the_chat_going_quiet(self) -> None:
+        """The delay is ours, so it must not count towards the idle close."""
+        conversation = self._parked()
+        conversation.last_seen = time.time() - 7200
+        conversation._tick()
+        self.assertAlmostEqual(conversation.last_seen, time.time(), delta=5)
+
+    def test_a_line_typed_meanwhile_becomes_the_first_prompt(self) -> None:
+        conversation = self._parked()
+        conversation._on_incoming(incoming("first thought"))
+        conversation._on_incoming(incoming("no, this one"))
+        assert conversation._relaunch is not None
+        self.assertEqual(conversation._relaunch.prompt, "no, this one")
+        self.assertEqual(self.driver.sent, [])  # claude is walled; nothing goes in
+
+    def test_commands_still_answer_while_parked(self) -> None:
+        conversation = self._parked()
+        conversation._on_incoming(incoming("/status"))
+        self.assertIn("2", self.bot.texts()[-1])
+        assert conversation._relaunch is not None
+        self.assertEqual(conversation._relaunch.after, [])
+
+    def test_an_explicit_switch_cancels_the_wait(self) -> None:
+        self._two_slots()
+        conversation = self._parked()
+        conversation._on_incoming(incoming("/switch 2"))
+        assert conversation._relaunch is not None
+        self.assertEqual(conversation._relaunch.slot, 2)
+        self.assertFalse(conversation._relaunch.pending())
+        self.assertTrue(conversation._due())
+
+    def test_when_the_moment_comes_the_relaunch_goes_through(self) -> None:
+        conversation = self._parked()
+        parked_message = self.bot.sent[-1]["id"]
+        assert conversation._relaunch is not None
+        conversation._relaunch.not_before = time.time() - 1
+        conversation._tick()
+        self.assertTrue(conversation._due())
+        self.assertEqual(conversation._relaunch.not_before, 0.0)
+        # The countdown message has done its job; one line says what happened.
+        self.assertIn(parked_message, self.bot.deleted_messages)
+        self.assertEqual(conversation._limit_messages, [])
+
+    def _two_slots(self) -> None:
+        from core import store
+        from core.store import Accounts, Slot
+
+        accounts = Accounts()
+        for number in (1, 2):
+            self.write_credentials(store.creds_file(number))
+            accounts.slots[number] = Slot(number=number, alias=f"s{number}")
+        accounts.save()
+
+
 class StartingOver(ConversationBase):
     """`/clear` is answered here: a fresh session, not a prompt to claude."""
 
     def test_clear_relaunches_with_a_new_session_id(self) -> None:
         conversation = self.make()
-        conversation._on_incoming(incoming("/clear"))
+        conversation._on_incoming(incoming("/new"))
         self.assertIn("🧹", self.bot.texts()[-1])
         self.assertEqual(self.driver.sent, [])
         assert conversation._relaunch is not None
@@ -460,11 +551,11 @@ class WorkStaysAtTheBottom(ConversationBase):
         # The old message is gone, the same text sits below the answered
         # question, and further work goes into the new one.
         self.assertIn(old_live, self.bot.deleted_messages)
-        self.assertEqual(self.bot.sent[-1]["text"], "half way")
+        self.assertEqual(self.bot.sent[-1]["text"], mark(conversation) + "half way")
         self.assertNotEqual(self.bot.sent[-1]["id"], old_live)
         conversation._on_event(Event("text", {"text": "done"}))
         conversation._flush_live()
-        self.assertEqual(self.bot.sent[-1]["text"], "done")
+        self.assertEqual(self.bot.sent[-1]["text"], mark(conversation) + "done")
         self.assertEqual(self.bot.edits[-1]["id"], self.bot.sent[-1]["id"])
 
     def test_expanded_mode_leaves_messages_where_they_are(self) -> None:
@@ -481,7 +572,7 @@ class SeveralCommandsInOneLine(ConversationBase):
 
     def test_clear_then_mode_then_prompt_ride_the_relaunch(self) -> None:
         conversation = self.make()
-        conversation._on_incoming(incoming("/clear /plan Давай сделаем"))
+        conversation._on_incoming(incoming("/new /plan Давай сделаем"))
         relaunch = conversation._relaunch
         assert relaunch is not None
         self.assertTrue(relaunch.fresh)
@@ -495,7 +586,7 @@ class SeveralCommandsInOneLine(ConversationBase):
 
     def test_commands_alone_end_with_the_last_one(self) -> None:
         conversation = self.make()
-        conversation._on_incoming(incoming("/clear /plan "))
+        conversation._on_incoming(incoming("/new /plan "))
         relaunch = conversation._relaunch
         assert relaunch is not None
         self.assertEqual((relaunch.fresh, relaunch.mode, relaunch.prompt), (True, "plan", ""))
@@ -505,7 +596,7 @@ class SeveralCommandsInOneLine(ConversationBase):
         conversation = self.make()
         project = self.home / "proj"
         project.mkdir()
-        conversation._on_incoming(incoming("/clear /cd proj /status"))
+        conversation._on_incoming(incoming("/new /cd proj /status"))
         relaunch = conversation._relaunch
         assert relaunch is not None
         self.assertTrue(relaunch.fresh)
@@ -684,3 +775,141 @@ class PlanModeWithBypass(ConversationBase):
         self.assertEqual(result["updatedPermissions"][0]["mode"], "bypassPermissions")  # type: ignore[index]
         self.assertEqual(conversation.mode, "bypassPermissions")
         self.assertIn("bypassPermissions", asked["text"])  # the plan stays, the decision under it
+
+
+class TheModeIsOnEveryAnswer(ConversationBase):
+    """No greeting carries it any more, so each answer says where it stands."""
+
+    def test_the_mark_is_the_mode_the_answer_was_written_in(self) -> None:
+        conversation = self.make(expanded=True)
+        conversation._on_event(Event("text", {"text": "first"}))
+        self.assertEqual(self.bot.texts()[-1], "🔴 first")  # bypass: the test config skips permissions
+
+        conversation._on_incoming(incoming("/plan"))
+        conversation._on_event(Event("text", {"text": "second"}))
+        self.assertEqual(self.bot.texts()[-1], "🟡 second")
+
+        conversation._on_incoming(incoming("/edits"))
+        conversation._on_event(Event("text", {"text": "third"}))
+        self.assertEqual(self.bot.texts()[-1], "🔵 third")
+
+    def test_the_collapsed_message_is_remarked_as_the_mode_changes(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("text", {"text": "working"}))
+        conversation._flush_live()
+        self.assertEqual(self.bot.sent[-1]["text"], "🔴 working")
+
+        conversation.mode = "plan"
+        conversation._on_event(Event("text", {"text": "still working"}))
+        conversation._flush_live()
+        self.assertEqual(self.bot.sent[-1]["text"], "🟡 still working")
+
+    def test_prompts_keep_their_own_marks(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("ask", {"request_id": "m1", "tool_name": "Bash", "input": {"command": "ls"}, "suggestions": []}))
+        self.assertTrue(self.bot.texts()[-1].startswith("🔐"))
+
+    def test_help_lists_the_modes_with_their_marks(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("/help"))
+        text = self.bot.texts()[-1]
+        self.assertIn("🟡 /plan", text)
+        self.assertIn("🔴 /bypass", text)
+
+
+class ThePlanStaysWhereItWasWritten(ConversationBase):
+    def test_the_working_message_holding_the_plan_is_kept(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(incoming("what would you do?"))
+        conversation._on_event(Event("text", {"text": "Here is the plan: rewrite the parser"}))
+        conversation._flush_live()
+        written = self.bot.sent[-1]["id"]
+
+        conversation._on_event(Event("ask", {"request_id": "x1", "tool_name": "ExitPlanMode", "input": {"plan": "rewrite the parser"}, "suggestions": []}))
+        asked = self.bot.sent[-1]
+        conversation._on_incoming(press(asked["markup"]["inline_keyboard"][0][0]["callback_data"]))
+
+        # Neither message moved, and the work that follows starts its own.
+        self.assertEqual(self.bot.deleted_messages, [])
+        conversation._on_event(Event("text", {"text": "done"}))
+        conversation._flush_live()
+        self.assertNotEqual(self.bot.sent[-1]["id"], written)
+        self.assertIn("rewrite the parser", [entry["text"] for entry in self.bot.sent if entry["id"] == written][0])
+
+    def test_a_plan_with_nothing_written_before_it_needs_no_keeping(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("ask", {"request_id": "x2", "tool_name": "ExitPlanMode", "input": {"plan": "do it"}, "suggestions": []}))
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(self.bot.deleted_messages, [])
+
+
+class TidyingUpTheChat(ConversationBase):
+    """`/new` starts over, `/clear` also empties the chat, `/exit` leaves the record."""
+
+    def _worked(self, conversation: Conversation) -> dict[str, int]:
+        """A turn with a plan, a permission, an answer and a mode line."""
+        conversation._on_incoming(incoming("do it"))
+        conversation._on_event(Event("text", {"text": "the plan"}))
+        conversation._flush_live()
+        plan_text = self.bot.sent[-1]["id"]
+        conversation._on_event(Event("ask", {"request_id": "x9", "tool_name": "ExitPlanMode", "input": {"plan": "do it"}, "suggestions": []}))
+        plan_prompt = self.bot.sent[-1]["id"]
+        conversation._on_incoming(press(self.bot.sent[-1]["markup"]["inline_keyboard"][0][1]["callback_data"]))
+        conversation._on_incoming(incoming("/status"))
+        service = self.bot.sent[-1]["id"]
+        conversation._on_event(Event("text", {"text": "all done"}))
+        conversation._flush_live()
+        answer = self.bot.sent[-1]["id"]
+        return {"plan_text": plan_text, "plan_prompt": plan_prompt, "service": service, "answer": answer}
+
+    def test_new_starts_a_fresh_session_and_leaves_the_chat_alone(self) -> None:
+        conversation = self.make()
+        self._worked(conversation)
+        before = len(self.bot.sent)
+        conversation._on_incoming(incoming("/new"))
+        self.assertEqual(self.bot.deleted_messages, [])
+        self.assertIn("🧹", self.bot.texts()[-1])
+        self.assertEqual(len(self.bot.sent), before + 1)
+        assert conversation._relaunch is not None
+        self.assertTrue(conversation._relaunch.fresh)
+
+    def test_clear_takes_everything_down_and_starts_a_fresh_session(self) -> None:
+        conversation = self.make()
+        shown = self._worked(conversation)
+        conversation._on_incoming(incoming("/clear"))
+        self.assertEqual(sorted(self.bot.deleted_messages), sorted(shown.values()))
+        assert conversation._relaunch is not None
+        self.assertTrue(conversation._relaunch.fresh)
+        self.assertEqual(conversation._messages, [])
+        self.assertEqual(conversation._live_id, 0)
+
+    def test_exit_keeps_the_plan_and_the_last_answer_and_closes(self) -> None:
+        conversation = self.make()
+        shown = self._worked(conversation)
+        conversation._on_incoming(incoming("/exit"))
+        self.assertTrue(conversation._closing)
+        self.assertEqual(
+            sorted(self.bot.deleted_messages), sorted([shown["service"]])
+        )
+        kept = [message_id for message_id, _ in conversation._messages]
+        self.assertEqual(kept, sorted([shown["plan_text"], shown["plan_prompt"], shown["answer"]]))
+        # Nothing is said on the way out: the chat is meant to be left tidy.
+        self.assertNotIn("👋", self.bot.texts()[-1])
+
+    def test_exit_after_an_interrupted_turn_keeps_only_the_plan(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("ask", {"request_id": "x8", "tool_name": "ExitPlanMode", "input": {"plan": "do it"}, "suggestions": []}))
+        plan_prompt = self.bot.sent[-1]["id"]
+        conversation._on_incoming(press(self.bot.sent[-1]["markup"]["inline_keyboard"][1][0]["callback_data"]))
+        conversation._on_incoming(incoming("/exit"))
+        self.assertEqual([message_id for message_id, _ in conversation._messages], [plan_prompt])
+
+    def test_an_answered_permission_is_gone_before_the_tidy_up(self) -> None:
+        conversation = self.make()
+        conversation._on_event(Event("ask", {"request_id": "p9", "tool_name": "Bash", "input": {"command": "ls"}, "suggestions": []}))
+        asked = self.bot.sent[-1]["id"]
+        conversation._on_incoming(press(self.bot.sent[-1]["markup"]["inline_keyboard"][0][0]["callback_data"]))
+        self.assertEqual(self.bot.deleted_messages, [asked])
+        conversation._on_incoming(incoming("/clear"))
+        # Taken down once, not twice.
+        self.assertEqual(self.bot.deleted_messages.count(asked), 1)

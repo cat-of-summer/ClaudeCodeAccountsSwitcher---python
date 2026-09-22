@@ -122,6 +122,20 @@ class ConversationsPerPerson(TransportBase):
         self.wait_for(lambda: not transport.conversations)
         self.assertFalse(conversation.driver.alive())
 
+    def test_a_conversation_waiting_out_a_limit_is_not_idle(self) -> None:
+        """The delay is the agent's, not the person's: the session stays."""
+        transport = self.transport(Profile(id=1, alias="bot"))
+        transport.idle_seconds = 0.05
+        transport._on_incoming(incoming("/bot hello", user=7))
+        conversation = next(iter(transport.conversations.values()))
+        self.wait_for(lambda: conversation.session_id != "")
+        conversation._limit_rechecked = time.time()  # no usage requests from a test
+        conversation._plan_relaunch(slot=2, not_before=time.time() + 600)
+
+        time.sleep(0.1)
+        transport._retire_idle()
+        self.assertIn(conversation.key, transport.conversations)
+
     def test_a_topic_is_a_conversation_of_its_own(self) -> None:
         transport = self.transport(Profile(id=1, alias="bot"))
         transport._on_incoming(incoming("/bot hello", user=7))
@@ -203,23 +217,14 @@ class ProfileSavedFromTheChat(TransportBase):
         self.assertEqual((saved.debug, saved.mode, saved.alias), (True, "plan", "rikroot"))
 
 
-class Greeting(TransportBase):
-    def test_one_line_with_the_mode_and_the_alias(self) -> None:
+class NothingIsSaidUnprompted(TransportBase):
+    def test_a_profile_coming_up_says_nothing_in_the_chat(self) -> None:
+        # The mode used to be greeted about; it rides on every answer now,
+        # and a chat that nobody wrote in stays untouched.
         transport = self.transport(Profile(id=2, alias="rikroot", chats=((CHAT, 0),), mode="plan"))
-        transport._greet()
-        text = self.bot.texts()[-1]
-        self.assertIn("🟡", text)
-        self.assertIn("plan", text)
-        self.assertIn("/rikroot", text)
-        self.assertIn("/plan", text)
-        self.assertIn("/help", text)
-
-    def test_the_greeting_counts_the_arguments_claude_will_get(self) -> None:
-        # No mode on the profile: the merged arguments (profile + launch +
-        # defaultArgs) decide what the chat is told.
-        transport = self.transport(Profile(id=2, alias="rikroot", chats=((CHAT, 0),)), args=["--dangerously-skip-permissions"])
-        transport._greet()
-        self.assertIn("bypassPermissions", self.bot.texts()[-1])
+        transport._tick()
+        self.assertEqual(self.bot.sent, [])
+        self.assertFalse(hasattr(transport, "_greet"))
 
     def test_an_idle_close_is_announced(self) -> None:
         transport = self.transport(Profile(id=1, alias="bot"))
@@ -231,8 +236,3 @@ class Greeting(TransportBase):
         transport._retire_idle()
         self.wait_for(lambda: not transport.conversations)
         self.assertIn("💤", self.bot.texts()[-1])
-
-    def test_nothing_to_greet_without_a_chat(self) -> None:
-        transport = self.transport(Profile(id=1, alias="bot"))
-        transport._greet()
-        self.assertEqual(self.bot.sent, [])

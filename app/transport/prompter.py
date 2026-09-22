@@ -57,6 +57,7 @@ class Prompt:
     text: str
     rows: list[list[Choice]]
     multi: bool = False
+    kind: str = ""  # KIND_*: what the session should make of this message
 
 
 @dataclass
@@ -329,7 +330,7 @@ class Prompter:
         rows.append(tail)
         if len(pending.questions) > 1:
             lines.insert(0, f"<i>{pending.index + 1}/{len(pending.questions)}</i>")
-        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, multi=multi)
+        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, multi=multi, kind=pending.kind)
 
     def _plan_prompt(self, pending: _Pending) -> Prompt:
         plan = str(pending.tool_input.get("plan") or "").strip()
@@ -344,7 +345,7 @@ class Prompter:
             ],
             [Choice(t("tg.plan_revise"), f"a:{pending.number}:0:n")],
         ]
-        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, kind=pending.kind)
 
     def plan_go_option(self) -> str:
         """What "carry on" after a plan means: back to bypass when the session
@@ -360,7 +361,7 @@ class Prompter:
             ],
             [Choice(t("tg.perm_deny"), f"a:{pending.number}:0:n")],
         ]
-        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, kind=pending.kind)
 
     def _elicit_field(self, pending: _Pending) -> tuple[str, dict[str, Any]]:
         if pending.index < len(pending.fields):
@@ -389,7 +390,7 @@ class Prompter:
                 ],
                 cancel,
             ]
-            return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+            return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, kind=pending.kind)
 
         lines.append(f"<b>{_esc(str(spec.get('title') or name))}</b>")
         if spec.get("description"):
@@ -416,7 +417,7 @@ class Prompter:
             pending.awaiting_text = True
             lines.append(f"<i>{_esc(t('tg.elicit_type'))}</i>")
             rows = [cancel]
-        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows)
+        return Prompt(pending.key(), pending.request_id, "\n".join(lines), rows, kind=pending.kind)
 
     def _decide_elicit(self, pending: _Pending, option: str) -> Outcome:
         if option == "c":

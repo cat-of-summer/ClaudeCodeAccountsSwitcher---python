@@ -6,11 +6,17 @@ Questions and permission prompts go through `Prompter`. Who a message
 belongs to is settled before it gets here -- the transport routes by profile
 and by `(chat, thread, user)`, and simply calls `deliver()`.
 
-A few lines are the conversation's own, not claude's: `/stop`, `/kill`,
-`/status`, `/usage`, `/cd`, `/pwd`, `/switch`, `/save`, `/help`, the mode
-switches, and `!cmd`, which the TUI would have run in its bash mode. Several
-may open one line -- `/clear /plan Давай…` -- and they run in order before
-what is left goes to claude as the prompt.
+A few lines are the conversation's own, not claude's: `/stop`, `/new`,
+`/clear`, `/exit`, `/kill`, `/status`, `/usage`, `/cd`, `/pwd`, `/switch`,
+`/save`, `/help`, the mode switches, and `!cmd`, which the TUI would have run
+in its bash mode. Several may open one line -- `/new /plan Давай…` -- and they
+run in order before what is left goes to claude as the prompt.
+
+Every message the session sends is remembered and labelled, because two of
+those commands tidy the chat up afterwards: `/clear` takes the whole
+conversation down and starts a fresh session in an empty chat, `/exit`
+leaves the record -- the plan and the last thing the agent said -- and
+closes.
 """
 
 from __future__ import annotations
@@ -49,7 +55,19 @@ TOOL_RESULT_PREVIEW = 400
 # A second Ctrl-C this soon after the first ends the session instead of
 # interrupting the turn again.
 DOUBLE_INTERRUPT_SECONDS = 3.0
-HELP_COMMANDS = ("/stop", "/kill", "/clear", "/status", "/usage", "/pwd", "/cd", "/switch", "/save", "/help")
+# How often a session parked on a limit reset asks again where to go. Each
+# ask is a usage request per account, and the thing it is waiting for moves
+# in hours, so once every few minutes is as often as it is worth asking.
+LIMIT_RECHECK_SECONDS = 300.0
+HELP_COMMANDS = (
+    "/stop", "/new", "/clear", "/exit", "/kill", "/status", "/usage", "/pwd", "/cd", "/switch", "/save", "/help",
+)
+
+# What a message the session sent was, so that `/clear` and `/exit` can tell
+# them apart long after they were sent.
+MSG_SERVICE = "service"  # prompts, mode lines, limit notices
+MSG_ANSWER = "answer"  # what the agent said
+MSG_PLAN = "plan"  # the plan: the prompt, and the message it was written into
 
 # Telegram rate-limits edits to the same message; one a second or so is what
 # a person reads anyway.
@@ -100,15 +118,25 @@ class Relaunch:
     # idle, until the person writes again.
     prompt: str = ""
     # Start over instead of resuming: a new session id in the same directory
-    # and on the same slot, the way `/clear` does it in the TUI.
+    # and on the same slot, the way `/clear` does it in the TUI -- `/new`
+    # here, since `/clear` also empties the chat.
     fresh: bool = False
     # The mode the new claude starts in, when a mode switch followed the
-    # command that caused the relaunch (`/clear /plan …`): it goes on the
+    # command that caused the relaunch (`/new /plan …`): it goes on the
     # command line, since the control channel is not there yet to ask.
     mode: str = ""
     # Own commands that came after the relaunching one and are better run
     # against the new claude than the one about to go.
     after: list[str] = field(default_factory=list)
+    # The moment before which the relaunch does not start: every account is in
+    # limit and we are sitting out the reset of the one that opens first.
+    # Until then claude stays up, the chat keeps answering, and whatever the
+    # person writes collects in `prompt`.
+    not_before: float = 0.0
+
+    def pending(self) -> bool:
+        """Scheduled, but not due yet."""
+        return self.not_before > time.time()
 
 
 @dataclass(frozen=True)
@@ -172,6 +200,9 @@ class Conversation:
         # Every prompt shown: the message it went into and the text in it,
         # so the answer can be written under the question.
         self._prompt_messages: dict[str, tuple[int, str]] = {}
+        # Everything this session put in the chat, oldest first, with what it
+        # was (MSG_*): `/clear` and `/exit` clean up by these labels.
+        self._messages: list[tuple[int, str]] = []
         self._relaunch: Relaunch | None = None
         self._closing = False
         self._close_reason = ""
@@ -189,6 +220,8 @@ class Conversation:
         self._mode_seen = False
         # Messages about a limit, taken down once the switch has happened.
         self._limit_messages: list[int] = []
+        # When the target of a parked wait was last re-elected.
+        self._limit_rechecked = 0.0
         self._opening_prompt = ""
         self._opening_lines: list[str] = []
         self._start_mode = ""
@@ -205,6 +238,11 @@ class Conversation:
     @property
     def key(self) -> tuple[int, int, int]:
         return self.target.key
+
+    @property
+    def waiting_out_limit(self) -> bool:
+        """Parked on a quota reset: silent, but not the person's silence."""
+        return self._relaunch is not None and self._relaunch.pending()
 
     # -- entry -------------------------------------------------------------
 
@@ -307,9 +345,9 @@ class Conversation:
         self.session_id = driver.session_id
         update_session(session_id=self.session_id, cwd=str(self.cwd), slot=self.slot, key=self.tag)
 
-        # The chat hears one greeting from the transport, not a header per
-        # relaunch: what slot and directory a conversation runs in is what
-        # the console window is for.
+        # The chat hears nothing on a start or a relaunch: what slot and
+        # directory a conversation runs in is what the console window is
+        # for, and the mode rides on every answer.
         self._console(self._banner() if not self.resume else t("tg.resumed", slot=self.slot, cwd=self.cwd))
         for line in self._opening_lines:
             self._on_line(line, source="relaunch")
@@ -336,6 +374,8 @@ class Conversation:
                 kind, item = self._inbox.get(timeout=TICK_SECONDS)
             except queue.Empty:
                 self._tick()
+                if self._due():
+                    return
                 continue
             except KeyboardInterrupt:
                 # Ctrl-C in the console window: the TUI would stop the turn,
@@ -359,13 +399,28 @@ class Conversation:
                 self._on_incoming(item)
             elif kind == "mode":
                 self._note_mode(item)
-            if self._relaunch is not None or self._closing:
+            if self._due():
                 return
+
+    def _due(self) -> bool:
+        """Time to leave `_loop`: we are closing, or a relaunch is ready.
+
+        A relaunch parked on a limit reset is not ready -- claude stays up and
+        the chat keeps working until the moment it was scheduled for.
+        """
+        if self._closing:
+            return True
+        return self._relaunch is not None and not self._relaunch.pending()
 
     def _tick(self) -> None:
         assert self.driver is not None and self.prompter is not None
         if self.driver.turn_active:
             self.last_seen = time.time()  # a long turn is not an idle one
+        if self._relaunch is not None and self._relaunch.not_before:
+            if self._relaunch.pending():
+                self._wait_out_limit()
+            else:
+                self._limit_expired()
         if self.driver.turn_active and time.time() - self._last_typing > TYPING_INTERVAL_SECONDS:
             self._last_typing = time.time()
             self.target.bot.typing(self.target.chat, thread_id=self.target.thread)
@@ -447,9 +502,15 @@ class Conversation:
 
         commands, rest = split_commands(line)
         for head, argument in commands:
-            if self._relaunch is not None and head not in RELAUNCH_COMMANDS:
+            if (
+                self._relaunch is not None
+                and not self._relaunch.pending()
+                and head not in RELAUNCH_COMMANDS
+            ):
                 # The claude this would run against is about to be replaced;
-                # the new one gets the line.
+                # the new one gets the line. A relaunch parked on a limit
+                # reset is hours away, and the claude it will replace is up
+                # and able to answer `/status` or `/usage` right now.
                 self._relaunch.after.append(f"{head} {argument}".strip())
                 continue
             self._own_command(head, argument, then_prompt=bool(rest) and not rest.startswith("!"))
@@ -459,9 +520,20 @@ class Conversation:
             return
         if self._relaunch is not None:
             if rest.startswith("!"):
-                self._relaunch.after.append(rest)
-            else:
-                self._relaunch.prompt = rest
+                # A shell line has nothing to do with the claude being
+                # replaced; during a parked wait it can simply run.
+                if self._relaunch.pending():
+                    self._shell(rest[1:].strip())
+                else:
+                    self._relaunch.after.append(rest)
+                return
+            # The last line typed wins: it becomes the first thing the
+            # resumed session is asked.
+            self._relaunch.prompt = rest
+            if self._relaunch.pending():
+                self._say(
+                    t("tg.limit_wait_queued", opens=autoswitch.stamp(self._relaunch.not_before))
+                )
             return
         if rest.startswith("!"):
             self._shell(rest[1:].strip())
@@ -478,14 +550,28 @@ class Conversation:
         if head == "/stop":
             self.driver.interrupt()
             self._say(t("tg.interrupted"))
-        elif head in {"/kill", "/exit", "/quit"}:
+        elif head == "/kill":
             self._say(t("tg.bye", session=self.session_id[:8]))
             self._closing = True
-        elif head in {"/clear", "/new"}:
+        elif head in {"/exit", "/quit"}:
+            # Done with this piece of work: the plan and the last thing the
+            # agent said are what anyone would come back to read, the rest
+            # was scaffolding.
+            self._retire_live()
+            self._purge(keep_plan=True, keep_last_answer=True)
+            self._console(t("tg.bye", session=self.session_id[:8]))
+            self._closing = True
+        elif head == "/new":
             # Headless claude has no /clear of its own: the line would go in
             # as a prompt. A fresh session is the same thing done here.
             self._retire_live()
             self._say(t("tg.cleared"))
+            self._plan_relaunch(fresh=True)
+        elif head == "/clear":
+            # Start over with nothing left of the old conversation, in the
+            # chat as well as in claude's context.
+            self._retire_live()
+            self._purge()
             self._plan_relaunch(fresh=True)
         elif head == "/status":
             self._say(self._status())
@@ -510,9 +596,16 @@ class Conversation:
 
     def _plan_relaunch(self, **fields: Any) -> Relaunch:
         """Add to the relaunch this line has already asked for, or start one:
-        `/clear /cd X /plan` is one relaunch, not three."""
+        `/clear /cd X /plan` is one relaunch, not three.
+
+        A relaunch parked on a limit reset loses its delay here unless the
+        caller names one again: `/switch`, `/cd`, `/new` are asks for
+        something to happen now, and an inherited `not_before` would silently
+        hold them back for hours.
+        """
         if self._relaunch is None:
             self._relaunch = Relaunch()
+        fields.setdefault("not_before", 0.0)
         for name, value in fields.items():
             setattr(self._relaunch, name, value)
         return self._relaunch
@@ -526,8 +619,9 @@ class Conversation:
             return
         if self._relaunch is not None:
             # The switch belongs to the claude about to start; it goes on
-            # its command line.
-            self._plan_relaunch(mode=wanted)
+            # its command line. A wait on a limit reset is kept: choosing a
+            # mode is not a reason to stop waiting for the quota.
+            self._plan_relaunch(mode=wanted, not_before=self._relaunch.not_before)
         else:
             try:
                 self.driver.set_permission_mode(wanted)
@@ -594,38 +688,55 @@ class Conversation:
                 self._say(t("tg.switch_bad", target=raw))
                 return
         else:
-            number = self._elect(accounts)
-            if number is None:
+            election = self._elect(accounts)
+            if election.target is None or election.must_wait():
                 self._say(t("tg.switch_none"))
                 return
+            number = election.target
         if number == self.slot:
             self._say(t("tg.switch_same", slot=number))
             return
+        self._go_to_slot(number, accounts)
+
+    def _go_to_slot(self, number: int, accounts: Accounts) -> None:
+        """Move to `number` as soon as the loop comes round."""
         # The limit messages and their button have done their job: one line
         # saying what happened is all that stays in the chat.
-        for message_id in self._limit_messages:
-            self.target.bot.delete_message(self.target.chat, message_id)
-        self._limit_messages = []
+        self._drop_limit_messages()
         self._say(
-            t("tg.limit_switched", from_slot=self.slot, to_slot=number, label=_plain(accounts.ensure(number).label))
+            t("tg.limit_over", slot=number)
+            if number == self.slot
+            else t(
+                "tg.limit_switched",
+                from_slot=self.slot,
+                to_slot=number,
+                label=_plain(accounts.ensure(number).label),
+            )
         )
+        # A line typed while the session was parked on a reset is already
+        # waiting to be said; the configured nudge is only for a relaunch
+        # nobody asked anything of.
+        queued = self._relaunch.prompt if self._relaunch is not None else ""
         self._plan_relaunch(
-            slot=number, prompt=str(self.config.auto_switch.get("resumePrompt") or "").strip()
+            slot=number,
+            prompt=queued or str(self.config.auto_switch.get("resumePrompt") or "").strip(),
         )
 
-    def _elect(self, accounts: Accounts) -> int | None:
+    def _drop_limit_messages(self) -> None:
+        for message_id in self._limit_messages:
+            self._drop(message_id)
+        self._limit_messages = []
+
+    def _elect(self, accounts: Accounts) -> autoswitch.Election:
         threshold = float(self.config.auto_switch.get("threshold") or 95)
         wrapper._refresh_candidates(accounts, skip=set())
-        election = autoswitch.elect_target(
+        return autoswitch.elect_target(
             accounts,
             current=self.slot,
             tried=set(self.tried),
             threshold=threshold,
             strategy=str(self.config.auto_switch.get("strategy") or "limits"),
         )
-        if election.target is None or election.must_wait():
-            return None
-        return election.target
 
     def _save_profile(self) -> None:
         """Pin what this conversation is doing to its profile."""
@@ -735,32 +846,141 @@ class Conversation:
     _rate_limit_announced = 0.0
 
     def _rate_limited(self, message: str, *, window: str = "") -> None:
+        if self._relaunch is not None and self._relaunch.pending():
+            # Already parked on this wall; claude retries a 429 several times
+            # and every retry comes back through here.
+            return
         if time.time() - self._rate_limit_announced < 30:
             return
         self._rate_limit_announced = time.time()
         accounts = Accounts.load()
-        target = self._elect(accounts)
+        election = self._elect(accounts)
+        target = election.target
         lines = [t("tg.rate_limited", slot=self.slot, window=window or "?")]
         if message:
             lines.append(f"<i>{_plain(message)}</i>")
-        if target is not None:
+        markup = None
+        if target is not None and election.must_wait():
+            # Nobody is free. The slot that opens first may well be another
+            # account still in limit, or this one -- either way the session
+            # waits it out here instead of being answered "no slot left" and
+            # left to the person to restart.
+            self._park_until(target, election.available_at)
+            lines.append(
+                t(
+                    "tg.limit_waiting",
+                    slot=target,
+                    label=_plain(accounts.ensure(target).label),
+                    opens=autoswitch.stamp(election.available_at),
+                )
+            )
+        elif target is not None:
             lines.append(t("tg.rate_limited_hint", slot=target, label=accounts.ensure(target).label))
             markup = telegram.keyboard([[(t("tg.switch_button", slot=target), f"{self.tag}:sw:{target}")]])
         else:
             lines.append(t("tg.switch_none"))
-            markup = None
         sent = self._say("\n".join(lines), markup=markup)
+        if sent:
+            self._limit_messages.append(sent)
+
+    def _park_until(self, target: int, opens: float) -> None:
+        """Schedule the move to `target` for the moment it opens."""
+        queued = self._relaunch.prompt if self._relaunch is not None else ""
+        self._plan_relaunch(
+            slot=target,
+            not_before=opens + wrapper.RESET_MARGIN_SECONDS,
+            prompt=queued or str(self.config.auto_switch.get("resumePrompt") or "").strip(),
+        )
+        self._limit_rechecked = time.time()
+        log.write(
+            f"transport: {self.tag} parked on slot {target}, opens {autoswitch.stamp(opens)}"
+        )
+
+    def _limit_expired(self) -> None:
+        """The moment we were parked on has come: let the relaunch through."""
+        assert self._relaunch is not None
+        self._relaunch.not_before = 0.0
+        target = self._relaunch.slot or self.slot
+        self._drop_limit_messages()
+        self._say(
+            t("tg.limit_over", slot=target)
+            if target == self.slot
+            else t(
+                "tg.limit_switched",
+                from_slot=self.slot,
+                to_slot=target,
+                label=_plain(Accounts.load().ensure(target).label),
+            )
+        )
+
+    def _wait_out_limit(self) -> None:
+        """Sit out the reset this conversation is parked on.
+
+        Two things happen here and nowhere else. The chat is not idle while
+        the delay is ours: `Transport._retire_idle` reads `last_seen`, and a
+        429 ends the turn, so without this line an hour of waiting would close
+        the session the person never went quiet on.
+
+        And the choice is made again now and then. A wait measured in hours
+        outlives the snapshot it was decided from -- an account can come back
+        early, or another one finish its own window first.
+        """
+        assert self._relaunch is not None
+        self.last_seen = time.time()
+        if time.time() - self._limit_rechecked < LIMIT_RECHECK_SECONDS:
+            return
+        self._limit_rechecked = time.time()
+        accounts = Accounts.load()
+        election = self._elect(accounts)
+        if election.target is None:
+            return
+        if not election.must_wait():
+            # Somebody came back early -- go now instead of sitting out a
+            # reset that no longer decides anything.
+            self._go_to_slot(election.target, accounts)
+            return
+        opens = election.available_at + wrapper.RESET_MARGIN_SECONDS
+        if election.target == self._relaunch.slot and abs(opens - self._relaunch.not_before) < 1.0:
+            return
+        self._park_until(election.target, election.available_at)
+        sent = self._say(
+            t(
+                "tg.limit_waiting",
+                slot=election.target,
+                label=_plain(accounts.ensure(election.target).label),
+                opens=autoswitch.stamp(election.available_at),
+            )
+        )
         if sent:
             self._limit_messages.append(sent)
 
     # -- prompts -----------------------------------------------------------
 
     def _show_prompt(self, prompt: Prompt) -> None:
+        is_plan = prompt.kind == prompter_module.KIND_PLAN
+        if is_plan:
+            self._keep_plan()
         markup = self._markup(prompt)
-        message_id = self._say(prompt.text, markup=markup)
+        message_id = self._say(prompt.text, markup=markup, kind=MSG_PLAN if is_plan else MSG_SERVICE)
         self._prompt_messages[prompt.key] = (message_id, prompt.text)
         numbered = [f"  {index + 1}) {choice.label}" for index, choice in enumerate(c for row in prompt.rows for c in row)]
         self._console("\n".join(numbered))
+
+    def _keep_plan(self) -> None:
+        """Close the message the plan was written into and leave it there.
+
+        In a collapsed chat the turn owns one message that later text
+        rewrites -- and the plan is the one thing worth rereading once the
+        work has started. So it is closed here: the plan stays where it is,
+        and what follows begins a new message.
+        """
+        if self.profile.expanded or not self._live_id:
+            return
+        self._flush_live()
+        self._mark(self._live_id, MSG_PLAN)
+        self._live_id = 0
+        self._live_text = ""
+        self._live_pending = ""
 
     def _markup(self, prompt: Prompt) -> dict[str, Any]:
         return telegram.keyboard(
@@ -804,7 +1024,7 @@ class Conversation:
                 self._say(summary)
             return True
         if kind in EPHEMERAL_PROMPTS and not self.profile.debug:
-            self.target.bot.delete_message(self.target.chat, message_id)
+            self._drop(message_id)
             self._console(telegram.strip_html(summary))
             return False
         rewritten = f"{text}\n\n{summary}" if summary else text
@@ -821,6 +1041,16 @@ class Conversation:
 
     # -- the message a turn is written into ---------------------------------
 
+    def _answer(self, text: str) -> str:
+        """What the agent said, marked with the mode it was said in.
+
+        The mark is on every answer rather than on a line of its own: the
+        session has no greeting to carry it, and the mode is exactly the
+        thing a person wants to know before reading what the agent did.
+        Prompts and questions keep their own marks.
+        """
+        return f"{mode_mark(self.mode)} {_esc(text)}"
+
     def _write(self, text: str) -> None:
         """A block of the agent's text, as this profile wants it shown.
 
@@ -829,7 +1059,7 @@ class Conversation:
         agent says last is almost always the part worth reading.
         """
         if self.profile.expanded:
-            self._say(_esc(text), plain=text)
+            self._say(self._answer(text), plain=text, kind=MSG_ANSWER)
             return
 
         self._live_pending = text
@@ -845,10 +1075,10 @@ class Conversation:
         self._live_pending = ""
         self._live_edited = time.time()
         self._live_text = text
-        rendered = _esc(text)
+        rendered = self._answer(text)
 
         if not self._live_id:
-            self._live_id = self._say(rendered, plain=text)
+            self._live_id = self._say(rendered, plain=text, kind=MSG_ANSWER)
             return
 
         self._console(text)
@@ -860,7 +1090,8 @@ class Conversation:
         if gone:
             # Deleted in the chat while we were writing into it; start again
             # rather than lose the rest of the turn.
-            self._live_id = self._say(rendered, plain=text)
+            self._forget(self._live_id)
+            self._live_id = self._say(rendered, plain=text, kind=MSG_ANSWER)
 
     def _relocate_live(self) -> None:
         """Move the turn's message below whatever was just answered.
@@ -874,16 +1105,68 @@ class Conversation:
         """
         if self.profile.expanded or not self._live_id:
             return
-        self.target.bot.delete_message(self.target.chat, self._live_id)
+        self._drop(self._live_id)
         self._live_id = 0
         if self._live_text:
-            self._live_id = self._say(_esc(self._live_text), plain=None, mirror=False)
+            self._live_id = self._say(
+                self._answer(self._live_text), plain=None, mirror=False, kind=MSG_ANSWER
+            )
 
     def _retire_live(self) -> None:
         """A new turn starts: close the old message and drop its buttons."""
         self._flush_live()
         if self._live_id:
             self.target.bot.edit_markup(self.target.chat, self._live_id, None)
+        self._live_id = 0
+        self._live_text = ""
+        self._live_pending = ""
+
+    # -- what is in the chat -------------------------------------------------
+
+    def _remember(self, message_id: int, kind: str) -> None:
+        if message_id:
+            self._messages.append((message_id, kind))
+
+    def _forget(self, message_id: int) -> None:
+        self._messages = [entry for entry in self._messages if entry[0] != message_id]
+
+    def _mark(self, message_id: int, kind: str) -> None:
+        self._messages = [
+            (found, kind if found == message_id else was) for found, was in self._messages
+        ]
+
+    def _drop(self, message_id: int) -> None:
+        """Take one of our messages out of the chat and off the books."""
+        self.target.bot.delete_message(self.target.chat, message_id)
+        self._forget(message_id)
+
+    def _purge(self, *, keep_plan: bool = False, keep_last_answer: bool = False) -> None:
+        """Take this session's messages out of the chat.
+
+        `/clear` keeps nothing: the chat ends up as it was before the
+        conversation started. `/exit` keeps what someone would come back to
+        read -- every plan, and the last thing the agent said. A turn cut
+        short has no last answer, and then only the plans stay.
+        """
+        kept: list[tuple[int, str]] = []
+        doomed = list(self._messages)
+        if keep_last_answer:
+            last = next((entry for entry in reversed(doomed) if entry[1] == MSG_ANSWER), None)
+            if last is not None:
+                doomed.remove(last)
+                kept.append(last)
+        if keep_plan:
+            for entry in [entry for entry in doomed if entry[1] == MSG_PLAN]:
+                doomed.remove(entry)
+                kept.append(entry)
+        for message_id, _ in doomed:
+            self.target.bot.delete_message(self.target.chat, message_id)
+        self._messages = sorted(kept)
+        surviving = {message_id for message_id, _ in kept}
+        self._prompt_messages = {
+            key: shown for key, shown in self._prompt_messages.items() if shown[0] in surviving
+        }
+        self._limit_messages = [found for found in self._limit_messages if found in surviving]
         self._live_id = 0
         self._live_text = ""
         self._live_pending = ""
@@ -897,12 +1180,13 @@ class Conversation:
         markup: dict[str, Any] | None = None,
         plain: str | None = None,
         mirror: bool = True,
+        kind: str = MSG_SERVICE,
     ) -> int:
         if mirror:
             self._console(plain if plain is not None else telegram.strip_html(html_text))
         reply_to, self._reply_to = self._reply_to, 0
         try:
-            return self.target.bot.send_message(
+            sent = self.target.bot.send_message(
                 self.target.chat,
                 html_text,
                 thread_id=self.target.thread,
@@ -913,6 +1197,8 @@ class Conversation:
             log.write(f"telegram: send failed: {exc}")
             self._console(t("tg.send_failed", error=exc))
             return 0
+        self._remember(sent, kind)
+        return sent
 
     def _console(self, text: str) -> None:
         if self._on_console is not None:
@@ -934,6 +1220,12 @@ class Conversation:
         state = t("tg.state_busy") if self.driver.turn_active else t("tg.state_idle")
         if self.prompter is not None and self.prompter.open:
             state = t("tg.state_waiting")
+        if self._relaunch is not None and self._relaunch.pending():
+            state = t(
+                "tg.state_limited",
+                slot=self._relaunch.slot or self.slot,
+                opens=autoswitch.stamp(self._relaunch.not_before),
+            )
         return t(
             "tg.status",
             mode=mode_line(self.mode),
@@ -956,11 +1248,13 @@ class Conversation:
         return f"<b>[{self.slot}] {_plain(slot.label)}</b>\n<code>{_plain(usage.describe(slot))}</code>"
 
     def _help(self) -> str:
+        # The marks go with the commands here, because they are what the
+        # chat sees on every answer and nothing else explains them.
         return t(
             "tg.help",
             alias=self.profile.command,
             commands="  ".join(HELP_COMMANDS),
-            modes="  ".join(MODE_COMMANDS),
+            modes="  ".join(f"{mode_mark(mode)} {command}" for command, mode in MODE_COMMANDS.items()),
             mode=mode_line(self.mode),
         )
 

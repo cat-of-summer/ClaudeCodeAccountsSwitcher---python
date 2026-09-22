@@ -521,7 +521,9 @@ class TestElection(TempHome):
         verdicts = autoswitch.explain(accounts, current=1, tried={1, 3}, threshold=95)
         self.assertEqual(
             verdicts,
-            {1: "current", 2: "free", 3: "tried", 4: "no-credentials", 5: "no-data"},
+            # Slot 3 was used earlier and has quota left: "tried-free" says it
+            # is out of the ranking but still somewhere to go back to.
+            {1: "current", 2: "free", 3: "tried-free", 4: "no-credentials", 5: "no-data"},
         )
 
         election = autoswitch.elect_target(accounts, current=1, tried={1, 3}, threshold=95)
@@ -700,6 +702,62 @@ class TestWaiting(TempHome):
         )
         self.assertIsNone(target)
         self.assertEqual(reason, "all_exhausted")
+
+    def test_a_tried_slot_that_came_back_beats_waiting_here(self) -> None:
+        """The evening's worst outcome: sitting out a reset next to a free slot.
+
+        Slot 2 was used earlier and hit its wall; by now its window has rolled
+        over. `candidates` keeps it out of the ranking, but `tried` is a fact
+        about this session, not about the account's quota.
+        """
+        accounts = self._accounts(
+            self._slot(1, 100, 10, five_reset=2700),
+            self._slot(2, 100, 10, five_reset=-60),
+        )
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1, 2}, threshold=95
+        )
+        self.assertEqual(target, 2)
+        self.assertEqual(reason, "recovered")
+        self.assertEqual(opens, 0.0)
+
+    def test_a_tried_slot_nobody_has_numbers_for_is_not_called_free(self) -> None:
+        accounts = self._accounts(
+            self._slot(1, 100, 10, five_reset=2700),
+            self._slot(2, 100, 10, five_reset=-60),
+        )
+        accounts.slots[2].usage["fetchedAtMs"] = (
+            time.time() - usage.USAGE_TTL_RANKING_SECONDS - 60
+        ) * 1000
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1, 2}, threshold=95
+        )
+        self.assertEqual(target, 1)
+        self.assertEqual(reason, "waiting")
+        self.assertAlmostEqual(opens, time.time() + 2700, delta=5)
+
+    def test_a_current_slot_reading_free_does_not_win_over_a_real_reset(self) -> None:
+        """We just got a 429 here; the snapshot saying otherwise is behind."""
+        accounts = self._accounts(
+            self._slot(1, 10, 10),
+            self._slot(2, 100, 10, five_reset=900),
+        )
+        target, reason, opens = autoswitch.pick_target(
+            accounts, current=1, tried={1, 2}, threshold=95
+        )
+        self.assertEqual(target, 2)
+        self.assertEqual(reason, "waiting")
+        self.assertAlmostEqual(opens, time.time() + 900, delta=5)
+
+    def test_the_journal_says_a_tried_slot_is_free_again(self) -> None:
+        accounts = self._accounts(
+            self._slot(1, 100, 10, five_reset=2700),
+            self._slot(2, 100, 10, five_reset=-60),
+            self._slot(3, 100, 10, five_reset=1800),
+        )
+        verdicts = autoswitch.explain(accounts, current=1, tried={1, 2, 3}, threshold=95)
+        self.assertEqual(verdicts[2], "tried-free")
+        self.assertEqual(verdicts[3], "tried")
 
     def test_the_plan_outlives_the_wait(self) -> None:
         accounts = self._accounts(

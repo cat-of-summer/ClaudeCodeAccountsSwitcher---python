@@ -663,17 +663,27 @@ def pick_target(
             opens = current_reset
         if math.isinf(opens):
             continue
-        # A slot the ranking above rejected as exhausted but whose data names no
-        # blocking window is not free either -- it is simply unreadable.
-        if opens <= moment and slot.number not in pool:
-            continue
+        if opens <= moment:
+            if slot.number == current:
+                # The wall we just hit here outweighs a snapshot saying
+                # otherwise; `current_reset` above is the reading that counts.
+                continue
+            if not usage.is_usable_for_ranking(slot.usage):
+                # "Free" only because nothing is known about it.
+                continue
+            # A slot tried earlier tonight whose window has since rolled over:
+            # there is nothing to wait for, go there now. `candidates` keeps
+            # it out of the ranking above, but `tried` is a fact about this
+            # session, not about the account's quota.
+            opens = 0.0
         key = (opens, slot.number)
         if soonest is None or key < soonest:
             soonest = key
 
     if soonest is None:
         return None, "all_exhausted" if pool else "no_candidates", 0.0
-    return soonest[1], "waiting", soonest[0]
+    opens, number = soonest[0], soonest[1]
+    return number, "waiting" if opens > moment else "recovered", opens
 
 
 def explain(
@@ -693,7 +703,14 @@ def explain(
         elif slot.number == current:
             verdicts[slot.number] = "current"
         elif slot.number in tried:
-            verdicts[slot.number] = "tried"
+            # A tried slot is out of the ranking, but not out of the election:
+            # once its window has rolled over it is somewhere to go back to,
+            # and the journal has to say so or the verdict contradicts the
+            # decision printed next to it.
+            recovered = usage.is_usable_for_ranking(slot.usage) and not is_exhausted(
+                slot.usage, threshold=threshold
+            )
+            verdicts[slot.number] = "tried-free" if recovered else "tried"
         elif not usage.is_usable_for_ranking(slot.usage):
             verdicts[slot.number] = "no-data"
         elif is_exhausted(slot.usage, threshold=threshold):

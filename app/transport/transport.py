@@ -29,7 +29,6 @@ from typing import Any
 from app.transport import daemonlink
 from app.transport import poller as poller_module
 from app.transport import profiles as profiles_module
-from app.transport import conversation as conversation_module
 from app.transport.conversation import ChatTarget, Conversation
 from app.transport.profiles import Profile
 from app.transport.routing import parse_address
@@ -114,7 +113,6 @@ class Transport:
                 cwd=self.cwd,
             )
         )
-        self._greet()
         try:
             self._loop()
         finally:
@@ -254,12 +252,20 @@ class Transport:
         starts a fresh one anyway. The window itself closes too, but only when
         the daemon can raise this profile again -- otherwise the chat would go
         deaf with nobody to wake it.
+
+        A session sitting out a quota reset is exempt. The chat is quiet there
+        because the agent cannot work, not because the person walked away, and
+        closing it would throw away the wait and the line queued for after it.
         """
         if not self.idle_seconds:
             return
         now = time.time()
         with self._lock:
-            stale = [c for c in self.conversations.values() if now - c.last_seen > self.idle_seconds]
+            stale = [
+                c
+                for c in self.conversations.values()
+                if now - c.last_seen > self.idle_seconds and not c.waiting_out_limit
+            ]
         for conversation in stale:
             log.write(f"transport: conversation {conversation.tag} idle, closing")
             conversation.close(reason=t("tg.idle_closed", hours=_hours_text(self.idle_seconds)))
@@ -400,29 +406,6 @@ class Transport:
             self.bot.send_message(
                 incoming.chat_id, text, thread_id=incoming.thread_id, reply_to=incoming.message_id
             )
-
-    def _greet(self) -> None:
-        """One line into the chat when the profile comes up.
-
-        The only message the transport sends on its own: what mode the agent
-        will be in and how to change it. Details about the slot, directory and
-        session id stay in the console window, where they are of use.
-        """
-        chat = self.chat or next((ref[0] for ref in self.profile.chats), 0)
-        if not chat:
-            return  # nothing to greet: the profile has no chat of its own yet
-        thread = self.thread or next((ref[1] for ref in self.profile.chats), 0)
-        mode = self.profile.resolve_mode(self.config, self.cwd, self.args)
-        text = t(
-            "tg.greeting",
-            mark=conversation_module.mode_mark(mode),
-            mode=mode or "default",
-            alias=self.profile.command,
-            modes="  ".join(conversation_module.MODE_COMMANDS),
-        )
-        self._console(telegram.strip_html(text))
-        with contextlib.suppress(telegram.TelegramError, telegram.Unreachable):
-            self.bot.send_message(chat, text, thread_id=thread)
 
     def _chats_text(self) -> str:
         if self.chat:

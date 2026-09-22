@@ -221,7 +221,7 @@ def route(
 # -- the session's own commands, several to a line ---------------------------
 
 # What a conversation handles itself rather than passing to claude. A line
-# may carry several in a row -- `/clear /plan Давай…` -- and they are run
+# may carry several in a row -- `/new /plan Давай…` -- and they are run
 # in order; the first word that is none of these starts the prompt.
 NO_ARG_COMMANDS = frozenset(
     {
@@ -258,7 +258,7 @@ def _next_word(text: str, start: int) -> tuple[str, int]:
 def split_commands(body: str) -> tuple[list[tuple[str, str]], str]:
     """Own commands at the front of a line, and whatever follows them.
 
-    `/clear /plan Давай сделаем` -> [("/clear", ""), ("/plan", "")], "Давай
+    `/new /plan Давай сделаем` -> [("/new", ""), ("/plan", "")], "Давай
     сделаем". A one-argument command takes the next word, quoted if it has
     spaces. The remainder is returned as typed -- newlines and all -- since
     it is the prompt.
