@@ -378,6 +378,35 @@ class HookBus:
         return parsed if isinstance(parsed, dict) else {}
 
 
+# claude has no "local artifacts" mode: `enableArtifact: false` takes the
+# tool away whole, and with it the agent's sense of when a page is the right
+# answer. So the tool stays, and the one step that puts the page on
+# claude.ai is refused on its way out.
+ARTIFACT_TOOL = "Artifact"
+ARTIFACT_PUBLISH_ACTIONS = frozenset({"", "publish"})
+ARTIFACT_LOCAL_REASON = (
+    "Publishing artifacts is turned off in this environment: the page stays a local file and "
+    "nothing is uploaded. Do not retry the publish and do not look for another way to share it. "
+    "Tell the user the full local path of the file instead of a link."
+)
+
+
+def is_artifact_publish(tool_name: str, tool_input: Any) -> bool:
+    """An Artifact call that would put something on claude.ai."""
+    if tool_name != ARTIFACT_TOOL or not isinstance(tool_input, dict):
+        return False
+    return str(tool_input.get("action") or "") in ARTIFACT_PUBLISH_ACTIONS
+
+
+def block_artifact_publish(event: HookEvent) -> dict[str, Any] | None:
+    """A subscriber that keeps artifacts local; see ARTIFACT_LOCAL_REASON."""
+    if event.name != "PreToolUse":
+        return None
+    if not is_artifact_publish(event.tool_name, event.payload.get("tool_input")):
+        return None
+    return _block(event, ARTIFACT_LOCAL_REASON)
+
+
 def _block(event: HookEvent, reason: str) -> dict[str, Any]:
     if event.name == "PreToolUse":
         return {

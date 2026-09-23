@@ -10,6 +10,7 @@ finds the poller to register with instead of competing with it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import threading
 import time
@@ -22,6 +23,12 @@ from core.sessions import _pid_alive
 from core.store import app_dir, read_json, write_json_atomic
 
 LOCK_STALE_SECONDS = 6 * 60 * 60
+# How long an album waits for its next file before it is handed on. Telegram
+# sends the parts back to back, but not always in one getUpdates answer.
+ALBUM_SETTLE_SECONDS = 1.5
+# The poll timeout while an album is still gathering: short enough to notice
+# that it has settled.
+ALBUM_POLL_SECONDS = 1
 
 
 def telegram_dir() -> Path:
@@ -71,6 +78,54 @@ def release(bot_id: int) -> None:
         lock_path(bot_id).unlink()
 
 
+class Albums:
+    """Files sent as one album, put back together into one message.
+
+    Telegram delivers an album as a message per file and puts the caption on
+    one of them. Routing reads the caption -- `/rik look at these` -- so a
+    file without it would be dropped as a line that names nobody. Held here
+    until the album stops growing, the parts leave as one update: the
+    captioned part's text and id, every part's files in the order sent.
+    """
+
+    def __init__(self, settle: float = ALBUM_SETTLE_SECONDS) -> None:
+        self.settle = settle
+        self._parts: dict[tuple[int, str], list[telegram.Incoming]] = {}
+        self._touched: dict[tuple[int, str], float] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self._parts)
+
+    def add(self, incoming: telegram.Incoming, *, now: float | None = None) -> bool:
+        """Keep `incoming` if it is part of an album; False when it is not."""
+        if not incoming.media_group or incoming.is_callback:
+            return False
+        key = (incoming.chat_id, incoming.media_group)
+        self._parts.setdefault(key, []).append(incoming)
+        self._touched[key] = time.time() if now is None else now
+        return True
+
+    def ready(self, *, now: float | None = None, everything: bool = False) -> list[telegram.Incoming]:
+        """The albums that have stopped growing, each as one update."""
+        moment = time.time() if now is None else now
+        done = [
+            key for key, touched in self._touched.items() if everything or moment - touched >= self.settle
+        ]
+        merged: list[telegram.Incoming] = []
+        for key in done:
+            parts = self._parts.pop(key)
+            self._touched.pop(key, None)
+            merged.append(_merge(parts))
+        return merged
+
+
+def _merge(parts: list[telegram.Incoming]) -> telegram.Incoming:
+    parts = sorted(parts, key=lambda part: part.message_id)
+    head = next((part for part in parts if part.text.strip()), parts[0])
+    files = tuple(item for part in parts for item in part.files)
+    return dataclasses.replace(head, files=files)
+
+
 class Poller(threading.Thread):
     """getUpdates in a loop, every update handed to `deliver`.
 
@@ -96,6 +151,7 @@ class Poller(threading.Thread):
         self.state = telegram.PollState()
         self._stop = threading.Event()
         self.busy_reason = ""
+        self.albums = Albums()
 
     def stop(self) -> None:
         self._stop.set()
@@ -111,14 +167,18 @@ class Poller(threading.Thread):
                 return
         while not self._stop.is_set():
             try:
-                incoming = telegram.poll_once(self.bot, self.state, timeout=self.timeout)
+                incoming = telegram.poll_once(
+                    self.bot, self.state, timeout=ALBUM_POLL_SECONDS if self.albums else self.timeout
+                )
             except telegram.TokenBusy as exc:
                 self.busy_reason = exc.description
                 log.write(f"telegram: token {self.bot.id} is polled elsewhere: {exc.description}")
                 if self.on_busy is not None:
                     self.on_busy(exc.description)
                 return
-            for item in incoming:
+            ready = [item for item in incoming if not self.albums.add(item)]
+            ready.extend(self.albums.ready())
+            for item in ready:
                 if self._stop.is_set():
                     return
                 try:

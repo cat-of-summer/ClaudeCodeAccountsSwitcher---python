@@ -40,6 +40,9 @@ class FakeBot:
         self.deleted: set[int] = set()
         self.deleted_messages: list[int] = []
         self.answered: list[tuple[str, str]] = []
+        self.remote: dict[str, bytes] = {}
+        self.upload_fails = False
+        self.batches: list[int] = []
 
     def send_message(
         self, chat_id: int, text: str, *, thread_id: int = 0, reply_markup: Any = None, reply_to: int = 0, **_: Any
@@ -77,8 +80,40 @@ class FakeBot:
     def typing(self, chat_id: int, *, thread_id: int = 0) -> None:
         return
 
+    # -- files: what the chat has for us, and what we sent it ------------
+
+    def get_file(self, file_id: str) -> str:
+        if file_id not in self.remote:
+            raise telegram.TelegramError("getFile", 400, "Bad Request: file is too big")
+        return f"documents/{file_id}"
+
+    def download(self, file_path: str, target: Any) -> None:
+        target.write(self.remote[file_path.rsplit("/", 1)[-1]])
+
+    def _upload(self, chat_id: int, files: list[tuple[str, bytes]], thread_id: int) -> list[int]:
+        self.batches.append(len(files))
+        if self.upload_fails:
+            raise telegram.Unreachable("offline")
+        ids = []
+        for name, content in files:
+            self.sent.append(
+                {"id": len(self.sent) + 1, "chat": chat_id, "text": "", "file": (name, content), "thread": thread_id,
+                 "album": len(files) > 1, "markup": None, "reply_to": 0}
+            )
+            ids.append(len(self.sent))
+        return ids
+
+    def send_document(self, chat_id: int, filename: str, content: bytes, *, thread_id: int = 0, **_: Any) -> int:
+        return self._upload(chat_id, [(filename, content)], thread_id)[0]
+
+    def send_media_group(self, chat_id: int, files: list[tuple[str, bytes]], *, thread_id: int = 0) -> list[int]:
+        return self._upload(chat_id, files, thread_id)
+
     def texts(self) -> list[str]:
         return [entry["text"] for entry in self.sent]
+
+    def uploads(self) -> list[dict[str, Any]]:
+        return [entry for entry in self.sent if "file" in entry]
 
 
 class FakeDriver:
@@ -913,3 +948,157 @@ class TidyingUpTheChat(ConversationBase):
         conversation._on_incoming(incoming("/clear"))
         # Taken down once, not twice.
         self.assertEqual(self.bot.deleted_messages.count(asked), 1)
+
+
+def with_files(text: str, *files: tuple[str, str], size: int = 0) -> telegram.Incoming:
+    """A message carrying `files`, each as (file_id, name)."""
+    return telegram.Incoming(
+        update_id=3,
+        chat_id=-100,
+        thread_id=0,
+        user_id=7,
+        text=text,
+        message_id=9,
+        files=tuple(telegram.Attachment(file_id, name, size) for file_id, name in files),
+    )
+
+
+class FilesFromTheChat(ConversationBase):
+    def test_a_file_lands_where_claude_works_and_its_path_follows_the_prompt(self) -> None:
+        self.bot.remote = {"d1": b"first", "d2": b"second"}
+        conversation = self.make()
+        conversation._on_incoming(with_files("what is in it?", ("d1", "notes.txt")))
+        conversation._on_incoming(with_files("and this one?", ("d2", "notes.txt")))
+
+        first, second = self.home / "notes.txt", self.home / "notes (1).txt"
+        self.assertEqual(first.read_bytes(), b"first")
+        self.assertEqual(second.read_bytes(), b"second")
+        self.assertEqual(self.driver.sent, [f"what is in it?\n\n{first}", f"and this one?\n\n{second}"])
+
+    def test_a_file_without_words_is_the_prompt_by_itself(self) -> None:
+        self.bot.remote = {"d1": b"x", "d2": b"y"}
+        conversation = self.make()
+        conversation._on_incoming(with_files("", ("d1", "a.png"), ("d2", "b.png")))
+        self.assertEqual(self.driver.sent, [f"{self.home / 'a.png'}\n{self.home / 'b.png'}"])
+
+    def test_own_commands_in_front_still_run(self) -> None:
+        self.bot.remote = {"d1": b"x"}
+        conversation = self.make()
+        conversation._on_incoming(with_files("/plan", ("d1", "spec.md")))
+        self.assertEqual(self.driver.mode, "plan")
+        self.assertEqual(self.driver.sent, [str(self.home / "spec.md")])
+
+    def test_a_file_that_cannot_be_had_is_said_and_the_rest_goes_through(self) -> None:
+        self.bot.remote = {"d2": b"ok"}
+        conversation = self.make()
+        conversation._on_incoming(with_files("look", ("gone", "a.txt"), ("d2", "b.txt")))
+        self.assertTrue(any("a.txt" in text and "📎" in text for text in self.bot.texts()))
+        self.assertFalse((self.home / "a.txt").exists())
+        self.assertEqual(self.driver.sent, [f"look\n\n{self.home / 'b.txt'}"])
+
+    def test_one_over_the_download_limit_is_not_even_asked_for(self) -> None:
+        conversation = self.make()
+        conversation._on_incoming(with_files("look", ("big", "movie.mp4"), size=telegram.DOWNLOAD_LIMIT_BYTES + 1))
+        self.assertIn("20", self.bot.texts()[-1])
+        self.assertEqual(self.driver.sent, ["look"])
+
+    def test_names_are_made_safe_for_the_disk(self) -> None:
+        from app.transport.conversation import safe_filename
+
+        self.assertEqual(safe_filename("../../etc/passwd"), "passwd")
+        self.assertEqual(safe_filename("C:\\x\\a<b>:c?.txt"), "a_b__c_.txt")
+        self.assertEqual(safe_filename("con.txt"), "_con.txt")
+        self.assertEqual(safe_filename(".."), "file")
+
+
+def artifact(conversation: Conversation, call: str, path: str, *, result: str = "", error: bool = False) -> None:
+    conversation._on_event(Event("tool_use", {"name": "Artifact", "id": call, "input": {"file_path": path}}))
+    conversation._on_event(Event("tool_result", {"id": call, "content": result, "is_error": error}))
+
+
+class ArtifactsFollowTheAnswer(ConversationBase):
+    def test_a_refused_publish_still_sends_the_file_after_the_answer(self) -> None:
+        (self.home / "page.html").write_text("<p>hi</p>", encoding="utf-8")
+        conversation = self.make()
+        artifact(conversation, "t1", "page.html", result="Publishing artifacts is turned off", error=True)
+        self.assertEqual(self.bot.uploads(), [])  # not before the answer
+        conversation._on_event(Event("text", {"text": "Here it is: page.html"}))
+        conversation._on_event(Event("result", {"text": "Here it is: page.html"}))
+
+        answer, upload = self.bot.sent[-2:]
+        self.assertIn("Here it is", answer["text"])
+        self.assertEqual(upload["file"], ("page.html", b"<p>hi</p>"))
+        self.assertIn((upload["id"], "artifact"), conversation._messages)
+
+    def test_a_published_one_sends_the_file_and_then_the_link(self) -> None:
+        (self.home / "page.html").write_text("x", encoding="utf-8")
+        conversation = self.make()
+        link = "https://claude.ai/code/artifact/0f3c-aa"
+        artifact(conversation, "t1", str(self.home / "page.html"), result=f"Published: {link}")
+        conversation._on_event(Event("result", {"text": f"Done, see {link}"}))
+        self.assertEqual(self.bot.sent[-2]["file"][0], "page.html")
+        self.assertEqual(self.bot.texts()[-1], f"🔗 {link}")
+
+    def test_other_tools_and_other_actions_send_nothing(self) -> None:
+        (self.home / "a.py").write_text("x", encoding="utf-8")
+        conversation = self.make()
+        conversation._on_event(Event("tool_use", {"name": "Write", "id": "w", "input": {"file_path": "a.py"}}))
+        conversation._on_event(Event("tool_result", {"id": "w", "content": "https://claude.ai/code/artifact/zzz"}))
+        conversation._on_event(Event("tool_use", {"name": "Artifact", "id": "r", "input": {"action": "read", "url": "u"}}))
+        conversation._on_event(Event("tool_result", {"id": "r", "content": ""}))
+        conversation._on_event(Event("result", {"text": "ok"}))
+        self.assertEqual(self.bot.sent, [])
+
+    def test_many_files_go_in_albums_of_ten(self) -> None:
+        conversation = self.make()
+        for number in range(12):
+            (self.home / f"p{number}.html").write_text("x", encoding="utf-8")
+            artifact(conversation, f"t{number}", f"p{number}.html")
+        conversation._on_event(Event("result", {"text": ""}))
+        uploads = self.bot.uploads()
+        self.assertEqual([entry["file"][0] for entry in uploads], [f"p{n}.html" for n in range(12)])
+        self.assertEqual(self.bot.batches, [10, 2])
+
+    def test_what_cannot_be_sent_is_named_by_its_path(self) -> None:
+        conversation = self.make()
+        artifact(conversation, "t1", "missing.html")
+        conversation._on_event(Event("result", {"text": ""}))
+        self.assertIn("missing.html", self.bot.texts()[-1])
+        self.assertEqual(conversation._messages[-1][1], "artifact")
+
+        (self.home / "page.html").write_text("x", encoding="utf-8")
+        self.bot.upload_fails = True
+        artifact(conversation, "t2", "page.html")
+        conversation._on_event(Event("result", {"text": ""}))
+        self.assertIn("page.html", self.bot.texts()[-1])
+        self.assertIn("offline", self.bot.texts()[-1])
+
+    def test_what_the_agent_writes_next_starts_below_the_files(self) -> None:
+        (self.home / "page.html").write_text("x", encoding="utf-8")
+        conversation = self.make()
+        conversation._on_event(Event("text", {"text": "made it"}))
+        artifact(conversation, "t1", "page.html")
+        conversation._on_event(Event("result", {"text": "made it"}))
+        self.assertEqual(conversation._live_id, 0)
+
+    def test_exit_keeps_the_artifacts_and_clear_takes_them_down(self) -> None:
+        (self.home / "page.html").write_text("x", encoding="utf-8")
+        conversation = self.make()
+        conversation._on_event(Event("text", {"text": "working"}))
+        conversation._flush_live()
+        artifact(conversation, "t1", "page.html", result="https://claude.ai/code/artifact/abc")
+        conversation._on_event(Event("result", {"text": "done"}))
+        artifacts = sorted(message_id for message_id, kind in conversation._messages if kind == "artifact")
+        self.assertEqual(len(artifacts), 2)  # the file and the link
+
+        conversation._on_incoming(incoming("/exit"))
+        kept = [message_id for message_id, _ in conversation._messages]
+        self.assertTrue(set(artifacts) <= set(kept))
+        self.assertFalse(set(artifacts) & set(self.bot.deleted_messages))
+
+        conversation = self.make()
+        artifact(conversation, "t2", "page.html")
+        conversation._on_event(Event("result", {"text": ""}))
+        sent = [message_id for message_id, _ in conversation._messages]
+        conversation._on_incoming(incoming("/clear"))
+        self.assertTrue(set(sent) <= set(self.bot.deleted_messages))

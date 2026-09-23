@@ -271,6 +271,10 @@ class Config:
     # On by default: it changes nothing visible, only lets ccas see the
     # session's hook events. The switch exists for the day it misbehaves.
     hooks_bus: bool = True
+    # Off by default: an artifact stays a local file and the agent names its
+    # path, instead of a page published on claude.ai. Enforced through the
+    # hook bus, so it holds only while the bus is on.
+    artifact_publish: bool = False
     hooks: list[dict[str, Any]] = field(default_factory=list)
     telegram: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_TELEGRAM))
 
@@ -308,6 +312,7 @@ class Config:
                 **(stored if isinstance(stored, dict) else {}),
             },
             hooks_bus=bool(raw.get("hooksBus", True)),
+            artifact_publish=bool(raw.get("artifactPublish", False)),
             hooks=[
                 entry for entry in (stored_hooks if isinstance(stored_hooks, list) else [])
                 if isinstance(entry, dict)
@@ -333,6 +338,7 @@ class Config:
                 "language": self.language,
                 "autoSwitch": self.auto_switch,
                 "hooksBus": self.hooks_bus,
+                "artifactPublish": self.artifact_publish,
                 "hooks": self.hooks,
                 "telegram": self.telegram,
             },

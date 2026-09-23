@@ -187,6 +187,12 @@ SETTINGS: tuple[Setting, ...] = (
         lambda config: config.hooks_bus,
         lambda config, value: setattr(config, "hooks_bus", bool(value)),
     ),
+    Setting(
+        "artifact-publish",
+        "bool",
+        lambda config: config.artifact_publish,
+        lambda config, value: setattr(config, "artifact_publish", bool(value)),
+    ),
     Setting("telegram-token", "text", _tg("token"), _set_token, editable_in_screen=False, secret=True),
     Setting("telegram-console", "bool", _tg("console"), _set_tg("console")),
     Setting(

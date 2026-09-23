@@ -197,7 +197,7 @@ class Transport:
                     registered = True
                 for raw in daemonlink.poll(self._feed_port, os.getpid(), wait=FEED_WAIT_SECONDS):
                     with contextlib.suppress(TypeError):
-                        self.deliver(telegram.Incoming(**raw))
+                        self.deliver(telegram.Incoming.from_dict(raw))
                 failures = 0
             except daemonlink.LinkError as exc:
                 failures += 1

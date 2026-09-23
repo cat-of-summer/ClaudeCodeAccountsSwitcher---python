@@ -12,26 +12,33 @@ A few lines are the conversation's own, not claude's: `/stop`, `/new`,
 in its bash mode. Several may open one line -- `/new /plan Давай…` -- and they
 run in order before what is left goes to claude as the prompt.
 
+Files come and go as files. What the person attaches is saved into the
+directory claude works in, and the paths are added under the prompt. What
+the agent makes as an artifact follows its answer into the chat as the file
+itself, with the claude.ai link when there was one.
+
 Every message the session sends is remembered and labelled, because two of
 those commands tidy the chat up afterwards: `/clear` takes the whole
 conversation down and starts a fresh session in an empty chat, `/exit`
-leaves the record -- the plan and the last thing the agent said -- and
-closes.
+leaves the record -- the plan, the artifacts and the last thing the agent
+said -- and closes.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from app import autoswitch, wrapper
 from app.transport import profiles as profiles_module
@@ -68,6 +75,13 @@ HELP_COMMANDS = (
 MSG_SERVICE = "service"  # prompts, mode lines, limit notices
 MSG_ANSWER = "answer"  # what the agent said
 MSG_PLAN = "plan"  # the plan: the prompt, and the message it was written into
+MSG_ARTIFACT = "artifact"  # an artifact the agent made, as a file or a link
+
+# A published artifact's address, in whatever the Artifact tool answered.
+ARTIFACT_URL_RE = re.compile(r"https://claude\.ai/(?:code/)?artifact/[\w-]+")
+# Files are sent in albums no heavier than this, well inside what one upload
+# to the Bot API may carry.
+ARTIFACT_BATCH_BYTES = 45 * 1024 * 1024
 
 # Telegram rate-limits edits to the same message; one a second or so is what
 # a person reads anyway.
@@ -225,6 +239,11 @@ class Conversation:
         self._opening_prompt = ""
         self._opening_lines: list[str] = []
         self._start_mode = ""
+        # The turn's artifacts: Artifact calls not answered yet (call id ->
+        # file), and what goes to the chat once the answer is in.
+        self._artifact_calls: dict[str, Path] = {}
+        self._turn_files: list[Path] = []
+        self._turn_links: list[str] = []
         self.last_seen = time.time()
         self.exit_code = 0
         self.started_at = time.time()
@@ -483,7 +502,43 @@ class Conversation:
             if self.profile.debug:
                 self._say(t("tg.interrupted"))
         self._retire_live()
-        self._on_line(incoming.text, source="telegram", user=incoming.username or str(incoming.user_id))
+        text = incoming.text
+        if incoming.files:
+            saved = self._fetch(incoming.files)
+            if saved:
+                paths = "\n".join(str(path) for path in saved)
+                text = f"{text.rstrip()}\n\n{paths}" if text.strip() else paths
+        self._on_line(text, source="telegram", user=incoming.username or str(incoming.user_id))
+
+    def _fetch(self, files: tuple[telegram.Attachment, ...]) -> list[Path]:
+        """Save what the person attached where claude works; the paths.
+
+        A name already taken gets a number, the way a browser saves a second
+        download -- nothing the agent or the person put there is overwritten.
+        A file that cannot be had is said so in the chat and left out; the
+        rest of the message still goes through.
+        """
+        saved: list[Path] = []
+        for item in files:
+            if item.size > telegram.DOWNLOAD_LIMIT_BYTES:
+                self._say(t("tg.file_too_big", name=_plain(item.name)))
+                continue
+            target: Path | None = None
+            try:
+                remote = self.target.bot.get_file(item.file_id)
+                target, handle = claim_file(self.cwd, item.name)
+                with handle:
+                    self.target.bot.download(remote, handle)
+            except (telegram.TelegramError, telegram.Unreachable, OSError) as exc:
+                if target is not None:
+                    with contextlib.suppress(OSError):
+                        target.unlink()
+                log.write(f"telegram: could not fetch {item.name}: {exc}")
+                self._say(t("tg.file_failed", name=_plain(item.name), error=_plain(str(exc))))
+                continue
+            self._console(f"📎 {target}")
+            saved.append(target)
+        return saved
 
     def _on_line(self, text: str, *, source: str = "telegram", user: str = "") -> None:
         assert self.driver is not None and self.prompter is not None
@@ -761,12 +816,14 @@ class Conversation:
                 return
             self._write(str(data["text"]))
         elif event.kind == "tool_use":
+            self._note_artifact_call(data)
             line = f"🔧 {data['name']} {_tool_line(data)}".rstrip()
             if not debug:
                 self._console(line)  # the window keeps the log the chat refused
                 return
             self._say(f"🔧 <b>{_plain(str(data['name']))}</b> <code>{_plain(_tool_line(data))}</code>")
         elif event.kind == "tool_result":
+            self._note_artifact_result(data)
             content = str(data.get("content") or "").strip()
             mark = "❌" if data.get("is_error") else "↩"
             if not debug:
@@ -787,6 +844,8 @@ class Conversation:
                 self._close_prompt(key, t("tg.prompt_cancelled"), kind=kind)
         elif event.kind == "result":
             self._flush_live()
+            self._note_links(str(data.get("text") or ""))
+            self._send_artifacts()
             if data.get("api_error_status") == 429 or data.get("terminal_reason") == "rate_limit":
                 self._rate_limited(str(data.get("text") or ""))
             elif data.get("is_error") and data.get("text"):
@@ -798,11 +857,129 @@ class Conversation:
                 self._rate_limited(str(data.get("message") or ""), window=str(data.get("window") or ""))
         elif event.kind == "exit":
             self._flush_live()
+            self._send_artifacts()
             if self._relaunch is None and not self._closing:
                 code = int(data.get("code") or 0)
                 self.exit_code = code
                 tail = str(data.get("stderr") or "")
                 self._say(t("tg.ended", code=code) + (f"\n<pre>{_plain(tail[:500])}</pre>" if tail and code else ""))
+
+    # -- artifacts -----------------------------------------------------------
+
+    def _note_artifact_call(self, data: dict[str, Any]) -> None:
+        """Remember the file an Artifact publish is about.
+
+        Taken from the call rather than its result: with publishing refused
+        the result is only the refusal, and the file is on disk either way.
+        """
+        tool_input = data.get("input")
+        if not hookbus.is_artifact_publish(str(data.get("name") or ""), tool_input):
+            return
+        assert isinstance(tool_input, dict)
+        file_path = tool_input.get("file_path")
+        if tool_input.get("asset") or not isinstance(file_path, str) or not file_path.strip():
+            return
+        path = Path(os.path.expanduser(file_path.strip()))
+        if not path.is_absolute():
+            path = self.cwd / path
+        self._artifact_calls[str(data.get("id") or "")] = path
+
+    def _note_artifact_result(self, data: dict[str, Any]) -> None:
+        path = self._artifact_calls.pop(str(data.get("id") or ""), None)
+        if path is None:
+            return
+        if path not in self._turn_files:
+            self._turn_files.append(path)
+        self._note_links(str(data.get("content") or ""))
+
+    def _note_links(self, text: str) -> None:
+        for link in ARTIFACT_URL_RE.findall(text):
+            if link not in self._turn_links:
+                self._turn_links.append(link)
+
+    def _send_artifacts(self) -> None:
+        """After the answer: the turn's artifacts as files, then their links.
+
+        Files go in albums of up to ten and a few dozen megabytes; one that
+        cannot be sent -- gone from disk, or over what a bot may upload -- is
+        named by its path in the message with the links instead. Everything
+        here is kept by `/exit`, the way the plan is.
+        """
+        files, links = self._turn_files, self._turn_links
+        self._turn_files, self._turn_links = [], []
+        self._artifact_calls = {}
+        if not files and not links:
+            return
+
+        notes: list[str] = []
+        batches: list[list[Path]] = []
+        batch: list[Path] = []
+        weight = 0
+        for path in files:
+            try:
+                size = path.stat().st_size if path.is_file() else -1
+            except OSError:
+                size = -1
+            if size < 0:
+                notes.append(t("tg.artifact_missing", path=_plain(str(path))))
+                continue
+            if size > telegram.UPLOAD_LIMIT_BYTES:
+                notes.append(t("tg.artifact_too_big", path=_plain(str(path))))
+                continue
+            if batch and (len(batch) >= telegram.MEDIA_GROUP_LIMIT or weight + size > ARTIFACT_BATCH_BYTES):
+                batches.append(batch)
+                batch, weight = [], 0
+            batch.append(path)
+            weight += size
+        if batch:
+            batches.append(batch)
+
+        sent = False
+        for group in batches:
+            failed = self._send_files(group)
+            notes.extend(failed)
+            sent = sent or len(failed) < len(group)
+        lines = [f"🔗 {_plain(link)}" for link in links] + notes
+        if lines:
+            sent = bool(self._say("\n".join(lines), kind=MSG_ARTIFACT)) or sent
+        if sent:
+            # Whatever the agent writes next starts below the files, not in
+            # the answer above them.
+            self._retire_live()
+
+    def _send_files(self, paths: list[Path]) -> list[str]:
+        """One album, or one document; the notes for what did not go."""
+        loaded: list[tuple[Path, bytes]] = []
+        notes: list[str] = []
+        for path in paths:
+            try:
+                loaded.append((path, path.read_bytes()))
+            except OSError:
+                notes.append(t("tg.artifact_missing", path=_plain(str(path))))
+        if not loaded:
+            return notes
+        bot = self.target.bot
+        try:
+            if len(loaded) == 1:
+                path, content = loaded[0]
+                ids = [bot.send_document(self.target.chat, path.name, content, thread_id=self.target.thread)]
+            else:
+                ids = bot.send_media_group(
+                    self.target.chat,
+                    [(path.name, content) for path, content in loaded],
+                    thread_id=self.target.thread,
+                )
+        except (telegram.TelegramError, telegram.Unreachable) as exc:
+            log.write(f"telegram: artifact upload failed: {exc}")
+            return notes + [
+                t("tg.artifact_send_failed", path=_plain(str(path)), error=_plain(str(exc)))
+                for path, _ in loaded
+            ]
+        for message_id in ids:
+            self._remember(message_id, MSG_ARTIFACT)
+        for path, _ in loaded:
+            self._console(f"📎 {path}")
+        return notes
 
     def _auto_allowed(self, event: Event) -> bool:
         """Plan mode with bypass: run the tool instead of asking.
@@ -1145,8 +1322,9 @@ class Conversation:
 
         `/clear` keeps nothing: the chat ends up as it was before the
         conversation started. `/exit` keeps what someone would come back to
-        read -- every plan, and the last thing the agent said. A turn cut
-        short has no last answer, and then only the plans stay.
+        read -- every plan, every artifact, and the last thing the agent
+        said. A turn cut short has no last answer, and then only the plans
+        and the artifacts stay.
         """
         kept: list[tuple[int, str]] = []
         doomed = list(self._messages)
@@ -1156,7 +1334,7 @@ class Conversation:
                 doomed.remove(last)
                 kept.append(last)
         if keep_plan:
-            for entry in [entry for entry in doomed if entry[1] == MSG_PLAN]:
+            for entry in [entry for entry in doomed if entry[1] in (MSG_PLAN, MSG_ARTIFACT)]:
                 doomed.remove(entry)
                 kept.append(entry)
         for message_id, _ in doomed:
@@ -1274,6 +1452,42 @@ def _tool_line(data: dict[str, Any]) -> str:
     return ""
 
 
+# What Windows will not have in a file name, and the names it keeps for
+# devices whatever the extension.
+_UNSAFE_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+)
+
+
+def safe_filename(name: str) -> str:
+    """A sent file's name, fit to be created on any of our platforms."""
+    base = re.split(r"[\\/]", name)[-1]
+    clean = _UNSAFE_NAME_RE.sub("_", base).strip().rstrip(". ")
+    if not clean:
+        return "file"
+    if clean.split(".", 1)[0].upper() in _RESERVED_NAMES:
+        clean = f"_{clean}"
+    return clean
+
+
+def claim_file(directory: Path, name: str) -> tuple[Path, BinaryIO]:
+    """Create `name` in `directory`, or `name (1)`, `name (2)`... when taken.
+
+    The file is opened exclusively, so two downloads racing for one name end
+    up in two files instead of one overwriting the other.
+    """
+    clean = safe_filename(name)
+    stem, suffix = Path(clean).stem, Path(clean).suffix
+    for index in itertools.count():
+        candidate = directory / (clean if not index else f"{stem} ({index}){suffix}")
+        try:
+            return candidate, candidate.open("xb")
+        except FileExistsError:
+            continue
+    raise AssertionError("unreachable")
+
+
 def resolve_dir(raw: str, base: Path, *, roots: list[Any]) -> Path | None:
     candidate = Path(os.path.expanduser(raw.strip().strip('"')))
     if not candidate.is_absolute():
@@ -1292,4 +1506,4 @@ def resolve_dir(raw: str, base: Path, *, roots: list[Any]) -> Path | None:
     return candidate
 
 
-__all__ = ["ChatTarget", "Conversation", "Relaunch", "resolve_dir"]
+__all__ = ["ChatTarget", "Conversation", "Relaunch", "claim_file", "resolve_dir", "safe_filename"]

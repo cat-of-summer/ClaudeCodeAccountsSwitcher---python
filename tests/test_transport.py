@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from app.transport import poller as poller_module
 from app.transport import profiles as profiles_module
 from app.transport.profiles import Profile
 from app.transport.transport import Transport
@@ -236,3 +237,50 @@ class NothingIsSaidUnprompted(TransportBase):
         transport._retire_idle()
         self.wait_for(lambda: not transport.conversations)
         self.assertIn("💤", self.bot.texts()[-1])
+
+
+def part(message_id: int, file_id: str, *, text: str = "", group: str = "g1", chat: int = CHAT) -> telegram.Incoming:
+    return telegram.Incoming(
+        update_id=message_id,
+        chat_id=chat,
+        thread_id=0,
+        user_id=7,
+        text=text,
+        message_id=message_id,
+        files=(telegram.Attachment(file_id, f"{file_id}.jpg"),),
+        media_group=group,
+    )
+
+
+class AlbumsArriveAsOneMessage(TempHome):
+    def test_the_parts_wait_and_then_leave_under_the_caption(self) -> None:
+        albums = poller_module.Albums(settle=1.5)
+        self.assertTrue(albums.add(part(11, "a"), now=100.0))
+        self.assertTrue(albums.add(part(12, "b", text="/rik look at these"), now=100.2))
+        self.assertEqual(albums.ready(now=101.0), [])
+        self.assertTrue(albums.add(part(13, "c"), now=101.0))
+        self.assertEqual(albums.ready(now=102.0), [])
+
+        (merged,) = albums.ready(now=102.6)
+        self.assertEqual(merged.text, "/rik look at these")
+        self.assertEqual(merged.message_id, 12)
+        self.assertEqual([item.file_id for item in merged.files], ["a", "b", "c"])
+        self.assertFalse(albums)
+
+    def test_a_lone_message_and_other_albums_are_not_mixed_in(self) -> None:
+        albums = poller_module.Albums(settle=1.0)
+        lone = telegram.Incoming(update_id=1, chat_id=CHAT, thread_id=0, user_id=7, text="/rik hi")
+        self.assertFalse(albums.add(lone))
+        albums.add(part(1, "a", text="/rik one"), now=10.0)
+        albums.add(part(2, "b", group="g2", text="/rik two"), now=10.0)
+        albums.add(part(3, "c", chat=CHAT + 1), now=10.0)
+        merged = albums.ready(now=20.0)
+        self.assertEqual(sorted(len(item.files) for item in merged), [1, 1, 1])
+
+    def test_an_album_nobody_captioned_is_still_one_message(self) -> None:
+        albums = poller_module.Albums()
+        albums.add(part(1, "a"), now=0.0)
+        albums.add(part(2, "b"), now=0.0)
+        (merged,) = albums.ready(everything=True)
+        self.assertEqual(merged.text, "")
+        self.assertEqual(len(merged.files), 2)

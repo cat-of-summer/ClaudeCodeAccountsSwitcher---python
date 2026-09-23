@@ -15,13 +15,14 @@ import dataclasses
 import html
 import json
 import re
+import shutil
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, BinaryIO
 
 from core import log
 
@@ -30,6 +31,12 @@ MESSAGE_LIMIT = 4096
 CALLBACK_DATA_LIMIT = 64
 POLL_TIMEOUT_SECONDS = 50
 REQUEST_TIMEOUT_SECONDS = 30
+# Files move slower than messages: tens of megabytes over a home uplink.
+TRANSFER_TIMEOUT_SECONDS = 300
+# What the Bot API lets a bot fetch, and what it lets a bot send.
+DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
+MEDIA_GROUP_LIMIT = 10
 BACKOFF_START = 1.0
 BACKOFF_MAX = 60.0
 
@@ -70,6 +77,15 @@ def mask(token: str) -> str:
 
 
 @dataclass(frozen=True)
+class Attachment:
+    """A file somebody sent: enough to fetch it and to name it on disk."""
+
+    file_id: str
+    name: str
+    size: int = 0
+
+
+@dataclass(frozen=True)
 class Incoming:
     """A message or a button press, flattened to what routing needs."""
 
@@ -85,6 +101,10 @@ class Incoming:
     # `/rik! ...`: the person wants the agent to drop what it is doing and
     # read this now. Set by routing once the alias has been peeled off.
     urgent: bool = False
+    files: tuple[Attachment, ...] = ()
+    # Telegram sends an album as one message per file, with only one of them
+    # captioned; this is what ties the rest to it.
+    media_group: str = ""
 
     @property
     def is_callback(self) -> bool:
@@ -93,6 +113,57 @@ class Incoming:
     def with_text(self, text: str, *, urgent: bool | None = None) -> "Incoming":
         """The same update with the alias peeled off the line."""
         return dataclasses.replace(self, text=text, urgent=self.urgent if urgent is None else urgent)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "Incoming":
+        """Back from `dataclasses.asdict` and a trip through JSON, where the
+        attachments turned into a list of plain dicts."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        fields = {key: value for key, value in raw.items() if key in known}
+        files = fields.get("files") or ()
+        fields["files"] = tuple(
+            item if isinstance(item, Attachment) else Attachment(**item)
+            for item in files
+            if isinstance(item, (Attachment, dict))
+        )
+        return cls(**fields)
+
+
+# The kinds of message that carry a file, and the extension one gets when
+# Telegram does not say what the file was called.
+_FILE_KINDS: tuple[tuple[str, str], ...] = (
+    ("document", ""),
+    ("video", ".mp4"),
+    ("audio", ".mp3"),
+    ("voice", ".ogg"),
+    ("video_note", ".mp4"),
+    ("animation", ".mp4"),
+)
+
+
+def parse_attachments(message: dict[str, Any]) -> tuple[Attachment, ...]:
+    found: list[Attachment] = []
+    photo = message.get("photo")
+    if isinstance(photo, list) and photo:
+        # Every size of the same picture; the last one is the largest.
+        largest = photo[-1] if isinstance(photo[-1], dict) else {}
+        if largest.get("file_id"):
+            found.append(
+                Attachment(
+                    file_id=str(largest["file_id"]),
+                    name=f"photo_{largest.get('file_unique_id') or largest['file_id']}.jpg",
+                    size=int(largest.get("file_size") or 0),
+                )
+            )
+    for kind, extension in _FILE_KINDS:
+        item = message.get(kind)
+        if not isinstance(item, dict) or not item.get("file_id"):
+            continue
+        name = str(item.get("file_name") or "")
+        if not name:
+            name = f"{kind}_{item.get('file_unique_id') or item['file_id']}{extension}"
+        found.append(Attachment(file_id=str(item["file_id"]), name=name, size=int(item.get("file_size") or 0)))
+    return tuple(found)
 
 
 def parse_update(update: dict[str, Any]) -> Incoming | None:
@@ -113,6 +184,8 @@ def parse_update(update: dict[str, Any]) -> Incoming | None:
             text=text,
             message_id=int(message.get("message_id") or 0),
             username=str(sender.get("username") or ""),
+            files=parse_attachments(message),
+            media_group=str(message.get("media_group_id") or ""),
         )
     callback = update.get("callback_query")
     if isinstance(callback, dict):
@@ -181,24 +254,32 @@ class Bot:
         return payload.get("result")
 
     def upload(
-        self, method: str, params: dict[str, Any], *, field_name: str, filename: str, content: bytes
+        self, method: str, params: dict[str, Any], files: list[tuple[str, str, bytes]]
     ) -> Any:
+        """A multipart call: `params` as form fields, `files` as (field,
+        filename, content). Dicts and lists in `params` go as JSON, which is
+        how the Bot API wants `media` and `reply_parameters` here."""
         boundary = f"----ccas{uuid.uuid4().hex}"
         parts: list[bytes] = []
         for key, value in params.items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
             parts.append(
                 (
                     f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n"
                 ).encode("utf-8")
             )
-        parts.append(
-            (
-                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; "
-                f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-            ).encode("utf-8")
-        )
-        parts.append(content)
-        parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        for field_name, filename, content in files:
+            safe = filename.replace("\\", "_").replace('"', "'").replace("\r", " ").replace("\n", " ")
+            parts.append(
+                (
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; "
+                    f"filename=\"{safe}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                ).encode("utf-8")
+            )
+            parts.append(content)
+            parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
         body = b"".join(parts)
         url = f"{self.api_root}/bot{self.token}/{method}"
         request = urllib.request.Request(
@@ -208,7 +289,7 @@ class Bot:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS * 2) as response:
+            with urllib.request.urlopen(request, timeout=TRANSFER_TIMEOUT_SECONDS) as response:
                 payload = _decode(response.read())
         except urllib.error.HTTPError as exc:
             payload = _decode(exc.read())
@@ -338,13 +419,58 @@ class Bot:
 
     def send_document(
         self, chat_id: int, filename: str, content: bytes, *, caption: str = "", thread_id: int = 0
-    ) -> None:
+    ) -> int:
         params: dict[str, Any] = {"chat_id": chat_id}
         if caption:
             params["caption"] = caption[:1024]
         if thread_id:
             params["message_thread_id"] = thread_id
-        self.upload("sendDocument", params, field_name="document", filename=filename, content=content)
+        result = self.upload("sendDocument", params, [("document", filename, content)])
+        return int(result.get("message_id") or 0) if isinstance(result, dict) else 0
+
+    def send_media_group(
+        self, chat_id: int, files: list[tuple[str, bytes]], *, thread_id: int = 0
+    ) -> list[int]:
+        """Several files as one album of documents; the ids of its messages.
+
+        Telegram takes two to ten items per album, and documents only group
+        with documents -- which is what every file here is sent as, so that
+        a picture arrives as the file it is rather than recompressed.
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "media": [{"type": "document", "media": f"attach://f{index}"} for index in range(len(files))],
+        }
+        if thread_id:
+            params["message_thread_id"] = thread_id
+        result = self.upload(
+            "sendMediaGroup",
+            params,
+            [(f"f{index}", name, content) for index, (name, content) in enumerate(files)],
+        )
+        if not isinstance(result, list):
+            return []
+        return [int(entry.get("message_id") or 0) for entry in result if isinstance(entry, dict)]
+
+    def get_file(self, file_id: str) -> str:
+        """Where Telegram keeps a file for us to fetch; raises for one over
+        the Bot API's download limit ("file is too big")."""
+        result = self.call("getFile", {"file_id": file_id})
+        path = result.get("file_path") if isinstance(result, dict) else None
+        if not isinstance(path, str) or not path:
+            raise TelegramError("getFile", 0, "no file_path")
+        return path
+
+    def download(self, file_path: str, target: BinaryIO) -> None:
+        """Copy a file `get_file` pointed at into an open file."""
+        url = f"{self.api_root}/file/bot{self.token}/{urllib.parse.quote(file_path)}"
+        try:
+            with urllib.request.urlopen(url, timeout=TRANSFER_TIMEOUT_SECONDS) as response:
+                shutil.copyfileobj(response, target)
+        except urllib.error.HTTPError as exc:
+            raise TelegramError("download", exc.code, str(exc.reason)) from None
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise Unreachable(str(exc)) from exc
 
 
 # What Telegram says when the message is gone, and when the new text is the

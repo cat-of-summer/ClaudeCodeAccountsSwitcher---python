@@ -241,3 +241,46 @@ class WrapperIntegration(TempHome):
         # The settings file lived only as long as the session did.
         self.assertFalse(Path(argv[1]).exists())
         self.assertFalse(wrapper.settings_file().exists())
+
+
+def _tool(name: str, tool_input: dict) -> hookbus.HookEvent:
+    return hookbus.HookEvent("PreToolUse", _event("PreToolUse", tool_name=name, tool_input=tool_input))
+
+
+class ArtifactsStayLocal(TempHome):
+    def test_publishing_is_refused_with_a_reason_for_the_model(self) -> None:
+        for tool_input in ({"file_path": "a.html"}, {"action": "publish", "file_path": "a.html", "url": "u"}):
+            answer = hookbus.block_artifact_publish(_tool("Artifact", tool_input))
+            assert answer is not None
+            output = answer["hookSpecificOutput"]
+            self.assertEqual(output["permissionDecision"], "deny")
+            self.assertIn("local", output["permissionDecisionReason"])
+
+    def test_everything_else_is_left_alone(self) -> None:
+        for event in (
+            _tool("Artifact", {"action": "read", "url": "u"}),
+            _tool("Artifact", {"action": "list"}),
+            _tool("Write", {"file_path": "a.html"}),
+            hookbus.HookEvent("PostToolUse", _event("PostToolUse", tool_name="Artifact", tool_input={})),
+        ):
+            self.assertIsNone(hookbus.block_artifact_publish(event))
+
+    def test_the_wrappers_bus_refuses_unless_publishing_is_allowed(self) -> None:
+        payload = _event("PreToolUse", tool_name="Artifact", tool_input={"file_path": "a.html"})
+        bus = wrapper.open_hook_bus(Config(), 1)
+        try:
+            answer = _post(bus.url, payload)
+        finally:
+            wrapper.close_hook_bus(bus)
+        self.assertEqual(answer["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        bus = wrapper.open_hook_bus(Config(artifact_publish=True), 1)
+        try:
+            self.assertEqual(_post(bus.url, payload), {})
+        finally:
+            wrapper.close_hook_bus(bus)
+
+    def test_the_switch_is_kept_in_the_config(self) -> None:
+        self.assertFalse(Config().artifact_publish)
+        Config(artifact_publish=True).save()
+        self.assertTrue(Config.load().artifact_publish)

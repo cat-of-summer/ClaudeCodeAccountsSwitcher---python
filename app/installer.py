@@ -312,6 +312,7 @@ def install(
         # the interception, and it used to take the bot token, the profiles
         # and the hook handlers with it.
         hooks_bus=previous.hooks_bus,
+        artifact_publish=previous.artifact_publish,
         hooks=list(previous.hooks),
         telegram=dict(previous.telegram),
     )

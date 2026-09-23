@@ -379,6 +379,8 @@ def wants_hook_bus(config: Config, args: list[str]) -> bool:
 
 def open_hook_bus(config: Config, slot: int, *, key: str = "") -> hookbus.HookBus:
     bus = hookbus.HookBus(hookbus.parse_handlers(config.hooks), slot=slot)
+    if not config.artifact_publish:
+        bus.subscribe(hookbus.block_artifact_publish)
     bus.start()
     update_session(port=bus.port, key=key)
     return bus
